@@ -1,0 +1,1303 @@
+# Reverse-engineered from observed StudentHub traffic during Hyeboard adapter development.
+# Unofficial, not endorsed by VNU-UET. Shapes reflect what the adapter code actually
+# consumes; fields not used by Hyeboard may be omitted or incomplete.
+openapi: 3.0.3
+info:
+  title: StudentHub API (reverse-engineered)
+  version: "0.1.0"
+  description: >
+    Unofficial documentation of the VNU-UET StudentHub portal's HTTP API, reverse-engineered
+    by observing real traffic during Hyeboard adapter development. Not endorsed by VNU-UET.
+servers:
+  - url: https://studenthub.uet.edu.vn
+tags:
+  - name: auth
+    description: Pre-authentication endpoints (login, captcha, Google credential exchange).
+  - name: core
+    description: Authenticated student-data endpoints with a corresponding Hyeboard mapper.
+  - name: extended
+    description: Endpoints discovered in a HAR capture of a parent/guardian-linked account; not currently called by Hyeboard's adapter and not consumed by mapper.ts.
+security:
+  - bearerAuth: []
+paths:
+  /api/auth/login:
+    post:
+      operationId: authenticateDirect
+      tags: [auth]
+      security: []
+      summary: Direct username/password login (captcha-protected)
+      description: Exchanges a student's StudentHub username, password, and solved captcha for a bearer access token.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userName: { type: string }
+                password: { type: string, format: password }
+                captchaId: { type: string }
+                captchaValue: { type: string }
+              required: [userName, password, captchaId, captchaValue]
+      responses:
+        "200":
+          description: Login succeeded, access token issued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubDirectLoginResult" }
+  /api/auth/captcha:
+    get:
+      operationId: getCaptchaChallenge
+      tags: [auth]
+      security: []
+      summary: Fetch a captcha challenge for direct login
+      description: Returns a captcha id and image to present to the user before calling /api/auth/login.
+      responses:
+        "200":
+          description: Captcha challenge.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubCaptchaChallenge" }
+  /api/auth/google/callback:
+    get:
+      operationId: exchangeGoogleCredential
+      tags: [auth]
+      security: []
+      summary: Exchange a Google OAuth code for a StudentHub access token
+      description: Called after a successful Google sign-in popup; the returned token is used as bearerAuth for all other endpoints.
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Access token issued for the linked account.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubGoogleLogin" }
+  /api/student/detail:
+    get:
+      operationId: getProfile
+      tags: [core]
+      security: [{bearerAuth: []}]
+      summary: Get the logged-in student's profile
+      description: Response is passed through mapStudent (mapper.ts) to build Hyeboard's Student profile, normalizing Vietnamese name casing.
+      responses:
+        "200":
+          description: Student profile.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubStudent" }
+  /api/student/term/getTerm:
+    post:
+      operationId: getTerms
+      tags: [core]
+      security: [{bearerAuth: []}]
+      summary: List the student's academic terms
+      description: Each item is passed through mapTerm (mapper.ts) to build Hyeboard's Term list; the first entry is treated as the current term.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Array of terms.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/StudentHubTerm" }
+  /api/student/tkb:
+    post:
+      operationId: getTimetable
+      tags: [core]
+      security: [{bearerAuth: []}]
+      summary: Get the student's weekly class timetable
+      description: Each item is passed through mapStudentHubClass (mapper.ts), which resolves the ISO weekday into a date within the current week and applies the verified period-to-clock-time table.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                termCode: { type: string }
+      responses:
+        "200":
+          description: Array of class sessions.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/StudentHubClassSession" }
+  /api/student/schedule-alert:
+    get:
+      operationId: getScheduleAlert
+      tags: [core]
+      security: [{bearerAuth: []}]
+      summary: Get today's (or a given day's) schedule-alert groups
+      description: Flattened groups are passed through mapStudentHubScheduleAlert (mapper.ts, via adapter.ts's flattenScheduleAlert) to build ClassSession entries, including the Canvas course link when present.
+      parameters:
+        - name: day
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Array of schedule-alert groups (observed nested as an array of arrays).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: array
+                  items: { $ref: "#/components/schemas/StudentHubScheduleAlertSession" }
+  /api/student/count-course-term:
+    get:
+      operationId: getCourseCount
+      tags: [core]
+      security: [{bearerAuth: []}]
+      summary: Get the student's in-term vs. completed course counts
+      description: Consumed directly in adapter.ts's getDashboard (no dedicated mapper.ts function) to build the dashboard's courseCount summary.
+      responses:
+        "200":
+          description: Course count summary.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubCourseCount" }
+  /api/student/kqht:
+    get:
+      operationId: getGrades
+      tags: [core]
+      security: [{bearerAuth: []}]
+      summary: Get the student's course grades
+      description: Each item is passed through mapStudentHubGrade (mapper.ts) to build Hyeboard's Grade list.
+      responses:
+        "200":
+          description: Array of grades.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/StudentHubGrade" }
+  /api/student/results:
+    get:
+      operationId: getGpa
+      tags: [core]
+      security: [{bearerAuth: []}]
+      summary: Get the student's GPA/CPA summary
+      description: Passed through mapStudentHubGpa (mapper.ts) to build Hyeboard's GpaSummary.
+      responses:
+        "200":
+          description: GPA/CPA summary.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubGpa" }
+  /api/student/exam-schedule:
+    post:
+      operationId: getExams
+      tags: [core]
+      security: [{bearerAuth: []}]
+      summary: Get the student's exam schedule
+      description: Each item is passed through mapStudentHubExam (mapper.ts) to build Hyeboard's ExamSession list.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                termCode: { type: string }
+      responses:
+        "200":
+          description: Array of exam sessions.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/StudentHubExam" }
+  /api/student/getAllBills:
+    post:
+      operationId: getBills
+      tags: [core]
+      security: [{bearerAuth: []}]
+      summary: Get the student's tuition bills
+      description: Passed through mapTuition/mapStudentHubBill (mapper.ts) to build Hyeboard's TuitionStatus, deriving a paid/partial/unpaid/credit status per bill.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Array of tuition bills.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/StudentHubBill" }
+  /api/noti/user/{studentCode}:
+    get:
+      operationId: getNotifications
+      tags: [core]
+      security: [{bearerAuth: []}]
+      summary: Get a student's notifications
+      description: The content array is passed through mapStudentHubNotifications (mapper.ts) to build Hyeboard's Notification list, tagged with source "studenthub".
+      parameters:
+        - name: studentCode
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Paged notification list.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubNotificationPage" }
+  /api/student/news:
+    get:
+      operationId: getNews
+      tags: [core]
+      security: [{bearerAuth: []}]
+      summary: Get UET news items
+      description: Each item is passed through mapStudentHubNews (mapper.ts) to build Hyeboard's NewsItem list.
+      responses:
+        "200":
+          description: Array of news items.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/StudentHubNews" }
+  /api/student/training-points/assessment:
+    get:
+      operationId: getTrainingPointAssessment
+      tags: [core]
+      security: [{bearerAuth: []}]
+      summary: Get the student's training-point criteria assessment
+      description: Combined with getTrainingPointLockAssessment's result inside mapTrainingPoints (mapper.ts) to build Hyeboard's TrainingPoint list (a locked final-score entry plus one entry per criterion).
+      parameters:
+        - name: studentCode
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Training-point assessment.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubTrainingPointAssessment" }
+  /api/student/training-points/assessment/lock-assessment:
+    get:
+      operationId: getTrainingPointLockAssessment
+      tags: [core]
+      security: [{bearerAuth: []}]
+      summary: Get the student's locked/final training-point totals for a term
+      description: Feeds mapTrainingPoints (mapper.ts) alongside getTrainingPointAssessment's result to produce the locked final-score entry; adapter.ts treats failure here as non-fatal.
+      parameters:
+        - name: studentCode
+          in: query
+          required: true
+          schema: { type: string }
+        - name: termCode
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Locked training-point assessment totals.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubTrainingPointLockAssessment" }
+  /api/student/request/display:
+    get:
+      operationId: getRequests
+      tags: [core]
+      security: [{bearerAuth: []}]
+      summary: Get the student's submitted service requests
+      description: Each item is passed through mapStudentHubRequest (mapper.ts) to build Hyeboard's ServiceRequest list.
+      responses:
+        "200":
+          description: Array of service requests.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/StudentHubServiceRequest" }
+  /api/student/request/type:
+    get:
+      operationId: getRequestTypes
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: List the available service-request type options
+      description: Defined on StudentHubClient but not currently called by adapter.ts/UniversityAdapter - no mapper.ts function consumes it yet.
+      responses:
+        "200":
+          description: Array of request-type label/value options.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/StudentHubRequestType" }
+  /api/student/mandatory-task/incomplete:
+    get:
+      operationId: getMandatoryTasks
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: List the student's incomplete mandatory tasks
+      description: Defined on StudentHubClient but not currently called by adapter.ts/UniversityAdapter; response shape has not been reverse-engineered beyond a bare array (typed unknown[] in types.ts).
+      responses:
+        "200":
+          description: Array of incomplete mandatory tasks (shape not yet reverse-engineered).
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {}
+  /api/student/admission/info:
+    get:
+      operationId: getAdmissionInfo
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Get admission/enrollment document status
+      description: Not currently called by adapter.ts/UniversityAdapter; discovered via a parent/guardian-account HAR capture.
+      responses:
+        "200":
+          description: Admission info.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubAdmissionInfo" }
+  /api/student/avatar:
+    get:
+      operationId: getAvatar
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Get the student's avatar
+      description: Not currently called by adapter.ts/UniversityAdapter. Bypasses the JSON envelope entirely - client code calls response.text() directly; observed mimetype was text/plain (likely a URL or base64 blob), not JSON.
+      responses:
+        "200":
+          description: Plain-text avatar payload (not JSON).
+          content:
+            text/plain:
+              schema: { type: string }
+  /api/student/criteria/role/is-committee:
+    get:
+      operationId: getIsCommittee
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Check whether the student holds a committee role
+      description: Not currently called by adapter.ts/UniversityAdapter.
+      responses:
+        "200":
+          description: Committee-role check result.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubCommitteeCheck" }
+  /api/student/criteria/student-info:
+    get:
+      operationId: getCriteriaStudentInfo
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Get criteria-assessment student info
+      description: Not currently called by adapter.ts/UniversityAdapter; response shape not reverse-engineered beyond this (typed unknown in types.ts).
+      parameters:
+        - name: studentCode
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Criteria student info (shape not reverse-engineered).
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/student/dktn:
+    get:
+      operationId: getDktn
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Get the student's DKTN (course-registration) status/document
+      description: Not currently called by adapter.ts/UniversityAdapter; typed as a bare string in types.ts (envelope's data field is a plain string, not an object).
+      responses:
+        "200":
+          description: DKTN status/document as a plain string.
+          content:
+            application/json:
+              schema: { type: string }
+  /api/student/dktn/course:
+    get:
+      operationId: getDktnCourses
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Get the student's DKTN course-registration options
+      description: Not currently called by adapter.ts/UniversityAdapter.
+      responses:
+        "200":
+          description: DKTN course groups.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubDktnCourses" }
+  /api/student/getBill/bill-optional/list:
+    post:
+      operationId: getBillOptionalList
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Get the student's optional/supplementary bills
+      description: Not currently called by adapter.ts/UniversityAdapter.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Array of optional bills.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/StudentHubBillOptional" }
+  /api/student/getBill/checkno:
+    post:
+      operationId: getBillCheckNo
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Check bill number/status
+      description: Not currently called by adapter.ts/UniversityAdapter; response shape not reverse-engineered beyond this (typed unknown in types.ts).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Bill check result (shape not reverse-engineered).
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/student/person/detail:
+    get:
+      operationId: getPersonDetail
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Get the student's personal/residence details
+      description: Not currently called by adapter.ts/UniversityAdapter.
+      responses:
+        "200":
+          description: Person detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubPersonDetail" }
+  /api/student/person/family-detail:
+    get:
+      operationId: getFamilyDetail
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Get the student's family/guardian details
+      description: Not currently called by adapter.ts/UniversityAdapter.
+      responses:
+        "200":
+          description: Family detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubFamilyDetail" }
+  /api/student/person/healthcare_detail:
+    get:
+      operationId: getHealthcareDetail
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Get the student's healthcare-insurance household details
+      description: Not currently called by adapter.ts/UniversityAdapter.
+      responses:
+        "200":
+          description: Healthcare detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubHealthcareDetail" }
+  /api/student/program:
+    get:
+      operationId: getProgram
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Get the student's degree program details and grouped courses
+      description: Not currently called by adapter.ts/UniversityAdapter.
+      responses:
+        "200":
+          description: Program details.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubProgram" }
+  /api/student/programs/dky-window:
+    get:
+      operationId: getRegistrationWindow
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Get the course-registration window's open/close times
+      description: Not currently called by adapter.ts/UniversityAdapter.
+      responses:
+        "200":
+          description: Registration window.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubRegistrationWindow" }
+  /api/student/semester-advice:
+    get:
+      operationId: getSemesterAdvice
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Get advised courses for the student's upcoming semester
+      description: Not currently called by adapter.ts/UniversityAdapter.
+      responses:
+        "200":
+          description: Array of semester-advice course entries.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/StudentHubSemesterAdvice" }
+  /api/student/semester-advice/status:
+    get:
+      operationId: getSemesterAdviceStatus
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Get the semester-advice workflow status
+      description: Not currently called by adapter.ts/UniversityAdapter; response shape not reverse-engineered beyond this (typed unknown in types.ts).
+      responses:
+        "200":
+          description: Semester-advice status (shape not reverse-engineered).
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/student/semester-expected:
+    get:
+      operationId: getSemesterExpected
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Get the student's expected-graduation-semester records
+      description: Not currently called by adapter.ts/UniversityAdapter.
+      responses:
+        "200":
+          description: Array of expected-semester records.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/StudentHubSemesterExpected" }
+  /api/student/student-info-canvas:
+    get:
+      operationId: getCanvasLinkInfo
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Get the student's linked Canvas account info
+      description: Not currently called by adapter.ts/UniversityAdapter.
+      responses:
+        "200":
+          description: Canvas link info.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubCanvasLinkInfo" }
+  /api/student/training-points/is-lock:
+    get:
+      operationId: getTrainingPointsIsLock
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Check whether the student's training points are locked
+      description: Not currently called by adapter.ts/UniversityAdapter; response shape not reverse-engineered beyond this (typed unknown in types.ts).
+      responses:
+        "200":
+          description: Training-points lock status (shape not reverse-engineered).
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/student/vn/blood/search:
+    post:
+      operationId: searchBloodTypes
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Search the blood-type reference list
+      description: Not currently called by adapter.ts/UniversityAdapter. size defaults to 100 in the client wrapper.
+      parameters:
+        - name: size
+          in: query
+          required: false
+          schema: { type: number, default: 100 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Paged blood-type list.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubBloodTypePage" }
+  /api/student/vn/district/search:
+    post:
+      operationId: searchDistricts
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Search districts within a province
+      description: Not currently called by adapter.ts/UniversityAdapter. size defaults to 100 in the client wrapper; provinceCode is sent in the request body, not as a query param.
+      parameters:
+        - name: size
+          in: query
+          required: false
+          schema: { type: number, default: 100 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                provinceCode: { type: string }
+              required: [provinceCode]
+      responses:
+        "200":
+          description: Paged district list.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubDistrictPage" }
+  /api/student/vn/nation/search:
+    post:
+      operationId: searchNations
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Search the nation/nationality reference list
+      description: Not currently called by adapter.ts/UniversityAdapter. size defaults to 100 in the client wrapper.
+      parameters:
+        - name: size
+          in: query
+          required: false
+          schema: { type: number, default: 100 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Paged nation list.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubNationPage" }
+  /api/student/vn/province/search:
+    post:
+      operationId: searchProvinces
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Search the province reference list
+      description: Not currently called by adapter.ts/UniversityAdapter. size defaults to 100 in the client wrapper.
+      parameters:
+        - name: size
+          in: query
+          required: false
+          schema: { type: number, default: 100 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Paged province list.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubProvincePage" }
+  /api/student/vn/ward/search:
+    post:
+      operationId: searchWards
+      tags: [extended]
+      security: [{bearerAuth: []}]
+      summary: Search wards within a province
+      description: Not currently called by adapter.ts/UniversityAdapter. size defaults to 100 in the client wrapper; provinceCode is sent in the request body, not as a query param.
+      parameters:
+        - name: size
+          in: query
+          required: false
+          schema: { type: number, default: 100 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                provinceCode: { type: string }
+              required: [provinceCode]
+      responses:
+        "200":
+          description: Paged ward list.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubWardPage" }
+  /dashboard-banner.json:
+    get:
+      operationId: getDashboardBanner
+      tags: [extended]
+      security: []
+      summary: Get the site-wide dashboard banner config
+      description: Not currently called by adapter.ts/UniversityAdapter. Static JSON file, not under /api/, no auth required per client code's comment.
+      responses:
+        "200":
+          description: Dashboard banner config.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StudentHubDashboardBanner" }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    StudentHubDirectLoginResult:
+      type: object
+      properties:
+        code: { type: string }
+        login:
+          type: object
+          properties:
+            accessToken: { type: string }
+            accountCode: { type: string }
+          required: [accessToken]
+      required: [code]
+    StudentHubCaptchaChallenge:
+      type: object
+      properties:
+        captchaId: { type: string }
+        image: { type: string }
+      required: [captchaId, image]
+    StudentHubGoogleLogin:
+      type: object
+      properties:
+        accountCode: { type: string }
+        username: { type: string }
+        name: { type: string }
+        email: { type: string }
+        accessToken: { type: string }
+        refreshToken: { type: string }
+        role: { type: string }
+        dependAccountCode: { type: string }
+      required: [accessToken]
+    StudentHubStudent:
+      type: object
+      properties:
+        id: { oneOf: [{ type: string }, { type: number }] }
+        personCode: { type: string }
+        studentCode: { type: string }
+        name: { type: string }
+        schoolEmail: { type: string }
+        email: { type: string }
+        classCode: { type: string }
+        programName: { type: string }
+        majorName: { type: string }
+    StudentHubTerm:
+      type: object
+      properties:
+        id: { oneOf: [{ type: string }, { type: number }] }
+        index: { type: number }
+        termCode: { type: string }
+        name: { type: string }
+    StudentHubClassSession:
+      type: object
+      properties:
+        studentCode: { type: string }
+        courseGroupCode: { type: string }
+        termCode: { type: string }
+        courseSectionCode: { type: string }
+        courseCode: { type: string }
+        courseName: { type: string }
+        roomCode: { type: string }
+        roomName: { type: string }
+        sessionStart: { oneOf: [{ type: string }, { type: number }] }
+        sessionEnd: { oneOf: [{ type: string }, { type: number }] }
+        weekday: { oneOf: [{ type: string }, { type: number }] }
+        staffCode1: { type: string }
+        type: { type: string }
+    StudentHubScheduleAlertSession:
+      type: object
+      properties:
+        sessionStart: { oneOf: [{ type: string }, { type: number }] }
+        courseSectionCode: { type: string }
+        weekDay: { oneOf: [{ type: string }, { type: number }] }
+        name: { type: string }
+        sessionEnd: { oneOf: [{ type: string }, { type: number }] }
+        typeLesson: { type: string }
+        name1: { type: string }
+        roomName: { type: string }
+        canvasCourseId: { type: number }
+    StudentHubCourseCount:
+      type: object
+      properties:
+        inTerm: { type: number }
+        completed: { type: number }
+    StudentHubGrade:
+      type: object
+      properties:
+        pointCode: { type: string }
+        courseCode: { type: string }
+        name: { type: string }
+        termCode: { type: string }
+        courseCredit: { type: number }
+        point4: { oneOf: [{ type: number }, { type: string }], nullable: true }
+        point10: { oneOf: [{ type: number }, { type: string }], nullable: true }
+        inProgram: { type: boolean }
+    StudentHubGpa:
+      type: object
+      properties:
+        studentCode: { type: string }
+        cpa: { oneOf: [{ type: number }, { type: string }], nullable: true }
+        gpa: { oneOf: [{ type: number }, { type: string }], nullable: true }
+        totalCredits: { type: number }
+        totalAccumulatedCredits: { type: number }
+        totalCourses: { type: number }
+        passedProgramCourses: { type: number }
+    StudentHubExam:
+      type: object
+      properties:
+        courseSectionCode: { type: string }
+        termCode: { type: string }
+        courseCode: { type: string }
+        courseName: { type: string }
+        examType: { type: string }
+        examMethod: { type: string }
+        examDate: { type: string }
+        timeStart: { type: string }
+        examSession: { oneOf: [{ type: string }, { type: number }] }
+        roomName: { type: string }
+        examNumber: { type: string }
+    StudentHubBill:
+      type: object
+      properties:
+        billCode: { type: string }
+        billDetailCode: { type: string }
+        billTitle: { type: string }
+        totalAmount: { type: number }
+        paidAmount: { type: number }
+        remainingAmount: { type: number }
+        billStatus: { oneOf: [{ type: string }, { type: number }] }
+        paymentStatus: { type: string }
+        payDate: { type: string }
+        dateEnd: { type: string }
+        termCode: { type: string }
+        billDescription: { type: string }
+        parentBillCode: { type: string }
+        invoiceUrl: { type: string }
+        electronicInvoiceUrl: { type: string }
+    StudentHubNotificationPage:
+      type: object
+      properties:
+        content:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { oneOf: [{ type: string }, { type: number }] }
+              title: { type: string }
+              content: { type: string }
+              createdAt: { type: string }
+              createdDate: { type: string }
+              link: { type: string }
+        totalElements: { type: number }
+    StudentHubNews:
+      type: object
+      properties:
+        id: { oneOf: [{ type: string }, { type: number }] }
+        title: { type: string }
+        date: { type: string }
+        image: { type: string }
+        category: { type: string }
+        link: { type: string }
+    StudentHubTrainingPointAssessment:
+      type: object
+      properties:
+        assessmentStatus: { type: string }
+        canAssess: { type: boolean }
+        termCode: { type: string }
+        criteriaAssessmentList:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              baseScore: { type: number }
+              maxScore: { type: number }
+              orderIndex: { type: number }
+    StudentHubTrainingPointLockAssessment:
+      type: object
+      properties:
+        studentCode: { type: string }
+        studentName: { type: string }
+        className: { type: string }
+        faculty: { type: string }
+        status: { type: string }
+        termCode: { type: string }
+        totalBase: { type: number }
+        totalSV: { type: number }
+        totalBCS: { type: number }
+        totalCVHT: { type: number }
+        totalKV: { type: number }
+        totalCTSV: { type: number }
+    StudentHubServiceRequest:
+      type: object
+      properties:
+        id: { oneOf: [{ type: string }, { type: number }] }
+        requestId: { oneOf: [{ type: string }, { type: number }] }
+        requestType: { type: string }
+        requestTypeName: { type: string }
+        type: { type: string }
+        title: { type: string }
+        detail: { type: string }
+        description: { type: string }
+        reason: { type: string }
+        status: { type: string }
+        statusName: { type: string }
+        createdAt: { type: string }
+        createdDate: { type: string }
+    StudentHubRequestType:
+      type: object
+      properties:
+        label: { type: string }
+        value: { oneOf: [{ type: string }, { type: number }] }
+    StudentHubAdmissionInfo:
+      type: object
+      properties:
+        id: { oneOf: [{ type: string }, { type: number }] }
+        studentCode: { type: string }
+        graduationCert: {}
+        transcript: {}
+        cccdFront: {}
+        cccdBack: {}
+        birthCert: {}
+        militaryDoc: {}
+        priorityDoc: {}
+        studentBankInfo: {}
+        workflowState: {}
+        admissionNotice: {}
+        personalInfo: {}
+        residenceInfo: {}
+        tempGraduationCert: {}
+        isLocked: { type: boolean }
+    StudentHubCommitteeCheck:
+      type: object
+      properties:
+        check: { type: boolean }
+    StudentHubDktnCourses:
+      type: object
+      properties:
+        listPhysical:
+          type: array
+          items: {}
+        listCourses: { $ref: "#/components/schemas/StudentHubCourseGroups" }
+    StudentHubCourseGroups:
+      type: object
+      additionalProperties: { $ref: "#/components/schemas/StudentHubCourseGroup" }
+    StudentHubCourseGroup:
+      type: object
+      properties:
+        courses:
+          type: array
+          items: { $ref: "#/components/schemas/StudentHubCourseRef" }
+        typeName: { type: string }
+        optionalNum: { type: number, nullable: true }
+    StudentHubCourseRef:
+      type: object
+      properties:
+        courseCode: { type: string }
+        courseName: { type: string }
+      additionalProperties: true
+    StudentHubBillOptional:
+      type: object
+      properties:
+        billCode: { type: string }
+        billDetailCode: { type: string }
+        billTitle: { type: string }
+        totalAmount: { type: number }
+        paidAmount: { type: number }
+        remainingAmount: { type: number }
+        billStatus: { oneOf: [{ type: string }, { type: number }] }
+        paymentStatus: { oneOf: [{ type: number }, { type: string }], nullable: true }
+        payDate: { type: string }
+        dateEnd: { type: string }
+        termCode: { type: string }
+        billDescription: { type: string }
+        parentBillCode: { type: string }
+        invoiceUrl: { type: string }
+        electronicInvoiceUrl: { type: string }
+    StudentHubPersonDetail:
+      type: object
+      properties:
+        studentCode: { type: string }
+        id: { oneOf: [{ type: string }, { type: number }] }
+        personCode: { type: string }
+        nowCountry: { type: string, nullable: true }
+        nowProvince: { type: string, nullable: true }
+        nowDistrict: { type: string, nullable: true }
+        nowWard: { type: string, nullable: true }
+        nowRoad: { type: string, nullable: true }
+        nowHomeNumber: { type: string, nullable: true }
+        phoneNumber: { type: string }
+        homePhoneNumber: { type: string, nullable: true }
+        ttProvince: { type: string, nullable: true }
+        ttDistrict: { type: string, nullable: true }
+        ttWard: { type: string, nullable: true }
+        ttRoad: { type: string, nullable: true }
+        ttHomeNumber: { type: string, nullable: true }
+        graduateYear: { type: number }
+        academicPerformance: { type: string }
+        conduct: { type: string }
+        avg12: { type: number }
+        collegeGraduation: { type: string }
+        intermediateSchoolGraduation: { type: string }
+        province12Code: { type: string }
+        school12Code: { type: string }
+        isDisabledStudent: { type: number }
+        disabilityLevel: { type: number }
+        disabilityType: { type: number }
+    StudentHubFamilyDetail:
+      type: object
+      properties:
+        id: { oneOf: [{ type: string }, { type: number }] }
+        personCode: { type: string }
+        studentCode: { type: string }
+        fatherName: { type: string }
+        fatherYear: { type: number }
+        fatherPhoneNumber: { type: string }
+        fatherJob: { type: string }
+        fatherEmail: { type: string, nullable: true }
+        fatherAddress: { type: string, nullable: true }
+        motherName: { type: string }
+        motherYear: { type: number }
+        motherPhoneNumber: { type: string }
+        motherJob: { type: string }
+        motherEmail: { type: string, nullable: true }
+        motherAddress: { type: string, nullable: true }
+        otherInformation: { type: string, nullable: true }
+        siblingUniStatus: {}
+        inFamilyOrder: {}
+    StudentHubHealthcareDetail:
+      type: object
+      properties:
+        id: { oneOf: [{ type: string }, { type: number }] }
+        personCode: { type: string }
+        healthcareCode: { type: string }
+        hkOwnerName: { type: string, nullable: true }
+        hkOwnerBirth: { type: string, nullable: true }
+        hkOwnerRelation: { type: string, nullable: true }
+        hkOwnerSex: { type: string, nullable: true }
+        ttProvince: { type: string, nullable: true }
+        ttWard: { type: string, nullable: true }
+    StudentHubProgram:
+      type: object
+      properties:
+        programDetails: { $ref: "#/components/schemas/StudentHubProgramDetails" }
+        groupedCourses: { $ref: "#/components/schemas/StudentHubCourseGroups" }
+    StudentHubProgramDetails:
+      type: object
+      properties:
+        programCode: { type: string }
+        engName: { type: string }
+        name: { type: string }
+        creditAmount: { type: string }
+        graduateMinPoint: { type: string }
+        plo: {}
+    StudentHubRegistrationWindow:
+      type: object
+      properties:
+        startAt: { type: string }
+        endAt: { type: string }
+        manualMode: { oneOf: [{ type: string }, { type: boolean }] }
+    StudentHubSemesterAdvice:
+      type: object
+      properties:
+        programCode: { type: string }
+        courseCode: { type: string }
+        name: { type: string }
+        egName: { type: string, nullable: true }
+        courseCredit: { type: number }
+        typeId: { type: number }
+        typeName: { type: string }
+        scorable: {}
+        termCode: { type: string, nullable: true }
+        courseSpecialCodes: {}
+        termExpect: {}
+        obligatory: { type: number }
+        optionalNum: { type: number, nullable: true }
+        isEdit: { type: number }
+    StudentHubSemesterExpected:
+      type: object
+      properties:
+        id: { oneOf: [{ type: string }, { type: number }] }
+        studentCode: { type: string }
+        termCode: { type: string }
+        termName: { type: string }
+        termExpect: { type: number }
+        isLock: { type: number }
+        isActive: {}
+        termLock: { type: number }
+    StudentHubCanvasLinkInfo:
+      type: object
+      properties:
+        userCanvasId: { type: number }
+        lastReqAt: { type: string }
+        curLoginAt: { type: string }
+    StudentHubBloodType:
+      type: object
+      properties:
+        id: { oneOf: [{ type: string }, { type: number }] }
+        bloodType: { type: string }
+    StudentHubBloodTypePage:
+      type: object
+      properties:
+        content:
+          type: array
+          items: { $ref: "#/components/schemas/StudentHubBloodType" }
+        pageable:
+          type: object
+          properties:
+            pageNumber: { type: number }
+            pageSize: { type: number }
+            offset: { type: number }
+            paged: { type: boolean }
+            unpaged: { type: boolean }
+        last: { type: boolean }
+        first: { type: boolean }
+        totalElements: { type: number }
+        totalPages: { type: number }
+        size: { type: number }
+        number: { type: number }
+        numberOfElements: { type: number }
+        empty: { type: boolean }
+    StudentHubDistrict:
+      type: object
+      properties:
+        id: { oneOf: [{ type: string }, { type: number }] }
+        districtCode: { type: string }
+        districtName: { type: string }
+        provinceCode: { type: string }
+    StudentHubDistrictPage:
+      type: object
+      properties:
+        content:
+          type: array
+          items: { $ref: "#/components/schemas/StudentHubDistrict" }
+        pageable:
+          type: object
+          properties:
+            pageNumber: { type: number }
+            pageSize: { type: number }
+            offset: { type: number }
+            paged: { type: boolean }
+            unpaged: { type: boolean }
+        last: { type: boolean }
+        first: { type: boolean }
+        totalElements: { type: number }
+        totalPages: { type: number }
+        size: { type: number }
+        number: { type: number }
+        numberOfElements: { type: number }
+        empty: { type: boolean }
+    StudentHubNation:
+      type: object
+      properties:
+        id: { oneOf: [{ type: string }, { type: number }] }
+        nation: { type: string }
+    StudentHubNationPage:
+      type: object
+      properties:
+        content:
+          type: array
+          items: { $ref: "#/components/schemas/StudentHubNation" }
+        pageable:
+          type: object
+          properties:
+            pageNumber: { type: number }
+            pageSize: { type: number }
+            offset: { type: number }
+            paged: { type: boolean }
+            unpaged: { type: boolean }
+        last: { type: boolean }
+        first: { type: boolean }
+        totalElements: { type: number }
+        totalPages: { type: number }
+        size: { type: number }
+        number: { type: number }
+        numberOfElements: { type: number }
+        empty: { type: boolean }
+    StudentHubProvince:
+      type: object
+      properties:
+        id: { oneOf: [{ type: string }, { type: number }] }
+        provinceCode: { type: string }
+        provinceName: { type: string }
+    StudentHubProvincePage:
+      type: object
+      properties:
+        content:
+          type: array
+          items: { $ref: "#/components/schemas/StudentHubProvince" }
+        pageable:
+          type: object
+          properties:
+            pageNumber: { type: number }
+            pageSize: { type: number }
+            offset: { type: number }
+            paged: { type: boolean }
+            unpaged: { type: boolean }
+        last: { type: boolean }
+        first: { type: boolean }
+        totalElements: { type: number }
+        totalPages: { type: number }
+        size: { type: number }
+        number: { type: number }
+        numberOfElements: { type: number }
+        empty: { type: boolean }
+    StudentHubWard:
+      type: object
+      properties:
+        id: { oneOf: [{ type: string }, { type: number }] }
+        name: { type: string }
+        provinceCode: { type: string }
+        wardCode: { type: string }
+    StudentHubWardPage:
+      type: object
+      properties:
+        content:
+          type: array
+          items: { $ref: "#/components/schemas/StudentHubWard" }
+        pageable:
+          type: object
+          properties:
+            pageNumber: { type: number }
+            pageSize: { type: number }
+            offset: { type: number }
+            paged: { type: boolean }
+            unpaged: { type: boolean }
+        last: { type: boolean }
+        first: { type: boolean }
+        totalElements: { type: number }
+        totalPages: { type: number }
+        size: { type: number }
+        number: { type: number }
+        numberOfElements: { type: number }
+        empty: { type: boolean }
+    StudentHubDashboardBanner:
+      type: object
+      properties:
+        title: { type: string }
+        content: { type: string }
+        isShow: { type: boolean }
+        status: { type: string }
+        stopAt: { type: string }
