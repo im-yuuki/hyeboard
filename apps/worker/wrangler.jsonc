@@ -12,7 +12,8 @@
     "HYEB_ALLOWED_ORIGINS": "",
     "HYEB_BROWSER_WS_ENDPOINT": "",
     "HYEB_LOG_LEVEL": "info",
-    "VNU_FAR_WALK_ENABLED": "false"
+    "VNU_CODE_LOOKUP_CONCURRENCY": "16",
+    "VNU_CROSS_LOOKUP_BULK_MAX_TARGETS": "50"
   },
   "assets": {
     "directory": "../web/dist",

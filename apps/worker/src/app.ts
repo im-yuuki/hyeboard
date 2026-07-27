@@ -5,6 +5,7 @@ import { Elysia, t } from "elysia";
 import { LocalCaptchaRelayCoordinator, captchaRelayCancelled, captchaRelayNotFound, type CaptchaRelayCoordinator, type PreparedCaptchaRelay } from "./captcha-relay";
 import { probeBudgetUnavailable, type VnuProbeBudgetCoordinator } from "./vnu-probe-budget";
 import { resolveVnuStudentId, VNU_STUDENT_ID_RESOLVER_MAX_PROBES } from "./vnu-student-id-resolver";
+import { normalizeSelfHostedInteger, parseVnuRuntimeConfig, type EffectiveVnuRuntimeConfig } from "./vnu-runtime-config";
 
 // ─── Runtime config ───────────────────────────────────────────
 // Self-hosted (Node/Bun) loads config from config.json + env var overrides
@@ -24,15 +25,28 @@ export interface RuntimeConfig {
   HYEB_BROWSER_IDLE_EVICTION_MS?: string;
   HYEB_LOG_LEVEL?: string;
   VNU_FAR_WALK_ENABLED?: string;
+  VNU_CODE_LOOKUP_CONCURRENCY?: string;
+  VNU_CROSS_LOOKUP_BULK_MAX_TARGETS?: string;
   HOST?: string;
   PORT?: string;
   HYEB_STATIC_DIR?: string;
 }
 
 let runtimeConfig: RuntimeConfig = {};
+let effectiveVnuRuntimeConfig: EffectiveVnuRuntimeConfig = parseVnuRuntimeConfig({});
 
 export function setRuntimeConfig(config: RuntimeConfig): void {
   runtimeConfig = config;
+  effectiveVnuRuntimeConfig = parseVnuRuntimeConfig({
+    codeLookupConcurrency: config.VNU_CODE_LOOKUP_CONCURRENCY,
+    crossLookupBulkMaxTargets: config.VNU_CROSS_LOOKUP_BULK_MAX_TARGETS,
+  }, (setting, effectiveFallback) => {
+    getLogger().warn({ setting, effectiveFallback }, "invalid VNU runtime setting; using safe fallback");
+  });
+}
+
+export function getEffectiveVnuRuntimeConfig(): EffectiveVnuRuntimeConfig {
+  return effectiveVnuRuntimeConfig;
 }
 
 // Read non-secret config from a JSON file (Node/Bun only, no-op on CF Workers).
@@ -44,8 +58,9 @@ export function setRuntimeConfig(config: RuntimeConfig): void {
 // come from an env var only.
 // Structured config.json schema:
 //   { "origins": [...], "browser": { "ws_endpoint", "local", "headless",
-//     "chrome_path", "idle_eviction_minutes" }, "log_level", "host", "port",
-//     "static_dir" }
+//     "chrome_path", "idle_eviction_minutes" }, "vnu": {
+//     "code_lookup_concurrency", "cross_lookup_bulk_max_targets" },
+//     "log_level", "host", "port", "static_dir" }
 // See apps/worker/config.json for the full default file.
 export async function loadConfigFile(): Promise<RuntimeConfig> {
   const isNode = typeof process !== "undefined" && typeof process.cwd === "function";
@@ -66,6 +81,10 @@ export async function loadConfigFile(): Promise<RuntimeConfig> {
       if (typeof cfg.browser.headless === "boolean") r.HYEB_BROWSER_HEADLESS = String(cfg.browser.headless);
       if (typeof cfg.browser.chrome_path === "string") r.HYEB_CHROME_PATH = cfg.browser.chrome_path;
       if (typeof cfg.browser.idle_eviction_minutes === "number") r.HYEB_BROWSER_IDLE_EVICTION_MS = String(cfg.browser.idle_eviction_minutes * 60_000);
+    }
+    if (cfg.vnu && typeof cfg.vnu === "object" && !Array.isArray(cfg.vnu)) {
+      r.VNU_CODE_LOOKUP_CONCURRENCY = normalizeSelfHostedInteger(cfg.vnu.code_lookup_concurrency);
+      r.VNU_CROSS_LOOKUP_BULK_MAX_TARGETS = normalizeSelfHostedInteger(cfg.vnu.cross_lookup_bulk_max_targets);
     }
     if (typeof cfg.log_level === "string") r.HYEB_LOG_LEVEL = cfg.log_level;
     if (typeof cfg.host === "string") r.HOST = cfg.host;
@@ -785,10 +804,18 @@ function corsPlugin() {
 // masked list must be a copy, never a mutation).
 function serializeUniversities() {
   const universities = listUniversities();
-  if (probeBudgetCoordinatorInstalled) return universities;
-  return universities.map((university) => university.capabilities.crossLookup
-    ? { ...university, capabilities: { ...university.capabilities, crossLookup: false } }
-    : university);
+  return universities.map((university) => {
+    if (!probeBudgetCoordinatorInstalled && university.capabilities.crossLookup) {
+      return { ...university, limits: undefined, capabilities: { ...university.capabilities, crossLookup: false } };
+    }
+    if (probeBudgetCoordinatorInstalled && university.id === "vnu" && university.capabilities.crossLookup) {
+      return {
+        ...university,
+        limits: { crossLookup: { bulkMaxTargets: effectiveVnuRuntimeConfig.crossLookupBulkMaxTargets } },
+      };
+    }
+    return university;
+  });
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

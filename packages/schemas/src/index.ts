@@ -33,12 +33,19 @@ export const universityCapabilitiesSchema = z.object({
   crossLookup: z.boolean(),
 });
 
+export const universityLimitsSchema = z.object({
+  crossLookup: z.object({
+    bulkMaxTargets: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  }).optional(),
+});
+
 export const universitySchema = z.object({
   id: z.string(),
   name: z.string(),
   shortName: z.string(),
   theme: universityThemeSchema.optional(),
   capabilities: universityCapabilitiesSchema,
+  limits: universityLimitsSchema.optional(),
 });
 
 export const termSchema = z.object({
@@ -245,6 +252,7 @@ export const apiResponseSchema = <T extends z.ZodType>(data: T) =>
 
 export type UniversityTheme = z.infer<typeof universityThemeSchema>;
 export type UniversityCapabilities = z.infer<typeof universityCapabilitiesSchema>;
+export type UniversityLimits = z.infer<typeof universityLimitsSchema>;
 export type University = z.infer<typeof universitySchema>;
 export type Term = z.infer<typeof termSchema>;
 export type Student = z.infer<typeof studentSchema>;

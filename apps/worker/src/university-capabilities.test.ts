@@ -19,7 +19,11 @@ import type { VnuProbeBudgetCoordinator } from "./vnu-probe-budget";
 const SESSION_SECRET = "worker-test-secret-worker-test-secret";
 
 type UniversitiesPayload = {
-  data: Array<{ id: string; capabilities: Record<string, boolean> }>;
+  data: Array<{
+    id: string;
+    capabilities: Record<string, boolean>;
+    limits?: { crossLookup?: { bulkMaxTargets: number } };
+  }>;
 };
 
 function vnuSession(): EncryptedSessionPayload {
@@ -76,7 +80,16 @@ describe("university capability serialization", () => {
     }
   });
 
-  it("reports the static capability once an authoritative coordinator is installed (Cloudflare path)", async () => {
+  it("omits runtime limits when the authoritative coordinator is unavailable", async () => {
+    const universities = await listUniversities(createApp(undefined));
+    const vnu = universities.find((university) => university.id === "vnu");
+
+    expect(vnu?.capabilities.crossLookup).toBe(false);
+    expect(vnu?.limits).toBeUndefined();
+  });
+
+  it("publishes effective optional VNU limits without mutating other universities once the coordinator is installed", async () => {
+    setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET, VNU_CROSS_LOOKUP_BULK_MAX_TARGETS: "9007199254740991" });
     const coordinator: VnuProbeBudgetCoordinator = {
       async consume() { /* not exercised — capability wiring only */ },
       async reserve() { /* not exercised — capability wiring only */ },
@@ -85,8 +98,15 @@ describe("university capability serialization", () => {
 
     const universities = await listUniversities(createApp(undefined));
 
-    // Seeing true here immediately after the previous test saw false also
-    // proves the mask never mutated the shared static adapter record.
-    expect(universities.find((university) => university.id === "vnu")?.capabilities.crossLookup).toBe(true);
+    expect(universities.find((university) => university.id === "vnu")).toMatchObject({
+      capabilities: { crossLookup: true },
+      limits: { crossLookup: { bulkMaxTargets: Number.MAX_SAFE_INTEGER } },
+    });
+    expect(universities.find((university) => university.id === "mock")?.limits).toBeUndefined();
+    expect(universities.find((university) => university.id === "uet")?.limits).toBeUndefined();
+
+    setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET, VNU_CROSS_LOOKUP_BULK_MAX_TARGETS: "0" });
+    const disabledBulkUniversities = await listUniversities(createApp(undefined));
+    expect(disabledBulkUniversities.find((university) => university.id === "vnu")?.limits?.crossLookup?.bulkMaxTargets).toBe(0);
   });
 });

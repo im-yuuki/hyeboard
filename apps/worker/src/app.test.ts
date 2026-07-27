@@ -1077,30 +1077,26 @@ describe("VNU cross-transcript route", () => {
     expect(probeBudget.count).toBeGreaterThan(0);
   });
 
-  it.each([true, "true", 1, "1", "TRUE", "True"])("ignores config-file far-walk value %j", (configValue) => {
-    const fileConfig = { VNU_FAR_WALK_ENABLED: configValue } as unknown as RuntimeConfig;
+  it("normalizes self-hosted VNU file values and gives environment values precedence", () => {
+    const fileConfig: RuntimeConfig = {
+      VNU_CODE_LOOKUP_CONCURRENCY: "16",
+      VNU_CROSS_LOOKUP_BULK_MAX_TARGETS: "75",
+    };
 
-    const config = selfHostedRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET }, fileConfig);
-
-    expect(config.VNU_FAR_WALK_ENABLED).toBeUndefined();
-    expect(isVnuFarWalkEnabled(config.VNU_FAR_WALK_ENABLED)).toBe(false);
+    expect(selfHostedRuntimeConfig({
+      HYEB_SESSION_SECRET: SESSION_SECRET,
+      VNU_CODE_LOOKUP_CONCURRENCY: "32",
+    }, fileConfig)).toMatchObject({
+      VNU_CODE_LOOKUP_CONCURRENCY: "32",
+      VNU_CROSS_LOOKUP_BULK_MAX_TARGETS: "75",
+    });
   });
 
-  it.each([undefined, "false", "1", "TRUE", "True", " true", "true "])("rejects non-literal environment value %j", (environmentValue) => {
-    const config = selfHostedRuntimeConfig({
-      HYEB_SESSION_SECRET: SESSION_SECRET,
-      VNU_FAR_WALK_ENABLED: environmentValue,
-    }, {});
-
-    expect(isVnuFarWalkEnabled(config.VNU_FAR_WALK_ENABLED)).toBe(false);
+  it.each([undefined, "false", "1", "TRUE", "True", " true", "true "])("keeps the internal far compatibility helper disabled for %j", (value) => {
+    expect(isVnuFarWalkEnabled(value)).toBe(false);
   });
 
-  it("enables far walking for the exact environment string true", () => {
-    const config = selfHostedRuntimeConfig({
-      HYEB_SESSION_SECRET: SESSION_SECRET,
-      VNU_FAR_WALK_ENABLED: "true",
-    }, {});
-
-    expect(isVnuFarWalkEnabled(config.VNU_FAR_WALK_ENABLED)).toBe(true);
+  it("recognizes literal true only for the temporary internal route compatibility path", () => {
+    expect(isVnuFarWalkEnabled("true")).toBe(true);
   });
 });
