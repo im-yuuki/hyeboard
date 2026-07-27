@@ -1,16 +1,10 @@
 import { HyeboardError } from "@hyeboard/core";
 
-const VERIFIED_NEAR_CODE_DELTA = 64;
-const FAR_LINEAR_CORRECTION_CODE_DELTA = 10;
-const NEAR_LINEAR_PROBE_LIMIT = 8;
-const BISECTION_PROBE_LIMIT = 12;
-const FAR_LINEAR_PROBE_LIMIT = 10;
-const TOTAL_PROBE_LIMIT = 24;
-const PROBE_DELAY_MS = 250;
+const LOCAL_RADIUS = 16;
+const STUDENT_CODE_PATTERN = /^\d{8}$/;
 
-// Bisection plus linear correction is the resolver's reachable hard maximum.
-// Bulk budget reservations consume this declared amount per code target.
-export const VNU_STUDENT_ID_RESOLVER_MAX_PROBES = BISECTION_PROBE_LIMIT + FAR_LINEAR_PROBE_LIMIT;
+export const VNU_STUDENT_ID_RESOLVER_MAX_PROBES = 1 + LOCAL_RADIUS * 2;
+export const VNU_STUDENT_ID_RESOLVER_PLATFORM_CONCURRENCY = 6;
 
 export type VnuStudentIdResolution = {
   stdId: string;
@@ -21,86 +15,225 @@ export type VnuStudentIdResolution = {
 export type VnuStudentIdResolverOptions = {
   ownStdId: number;
   ownCode: number;
-  targetCode: number;
-  fetchStudentCode: (stdId: number) => Promise<string | undefined>;
-  waitBetweenProbes?: () => Promise<void>;
+  targetCode: string | number;
+  fetchStudentCode: (stdId: number, signal: AbortSignal) => Promise<string | undefined>;
+  concurrency?: number;
+  platformConcurrencyLimit?: number;
+  signal?: AbortSignal;
   farWalkEnabled?: boolean;
 };
 
-type ProbeResult = { stdId: number; studentCode: number };
+type ProbeOutcome =
+  | { index: number; stdId: number; studentCode: string | undefined }
+  | { index: number; stdId: number; error: unknown };
+
+type ProbeCancellation = { index: number; stdId: number; cancelled: true; reason: unknown };
+type ProbeDecision = ProbeOutcome | ProbeCancellation;
+
+type ActiveProbe = {
+  controller: AbortController;
+  decision: Promise<ProbeDecision>;
+  workSettlement: Promise<ProbeOutcome>;
+  cancel: (reason: unknown) => void;
+};
+
+type ProbeSettlement = { decision: ProbeDecision; workOutcome: ProbeOutcome };
 
 function notConverged(): HyeboardError {
   return new HyeboardError(
     "VNU_CROSS_LOOKUP_NOT_CONVERGED",
-    "Could not resolve an internal student id for that code near your own cohort. The code-to-id mapping only holds within one cohort.",
+    "Could not resolve an internal student id within the bounded local window.",
     404,
   );
 }
 
-function defaultProbeDelay(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, PROBE_DELAY_MS));
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException("This operation was aborted", "AbortError");
 }
 
-function resolved(stdId: number, targetCode: number, probes: number): VnuStudentIdResolution {
-  return {
-    stdId: String(stdId).padStart(11, "0"),
-    stdCode: String(targetCode).padStart(8, "0"),
-    probes,
-  };
+function isValidStudentId(value: number): boolean {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
+function parsePositiveSafeInteger(value: number, name: string): number {
+  if (Number.isSafeInteger(value) && value > 0) return value;
+  throw new Error(`${name} must be a positive safe integer`);
+}
+
+function configuredPoolWidth(concurrency: number, platformConcurrencyLimit: number, candidateCount: number): number {
+  return Math.min(concurrency, platformConcurrencyLimit, candidateCount);
+}
+
+function resolved(stdId: number, targetCode: string, probes: number): VnuStudentIdResolution {
+  return { stdId: String(stdId).padStart(11, "0"), stdCode: targetCode, probes };
+}
+
+function localCandidates(projectedStdId: number, correction: number | undefined): number[] {
+  const candidates = correction === undefined ? [] : [correction];
+  for (let offset = 1; offset <= LOCAL_RADIUS; offset += 1) {
+    candidates.push(projectedStdId - offset, projectedStdId + offset);
+  }
+  return candidates.filter((candidate, index) => (
+    isValidStudentId(candidate)
+    && candidate !== projectedStdId
+    && candidates.indexOf(candidate) === index
+  ));
 }
 
 export async function resolveVnuStudentId(options: VnuStudentIdResolverOptions): Promise<VnuStudentIdResolution> {
-  const { ownStdId, ownCode, targetCode, fetchStudentCode } = options;
-  const waitBetweenProbes = options.waitBetweenProbes ?? defaultProbeDelay;
-  const visited = new Set<number>();
-  let probeCount = 0;
-
-  const probe = async (stdId: number): Promise<ProbeResult> => {
-    if (!Number.isSafeInteger(stdId) || stdId <= 0 || visited.has(stdId) || probeCount >= TOTAL_PROBE_LIMIT) throw notConverged();
-    if (probeCount > 0) await waitBetweenProbes();
-    visited.add(stdId);
-    probeCount += 1;
-    const rawStudentCode = await fetchStudentCode(stdId);
-    if (!rawStudentCode || !/^\d{8}$/.test(rawStudentCode)) throw notConverged();
-    return { stdId, studentCode: Number(rawStudentCode) };
-  };
-
-  const runLinearCorrection = async (initialGuess: number, probeLimit: number): Promise<VnuStudentIdResolution> => {
-    let guess = initialGuess;
-    for (let stageProbes = 0; stageProbes < probeLimit; stageProbes += 1) {
-      const result = await probe(guess);
-      if (result.studentCode === targetCode) return resolved(result.stdId, targetCode, probeCount);
-      guess = result.stdId + (targetCode - result.studentCode);
-    }
+  const concurrency = parsePositiveSafeInteger(options.concurrency ?? 1, "concurrency");
+  const platformConcurrencyLimit = parsePositiveSafeInteger(
+    options.platformConcurrencyLimit ?? VNU_STUDENT_ID_RESOLVER_PLATFORM_CONCURRENCY,
+    "platformConcurrencyLimit",
+  );
+  const targetCode = String(options.targetCode);
+  if (!isValidStudentId(options.ownStdId) || !isValidStudentId(options.ownCode) || !STUDENT_CODE_PATTERN.test(targetCode)) {
     throw notConverged();
+  }
+
+  const numericTargetCode = Number(targetCode);
+  const projectedStdId = options.ownStdId + (numericTargetCode - options.ownCode);
+  if (!isValidStudentId(projectedStdId)) throw notConverged();
+  if (options.signal?.aborted) throw abortReason(options.signal);
+
+  const active = new Map<number, ActiveProbe>();
+  let probes = 0;
+  let callerCancellation: unknown;
+
+  const abortActive = (reason: unknown): void => {
+    for (const probe of active.values()) probe.cancel(reason);
+  };
+  const onCallerAbort = (): void => {
+    callerCancellation = abortReason(options.signal!);
+    abortActive(callerCancellation);
+  };
+  options.signal?.addEventListener("abort", onCallerAbort, { once: true });
+
+  const startProbe = (index: number, stdId: number): ActiveProbe => {
+    const controller = new AbortController();
+    let resolveCancellation!: (cancellation: ProbeCancellation) => void;
+    let cancellationIssued = false;
+    probes += 1;
+    let fetchWork: Promise<string | undefined>;
+    try {
+      fetchWork = options.fetchStudentCode(stdId, controller.signal);
+    } catch (error) {
+      fetchWork = Promise.reject(error);
+    }
+    const workSettlement = fetchWork.then<ProbeOutcome, ProbeOutcome>(
+      (studentCode) => ({ index, stdId, studentCode }),
+      (error: unknown) => ({ index, stdId, error }),
+    );
+    const cancellation = new Promise<ProbeCancellation>((resolve) => {
+      resolveCancellation = resolve;
+    });
+    const decision = Promise.race<ProbeDecision>([workSettlement, cancellation]);
+    const cancel = (reason: unknown): void => {
+      if (cancellationIssued) return;
+      cancellationIssued = true;
+      resolveCancellation({ index, stdId, cancelled: true, reason });
+      controller.abort(reason);
+    };
+    const probe = { controller, decision, workSettlement, cancel };
+    active.set(index, probe);
+    return probe;
   };
 
-  const codeDelta = targetCode - ownCode;
-  const projectedStdId = ownStdId + codeDelta;
-  if (Math.abs(codeDelta) <= VERIFIED_NEAR_CODE_DELTA) {
-    return runLinearCorrection(projectedStdId, NEAR_LINEAR_PROBE_LIMIT);
+  const settleStarted = async (): Promise<ProbeSettlement[]> => {
+    const settlements = await Promise.all([...active.values()].map(async (probe) => {
+      const [decision, workOutcome] = await Promise.all([probe.decision, probe.workSettlement]);
+      return { decision, workOutcome };
+    }));
+    active.clear();
+    return settlements;
+  };
+
+  try {
+    const firstProbe = startProbe(-1, projectedStdId);
+    const firstOutcome = await firstProbe.decision;
+    await firstProbe.workSettlement;
+    active.delete(-1);
+    if (callerCancellation !== undefined) throw callerCancellation;
+    if ("cancelled" in firstOutcome) throw firstOutcome.reason;
+    if ("error" in firstOutcome) throw callerCancellation ?? firstOutcome.error;
+    if (firstOutcome.studentCode === targetCode) return resolved(projectedStdId, targetCode, probes);
+
+    let correction: number | undefined;
+    if (firstOutcome.studentCode && STUDENT_CODE_PATTERN.test(firstOutcome.studentCode)) {
+      const correctionOffset = numericTargetCode - Number(firstOutcome.studentCode);
+      const correctedStdId = projectedStdId + correctionOffset;
+      if (Math.abs(correctionOffset) <= LOCAL_RADIUS && isValidStudentId(correctedStdId) && correctedStdId !== projectedStdId) {
+        correction = correctedStdId;
+      }
+    }
+
+    const candidates = localCandidates(projectedStdId, correction);
+    const poolWidth = configuredPoolWidth(concurrency, platformConcurrencyLimit, candidates.length);
+    const settled = new Map<number, string | undefined>();
+    let nextIndex = 0;
+    let earliestExactIndex: number | undefined;
+
+    const fillPool = (): void => {
+      while (active.size < poolWidth && nextIndex < candidates.length && (earliestExactIndex === undefined || nextIndex < earliestExactIndex)) {
+        startProbe(nextIndex, candidates[nextIndex]);
+        nextIndex += 1;
+      }
+    };
+
+    fillPool();
+    while (active.size > 0) {
+      const outcome = await Promise.race([...active.values()].map((probe) => probe.decision));
+
+      if (callerCancellation !== undefined) {
+        abortActive(callerCancellation);
+        await settleStarted();
+        throw callerCancellation;
+      }
+
+      if ("cancelled" in outcome) {
+        abortActive(outcome.reason);
+        await settleStarted();
+        throw outcome.reason;
+      }
+
+      active.delete(outcome.index);
+
+      if ("error" in outcome) {
+        const fatal = callerCancellation ?? outcome.error;
+        abortActive(fatal);
+        await settleStarted();
+        if (callerCancellation !== undefined) throw callerCancellation;
+        throw fatal;
+      }
+
+      settled.set(outcome.index, outcome.studentCode);
+      if (outcome.studentCode === targetCode) {
+        earliestExactIndex = Math.min(earliestExactIndex ?? outcome.index, outcome.index);
+      }
+
+      let prefixIndex = 0;
+      while (settled.has(prefixIndex)) {
+        if (settled.get(prefixIndex) === targetCode) {
+          const winnerStdId = candidates[prefixIndex];
+          const winnerReason = new DOMException("Lower-priority probe cancelled", "AbortError");
+          abortActive(winnerReason);
+          const siblingSettlements = await settleStarted();
+          if (callerCancellation !== undefined) throw callerCancellation;
+          const unexpectedFailure = siblingSettlements.find(({ decision }) => "error" in decision);
+          if (unexpectedFailure && "error" in unexpectedFailure.decision) throw unexpectedFailure.decision.error;
+          return resolved(winnerStdId, targetCode, probes);
+        }
+        prefixIndex += 1;
+      }
+      fillPool();
+    }
+
+    throw callerCancellation ?? notConverged();
+  } catch (error) {
+    abortActive(error);
+    await settleStarted();
+    throw error;
+  } finally {
+    options.signal?.removeEventListener("abort", onCallerAbort);
   }
-
-  if (options.farWalkEnabled !== true) throw notConverged();
-
-  const direction = Math.sign(codeDelta);
-  const margin = Math.ceil(Math.abs(codeDelta) * 0.02) + 64;
-  let lowerStdId = direction > 0 ? ownStdId + 1 : projectedStdId - margin;
-  let upperStdId = direction > 0 ? projectedStdId + margin : ownStdId - 1;
-  let closest: ProbeResult | undefined;
-
-  // Wide-span code(StdID) monotonicity is assumed here, not live-verified.
-  // Callers must retain an explicit release gate around this path.
-  for (let bisectionProbes = 0; bisectionProbes < BISECTION_PROBE_LIMIT && lowerStdId <= upperStdId; bisectionProbes += 1) {
-    const midpoint = Math.floor((lowerStdId + upperStdId) / 2);
-    const result = await probe(midpoint);
-    if (!closest || Math.abs(targetCode - result.studentCode) < Math.abs(targetCode - closest.studentCode)) closest = result;
-    if (result.studentCode === targetCode) return resolved(result.stdId, targetCode, probeCount);
-    if (Math.abs(targetCode - result.studentCode) <= FAR_LINEAR_CORRECTION_CODE_DELTA) break;
-    if (result.studentCode < targetCode) lowerStdId = midpoint + 1;
-    else upperStdId = midpoint - 1;
-  }
-
-  if (!closest) throw notConverged();
-  return runLinearCorrection(closest.stdId + (targetCode - closest.studentCode), FAR_LINEAR_PROBE_LIMIT);
 }
