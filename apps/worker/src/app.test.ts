@@ -108,6 +108,17 @@ class TestCache {
       expiresAt: this.currentTime() + 3_600_000,
     });
   }
+
+  setOnlyRawEntry(value: unknown): void {
+    const rawUrls = this.rawUrls();
+    if (rawUrls.length !== 1) throw new Error(`Expected one VNU raw cache entry, found ${rawUrls.length}`);
+    this.store.set(rawUrls[0], {
+      response: new Response(JSON.stringify(value), {
+        headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=300" },
+      }),
+      expiresAt: this.currentTime() + 300_000,
+    });
+  }
 }
 
 function vnuSession(expiresAt = "2099-01-01T00:00:00.000Z"): EncryptedSessionPayload {
@@ -578,6 +589,34 @@ describe("VNU import session cache", () => {
     expect(cache.rawUrls()).toEqual([]);
     expect(gradesSpy).toHaveBeenCalledTimes(1);
     expect(upstreamFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a legacy expiry page from the raw cache without an upstream call or notice leak", async () => {
+    const expiryNoticeSentinel = "LEGACY_CACHED_EXPIRY_NOTICE_SENTINEL";
+    const expiryNotice = "Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.";
+    const token = await encryptSession(vnuSession(), SESSION_SECRET);
+    gradesSpy = vi.spyOn(DaotaoClient.prototype, "getGradesHtml").mockResolvedValue("<html><body>NORMAL_CACHED_GRADES</body></html>");
+
+    const seedResponse = await getVnuRawPage(app, token);
+    const normalCacheHit = await getVnuRawPage(app, token);
+    expect(seedResponse.status).toBe(200);
+    expect(normalCacheHit.status).toBe(200);
+    await expect(normalCacheHit.json()).resolves.toEqual({ data: { html: "<html><body>NORMAL_CACHED_GRADES</body></html>" }, error: null });
+    expect(gradesSpy).toHaveBeenCalledTimes(1);
+
+    cache.setOnlyRawEntry({
+      html: `<html><body><table data-synthetic-marker="${expiryNoticeSentinel}"><tr><td>${expiryNotice}</td></tr></table></body></html>`,
+    });
+    gradesSpy.mockClear();
+
+    const response = await getVnuRawPage(app, token);
+    const responseText = await response.text();
+
+    expect(response.status).toBe(401);
+    expect(JSON.parse(responseText)).toMatchObject({ data: null, error: { code: "VNU_SESSION_EXPIRED" } });
+    expect(responseText).not.toContain(expiryNoticeSentinel);
+    expect(responseText).not.toContain(expiryNotice);
+    expect(gradesSpy).not.toHaveBeenCalled();
   });
 
   it("uses separate raw-cache keys for old and repaired VNU cookies", async () => {

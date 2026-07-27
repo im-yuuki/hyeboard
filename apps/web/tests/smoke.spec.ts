@@ -22,12 +22,17 @@ async function startMockedVnuSession(
   const featureNavigationReady = new Promise<void>((resolve) => {
     releaseRawRequests = resolve;
   });
-  let rawRequestsStarted = 0;
+  const expectedRawPaths = new Set([
+    "/api/vnu/raw/profile",
+    "/api/vnu/raw/grades",
+    "/api/vnu/raw/progress",
+  ]);
+  const pendingRawRequestPaths = new Set(expectedRawPaths);
   let markAllRawRequestsStarted!: () => void;
   const allRawRequestsStarted = new Promise<void>((resolve) => {
     markAllRawRequestsStarted = resolve;
   });
-  let rawResponsesFulfilled = 0;
+  const pendingRawResponsePaths = new Set(expectedRawPaths);
   let markAllRawResponsesFulfilled!: () => void;
   const allRawResponsesFulfilled = new Promise<void>((resolve) => {
     markAllRawResponsesFulfilled = resolve;
@@ -52,16 +57,15 @@ async function startMockedVnuSession(
     });
   });
   await page.route("**/api/vnu/raw/**", async (route) => {
-    rawRequestsStarted += 1;
-    if (rawRequestsStarted === 3) markAllRawRequestsStarted();
+    const rawPath = new URL(route.request().url()).pathname;
+    if (pendingRawRequestPaths.delete(rawPath) && pendingRawRequestPaths.size === 0) markAllRawRequestsStarted();
     await featureNavigationReady;
     await route.fulfill({
       status: error.status,
       contentType: "application/json",
       body: JSON.stringify({ error: { code: error.code, message: error.message } }),
     });
-    rawResponsesFulfilled += 1;
-    if (rawResponsesFulfilled === 3) markAllRawResponsesFulfilled();
+    if (pendingRawResponsePaths.delete(rawPath) && pendingRawResponsePaths.size === 0) markAllRawResponsesFulfilled();
   });
 
   await page.goto("/login");
@@ -246,6 +250,7 @@ test("concurrent VNU session expiry removes only its originating account", async
     status: 401,
     message: "Synthetic concurrent VNU session expiry",
   }, { deferRawResponses: true });
+  const harmlessExtraRawRequest = page.evaluate(() => fetch("/api/vnu/raw/syllabus").then((response) => response.status));
   await mockedSession.allRawRequestsStarted;
 
   await page.getByRole("button", { name: "Open account menu" }).click();
@@ -254,6 +259,7 @@ test("concurrent VNU session expiry removes only its originating account", async
 
   mockedSession.releaseRawRequests();
   await mockedSession.allRawResponsesFulfilled;
+  await expect(harmlessExtraRawRequest).resolves.toBe(401);
   await page.waitForLoadState("networkidle");
   await expect.poll(() => page.evaluate((expectedAccount) => {
     const accounts = JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ id: string; universityId: string; token: string }>;

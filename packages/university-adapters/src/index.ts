@@ -5,7 +5,7 @@ export { DaotaoClient } from "./vnu/daotao-client";
 // internal student id from their own profile page (never from client query
 // params) for the vnu point-detail / cross-lookup guards. Pure regex, safe
 // for every runtime the package ships to.
-export { parseProfileHtml } from "./vnu/parser";
+export { isDaotaoSessionExpired, parseProfileHtml } from "./vnu/parser";
 export type { VnuProfile } from "./vnu/types";
 // Worker-side cross-student identity resolution — the worker parses the
 // fetched listpoint_Brc1.asp header itself so only the resolved code/name/

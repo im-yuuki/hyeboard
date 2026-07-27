@@ -1,6 +1,6 @@
 import { cors } from "@elysiajs/cors";
 import { decryptSession, encryptSession, fail, getLogger, HyeboardError, isExpired, ok, parseBearerToken, type EncryptedSessionPayload } from "@hyeboard/core";
-import { DaotaoClient, getAdapter, listUniversities, parseProfileHtml, parseTranscriptHeader, parseTranscriptHtml, type BrowserBinding, type BrowserConnection, type VnuTranscript } from "@hyeboard/university-adapters";
+import { DaotaoClient, getAdapter, isDaotaoSessionExpired, listUniversities, parseProfileHtml, parseTranscriptHeader, parseTranscriptHtml, type BrowserBinding, type BrowserConnection, type VnuTranscript } from "@hyeboard/university-adapters";
 import { Elysia, t } from "elysia";
 import { LocalCaptchaRelayCoordinator, captchaRelayCancelled, captchaRelayNotFound, type CaptchaRelayCoordinator, type PreparedCaptchaRelay } from "./captcha-relay";
 import { probeBudgetUnavailable, type VnuProbeBudgetCoordinator } from "./vnu-probe-budget";
@@ -710,7 +710,12 @@ async function vnuRawHtml(session: EncryptedSessionPayload, page: string, params
   const { selStd: _ignoredSelStd, selUniv: _ignoredSelUniv, ...trustedParams } = params;
   const cacheKey = await vnuRawCacheKey(session, page, trustedParams);
   const cached = await cacheGet<{ html: string }>(cacheKey);
-  if (cached) return cached.html;
+  if (cached) {
+    if (isDaotaoSessionExpired("", cached.html)) {
+      throw new HyeboardError("VNU_SESSION_EXPIRED", "The university portal session has expired. Sign in again.", 401);
+    }
+    return cached.html;
+  }
 
   const client = new DaotaoClient(session);
   let html: string;

@@ -481,73 +481,62 @@ function scriptClosingTagEndAt(html: string, index: number): number | undefined 
   return html[cursor] === ">" ? cursor + 1 : undefined;
 }
 
-function maskCommentsAndScripts(html: string): string {
-  const masked: string[] = [];
-  let mode: "markup" | "comment" | "script" = "markup";
-  let index = 0;
-
-  while (index < html.length) {
-    if (mode === "markup") {
-      if (html.startsWith("<!--", index)) {
-        mode = "comment";
-        masked.push(" ");
-      } else if (isScriptOpeningAt(html, index)) {
-        mode = "script";
-        masked.push(" ");
-      } else {
-        masked.push(html[index]);
-      }
-      index += 1;
-      continue;
-    }
-
-    if (mode === "comment" && html.startsWith("-->", index)) {
-      masked.push("   ");
-      mode = "markup";
-      index += 3;
-      continue;
-    }
-
-    if (mode === "script") {
-      const closingTagEnd = scriptClosingTagEndAt(html, index);
-      if (closingTagEnd !== undefined) {
-        masked.push(" ".repeat(closingTagEnd - index));
-        mode = "markup";
-        index = closingTagEnd;
-        continue;
-      }
-    }
-
-    masked.push(" ");
-    index += 1;
-  }
-
-  return masked.join("");
-}
-
 function hasCompleteLoginForm(html: string): boolean {
-  const searchableHtml = maskCommentsAndScripts(html);
-  const formStartRe = /<form\b[^>]*>/gi;
-  let formStart: RegExpExecArray | null;
+  type LoginFormCandidate = { hasLoginId: boolean; hasPassword: boolean };
 
-  while ((formStart = formStartRe.exec(searchableHtml))) {
-    if (attrOf(formStart[0], "action")?.toLowerCase() !== DAOTAO_LOGIN_PATH) continue;
+  let candidate: LoginFormCandidate | undefined;
+  let cursor = 0;
 
-    const formEndRe = /<\/form\s*>/gi;
-    formEndRe.lastIndex = formStartRe.lastIndex;
-    const formEnd = formEndRe.exec(searchableHtml);
-    if (!formEnd) continue;
+  while (cursor < html.length) {
+    const tagStart = html.indexOf("<", cursor);
+    if (tagStart === -1) return false;
 
-    const inputNames = new Set<string>();
-    const inputRe = /<input\b[^>]*>/gi;
-    const formBody = searchableHtml.slice(formStartRe.lastIndex, formEnd.index);
-    let input: RegExpExecArray | null;
-    while ((input = inputRe.exec(formBody))) {
-      const name = attrOf(input[0], "name")?.toLowerCase();
-      if (name) inputNames.add(name);
+    if (html.startsWith("<!--", tagStart)) {
+      const commentEnd = html.indexOf("-->", tagStart + 4);
+      if (commentEnd === -1) return false;
+      cursor = commentEnd + 3;
+      continue;
     }
 
-    if (inputNames.has("txtloginid") && inputNames.has("txtpassword")) return true;
+    if (isScriptOpeningAt(html, tagStart)) {
+      const openingTagEnd = html.indexOf(">", tagStart + 7);
+      if (openingTagEnd === -1) return false;
+
+      cursor = openingTagEnd + 1;
+      while (cursor < html.length) {
+        const closingTagEnd = scriptClosingTagEndAt(html, cursor);
+        if (closingTagEnd !== undefined) {
+          cursor = closingTagEnd;
+          break;
+        }
+        cursor += 1;
+      }
+      if (cursor >= html.length) return false;
+      continue;
+    }
+
+    const tagEnd = html.indexOf(">", tagStart + 1);
+    if (tagEnd === -1) return false;
+    const tag = html.slice(tagStart, tagEnd + 1);
+    cursor = tagEnd + 1;
+
+    if (/^<form\b/i.test(tag)) {
+      candidate = attrOf(tag, "action")?.toLowerCase() === DAOTAO_LOGIN_PATH
+        ? { hasLoginId: false, hasPassword: false }
+        : undefined;
+      continue;
+    }
+
+    if (/^<\/form\s*>$/i.test(tag)) {
+      if (candidate?.hasLoginId && candidate.hasPassword) return true;
+      candidate = undefined;
+      continue;
+    }
+
+    if (!candidate || !/^<input\b/i.test(tag)) continue;
+    const inputName = attrOf(tag, "name")?.toLowerCase();
+    if (inputName === "txtloginid") candidate.hasLoginId = true;
+    if (inputName === "txtpassword") candidate.hasPassword = true;
   }
 
   return false;

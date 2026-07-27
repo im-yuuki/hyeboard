@@ -135,6 +135,14 @@ describe("isDaotaoSessionExpired", () => {
     expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(false);
   });
 
+  it("scans many unterminated login-form candidates without matching controls across forms", () => {
+    const candidates = Array.from({ length: 20_000 }, (_, index) => (
+      `<form action="/dkmh/login.asp"><input name="${index % 2 === 0 ? "txtLoginId" : "txtPassword"}">`
+    )).join("");
+
+    expect(isDaotaoSessionExpired(authenticatedUrl, `${candidates}</form>`)).toBe(false);
+  });
+
   it("matches the complete standalone session-ended notice", () => {
     expect(isDaotaoSessionExpired(authenticatedUrl, standaloneSessionEndedNoticeHtml)).toBe(true);
   });
