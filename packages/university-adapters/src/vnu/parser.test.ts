@@ -103,6 +103,14 @@ describe("isDaotaoSessionExpired", () => {
   });
 
   it.each([
+    ["an extra row", `<html><body><table><tr><td>Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.</td></tr><tr><td></td></tr></table></body></html>`],
+    ["an extra cell", `<html><body><table><tr><td>Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.</td><td></td></tr></table></body></html>`],
+    ["an empty button", `<html><body><table><tr><td>Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.<button></button></td></tr></table></body></html>`],
+  ])("rejects a standalone notice with %s", (_case, html) => {
+    expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(false);
+  });
+
+  it.each([
     "Please log in because your session may have ended.",
     `<html><body><form><input name="StdCode" value="SYNTHETIC"></form><table><tr><td>Current term</td></tr></table></body></html>`,
     `<html><body><table><tr><td><font color="red">Unrelated notice.</font></td></tr></table></body></html>`,

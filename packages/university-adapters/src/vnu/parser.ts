@@ -486,13 +486,15 @@ function isTrustedLoginUrl(finalUrl: string): boolean {
   }
 }
 
-function isStandaloneSessionEndedNotice(html: string): boolean {
+function hasStandaloneSessionEndedNotice(html: string): boolean {
   const bodyMatch = html.match(/<body\b[^>]*>([\s\S]*?)<\/body\s*>/i);
   if (!bodyMatch) return false;
 
   const body = bodyMatch[1];
   if ((body.match(/<table\b/gi) ?? []).length !== 1) return false;
-  if (/<(?:form|input|select|textarea)\b/i.test(body)) return false;
+  if ((body.match(/<tr\b/gi) ?? []).length !== 1) return false;
+  if ((body.match(/<td\b/gi) ?? []).length !== 1) return false;
+  if (/<(?:form|input|select|textarea|button)\b/i.test(body)) return false;
   if (!/^\s*<table\b[^>]*>\s*<tr\b[^>]*>\s*<td\b[^>]*>[\s\S]*<\/td\s*>\s*<\/tr\s*>\s*<\/table\s*>\s*$/i.test(body)) return false;
 
   return stripTags(body) === DAOTAO_SESSION_ENDED_SENTENCE;
@@ -501,9 +503,10 @@ function isStandaloneSessionEndedNotice(html: string): boolean {
 export function isDaotaoSessionExpired(finalUrl: string, html: string): boolean {
   if (isTrustedLoginUrl(finalUrl)) return true;
   if (hasCompleteLoginForm(html)) return true;
-  return isStandaloneSessionEndedNotice(html);
+  return hasStandaloneSessionEndedNotice(html);
 }
 
+// Deprecated compatibility wrapper; Task 2 removes it when daotao-client migrates.
 export function hasLoginForm(html: string): boolean {
   return hasCompleteLoginForm(html);
 }
