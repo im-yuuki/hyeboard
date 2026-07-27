@@ -615,6 +615,11 @@ type CachedVnuImport = {
   session: AuthenticatedSessionMetadata;
 };
 
+type RestoredCachedVnuImport = {
+  payload: EncryptedSessionPayload;
+  session: AuthenticatedSessionMetadata;
+};
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -637,20 +642,20 @@ function parseCachedVnuImport(value: unknown): CachedVnuImport | undefined {
   };
 }
 
-async function restoreCachedVnuImport(value: unknown, secret: string): Promise<{ token: string; session: AuthenticatedSessionMetadata } | undefined> {
+async function restoreCachedVnuImport(value: unknown, secret: string): Promise<RestoredCachedVnuImport | undefined> {
   const cached = parseCachedVnuImport(value);
   if (!cached) return undefined;
 
   try {
-    const session = await decryptSession(cached.seed, secret);
-    const expiresAt = Date.parse(session.expiresAt);
-    if (session.universityId !== "vnu" || session.vnu?.kind !== "cookie" || typeof session.vnu.value !== "string" || session.vnu.value.length === 0) return undefined;
+    const payload = await decryptSession(cached.seed, secret);
+    const expiresAt = Date.parse(payload.expiresAt);
+    if (payload.universityId !== "vnu" || payload.vnu?.kind !== "cookie" || typeof payload.vnu.value !== "string" || payload.vnu.value.length === 0) return undefined;
     if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) return undefined;
-    if (cached.session.universityId !== session.universityId) return undefined;
-    if (cached.session.studentCode !== session.studentCode) return undefined;
-    if (cached.session.expiresAt !== session.expiresAt) return undefined;
+    if (cached.session.universityId !== payload.universityId) return undefined;
+    if (cached.session.studentCode !== payload.studentCode) return undefined;
+    if (cached.session.expiresAt !== payload.expiresAt) return undefined;
 
-    return { token: await encryptSession(session, secret), session: cached.session };
+    return { payload, session: cached.session };
   } catch {
     return undefined;
   }
@@ -907,19 +912,34 @@ export function createApp(adapter: any) {
       if (params.universityId === "vnu" && body.vnuUsername && body.vnuPassword) {
         const cacheKey = await vnuImportCacheKey(body.vnuUsername, body.vnuPassword);
         const secret = getSessionSecret();
-        const cached = await restoreCachedVnuImport(await cacheGet<unknown>(cacheKey), secret);
-        if (cached) return ok(cached);
-
-        const imported = await adapterInstance.importSession(body);
-        const normalizedSession: EncryptedSessionPayload = {
-          ...imported.session,
-          studentCode: imported.studentCode ?? imported.session.studentCode,
+        const loginAndCache = async () => {
+          const imported = await adapterInstance.importSession(body);
+          const normalizedSession: EncryptedSessionPayload = {
+            ...imported.session,
+            studentCode: imported.studentCode ?? imported.session.studentCode,
+          };
+          const seed = await encryptSession(normalizedSession, secret);
+          const token = await encryptSession(normalizedSession, secret);
+          const payload = { token, session: { universityId: normalizedSession.universityId, studentCode: normalizedSession.studentCode, expiresAt: normalizedSession.expiresAt, authenticated: true as const } };
+          await cachePut(cacheKey, { seed, session: payload.session }, Math.floor((Date.parse(normalizedSession.expiresAt) - Date.now()) / 1000));
+          return ok(payload);
         };
-        const seed = await encryptSession(normalizedSession, secret);
-        const token = await encryptSession(normalizedSession, secret);
-        const payload = { token, session: { universityId: normalizedSession.universityId, studentCode: normalizedSession.studentCode, expiresAt: normalizedSession.expiresAt, authenticated: true as const } };
-        await cachePut(cacheKey, { seed, session: payload.session }, Math.floor((Date.parse(normalizedSession.expiresAt) - Date.now()) / 1000));
-        return ok(payload);
+
+        const cached = await restoreCachedVnuImport(await cacheGet<unknown>(cacheKey), secret);
+        if (!cached) return loginAndCache();
+
+        let liveStudentCode: string | undefined;
+        try {
+          liveStudentCode = parseProfileHtml(await new DaotaoClient(cached.payload).getProfileHtml()).studentCode;
+        } catch (error) {
+          if (error instanceof HyeboardError && error.code === "VNU_SESSION_EXPIRED") return loginAndCache();
+          throw error;
+        }
+
+        if (!liveStudentCode || liveStudentCode !== cached.payload.studentCode || liveStudentCode !== cached.session.studentCode) return loginAndCache();
+
+        const token = await encryptSession(cached.payload, secret);
+        return ok({ token, session: cached.session });
       }
       const imported = await adapterInstance.importSession(body);
       const token = await encryptSession(imported.session, getSessionSecret());
