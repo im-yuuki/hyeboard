@@ -33,6 +33,7 @@ function options(overrides: Partial<Parameters<typeof resolveVnuStudentId>[0]> =
     ownStdId: SYNTHETIC_INTERNAL_ID,
     ownCode: SYNTHETIC_STUDENT_CODE,
     targetCode: TARGET_CODE,
+    concurrency: 4,
     fetchStudentCode: async () => undefined,
     ...overrides,
   };
@@ -46,6 +47,7 @@ describe("resolveVnuStudentId", () => {
   it("uses the projection header correction first for a +89 code delta", async () => {
     const calls: number[] = [];
     const result = await resolveVnuStudentId(options({
+      concurrency: 1,
       fetchStudentCode: async (stdId) => {
         calls.push(stdId);
         return stdId === PROJECTED_STD_ID ? String(TARGET_CODE_NUMBER - 2) : TARGET_CODE;
@@ -64,25 +66,6 @@ describe("resolveVnuStudentId", () => {
       probes: 1,
     });
     expect(fetchStudentCode).toHaveBeenCalledOnce();
-  });
-
-  it("keeps the compatibility options while defaulting to serial probes", async () => {
-    let active = 0;
-    let maxActive = 0;
-    const result = await resolveVnuStudentId(options({
-      targetCode: TARGET_CODE_NUMBER,
-      farWalkEnabled: true,
-      fetchStudentCode: async (stdId) => {
-        active += 1;
-        maxActive = Math.max(maxActive, active);
-        await Promise.resolve();
-        active -= 1;
-        return stdId === PROJECTED_STD_ID + 1 ? TARGET_CODE : undefined;
-      },
-    }));
-
-    expect(result.probes).toBe(3);
-    expect(maxActive).toBe(1);
   });
 
   it("prioritizes one valid first-header correction and removes its default duplicate", async () => {
@@ -107,6 +90,7 @@ describe("resolveVnuStudentId", () => {
   it("treats headerless and malformed local holes as misses", async () => {
     const calls: number[] = [];
     const result = await resolveVnuStudentId(options({
+      concurrency: 1,
       fetchStudentCode: async (stdId) => {
         calls.push(stdId);
         if (stdId === PROJECTED_STD_ID) return undefined;
@@ -325,6 +309,29 @@ describe("resolveVnuStudentId", () => {
     await vi.waitFor(() => expect(started).toEqual([PROJECTED_STD_ID - 1, PROJECTED_STD_ID + 1]));
     winner.resolve(TARGET_CODE);
     siblingFailure.reject(fatal);
+
+    await expect(resolution).rejects.toBe(fatal);
+  });
+
+  it("propagates a sibling fatal whose work settles after winner cleanup cancellation", async () => {
+    const winner = deferred<string | undefined>();
+    const siblingWork = deferred<string | undefined>();
+    const fatal = new HyeboardError("VNU_RATE_LIMITED", "racing systemic failure", 429);
+    let siblingSignal: AbortSignal | undefined;
+    const resolution = resolveVnuStudentId(options({
+      concurrency: 2,
+      fetchStudentCode: async (stdId, signal) => {
+        if (stdId === PROJECTED_STD_ID) return undefined;
+        if (stdId === PROJECTED_STD_ID - 1) return winner.promise;
+        siblingSignal = signal;
+        return siblingWork.promise;
+      },
+    }));
+
+    await vi.waitFor(() => expect(siblingSignal).toBeDefined());
+    winner.resolve(TARGET_CODE);
+    await vi.waitFor(() => expect(siblingSignal?.aborted).toBe(true));
+    siblingWork.reject(fatal);
 
     await expect(resolution).rejects.toBe(fatal);
   });

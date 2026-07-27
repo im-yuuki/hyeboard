@@ -15,12 +15,11 @@ export type VnuStudentIdResolution = {
 export type VnuStudentIdResolverOptions = {
   ownStdId: number;
   ownCode: number;
-  targetCode: string | number;
+  targetCode: string;
   fetchStudentCode: (stdId: number, signal: AbortSignal) => Promise<string | undefined>;
-  concurrency?: number;
+  concurrency: number;
   platformConcurrencyLimit?: number;
   signal?: AbortSignal;
-  farWalkEnabled?: boolean;
 };
 
 type ProbeOutcome =
@@ -38,6 +37,16 @@ type ActiveProbe = {
 };
 
 type ProbeSettlement = { decision: ProbeDecision; workOutcome: ProbeOutcome };
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function isWinnerCleanupRejection(settlement: ProbeSettlement, winnerReason: unknown): boolean {
+  if (!("error" in settlement.workOutcome)) return false;
+  if (!("cancelled" in settlement.decision) || settlement.decision.reason !== winnerReason) return false;
+  return settlement.workOutcome.error === winnerReason || isAbortError(settlement.workOutcome.error);
+}
 
 function notConverged(): HyeboardError {
   return new HyeboardError(
@@ -81,12 +90,12 @@ function localCandidates(projectedStdId: number, correction: number | undefined)
 }
 
 export async function resolveVnuStudentId(options: VnuStudentIdResolverOptions): Promise<VnuStudentIdResolution> {
-  const concurrency = parsePositiveSafeInteger(options.concurrency ?? 1, "concurrency");
+  const concurrency = parsePositiveSafeInteger(options.concurrency, "concurrency");
   const platformConcurrencyLimit = parsePositiveSafeInteger(
     options.platformConcurrencyLimit ?? VNU_STUDENT_ID_RESOLVER_PLATFORM_CONCURRENCY,
     "platformConcurrencyLimit",
   );
-  const targetCode = String(options.targetCode);
+  const targetCode = options.targetCode;
   if (!isValidStudentId(options.ownStdId) || !isValidStudentId(options.ownCode) || !STUDENT_CODE_PATTERN.test(targetCode)) {
     throw notConverged();
   }
@@ -219,8 +228,10 @@ export async function resolveVnuStudentId(options: VnuStudentIdResolverOptions):
           abortActive(winnerReason);
           const siblingSettlements = await settleStarted();
           if (callerCancellation !== undefined) throw callerCancellation;
-          const unexpectedFailure = siblingSettlements.find(({ decision }) => "error" in decision);
-          if (unexpectedFailure && "error" in unexpectedFailure.decision) throw unexpectedFailure.decision.error;
+          const independentFailure = siblingSettlements.find((settlement) => (
+            "error" in settlement.workOutcome && !isWinnerCleanupRejection(settlement, winnerReason)
+          ));
+          if (independentFailure && "error" in independentFailure.workOutcome) throw independentFailure.workOutcome.error;
           return resolved(winnerStdId, targetCode, probes);
         }
         prefixIndex += 1;
