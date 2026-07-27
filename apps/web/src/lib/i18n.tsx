@@ -88,6 +88,12 @@ function buildDictionary() {
       document: "Document",
       news: "News",
     },
+    exports: {
+      action: "Export",
+      json: "Download JSON",
+      csv: "Download CSV",
+      failed: "The export could not be downloaded. Your result is unchanged; try again.",
+    },
     dashboard: {
       currentTerm: "Current term",
       welcomeBack: (name: string) => `Welcome back, ${name}`,
@@ -555,6 +561,12 @@ function vi(): typeof en {
       pending: "Đang chờ",
       document: "Tài liệu",
       news: "Tin tức",
+    },
+    exports: {
+      action: "Xuất dữ liệu",
+      json: "Tải JSON",
+      csv: "Tải CSV",
+      failed: "Không thể tải dữ liệu xuất. Kết quả vẫn được giữ nguyên; hãy thử lại.",
     },
     dashboard: {
       currentTerm: "Học kỳ hiện tại",
