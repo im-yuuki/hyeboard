@@ -143,6 +143,20 @@ describe("isDaotaoSessionExpired", () => {
     expect(isDaotaoSessionExpired(authenticatedUrl, `${candidates}</form>`)).toBe(false);
   });
 
+  it("rejects a complete login form nested inside a non-login form", () => {
+    const html = `<form action="/account"><form action="/dkmh/login.asp"><input name="txtLoginId"><input name="txtPassword"></form></form>`;
+
+    expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(false);
+  });
+
+  it("taints an outer login form containing a nested form, then resumes after the outer close", () => {
+    const malformed = `<form action="/dkmh/login.asp"><input name="txtLoginId"><form action="/account"></form><input name="txtPassword"></form>`;
+    const valid = `<form action="/dkmh/login.asp"><input name="txtLoginId"><input name="txtPassword"></form>`;
+
+    expect(isDaotaoSessionExpired(authenticatedUrl, malformed)).toBe(false);
+    expect(isDaotaoSessionExpired(authenticatedUrl, `${malformed}${valid}`)).toBe(true);
+  });
+
   it("matches the complete standalone session-ended notice", () => {
     expect(isDaotaoSessionExpired(authenticatedUrl, standaloneSessionEndedNoticeHtml)).toBe(true);
   });

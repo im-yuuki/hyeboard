@@ -485,6 +485,8 @@ function hasCompleteLoginForm(html: string): boolean {
   type LoginFormCandidate = { hasLoginId: boolean; hasPassword: boolean };
 
   let candidate: LoginFormCandidate | undefined;
+  let formDepth = 0;
+  let formRegionTainted = false;
   let cursor = 0;
 
   while (cursor < html.length) {
@@ -521,6 +523,12 @@ function hasCompleteLoginForm(html: string): boolean {
     cursor = tagEnd + 1;
 
     if (/^<form\b/i.test(tag)) {
+      formDepth += 1;
+      if (formDepth > 1) {
+        formRegionTainted = true;
+        candidate = undefined;
+        continue;
+      }
       candidate = attrOf(tag, "action")?.toLowerCase() === DAOTAO_LOGIN_PATH
         ? { hasLoginId: false, hasPassword: false }
         : undefined;
@@ -528,12 +536,16 @@ function hasCompleteLoginForm(html: string): boolean {
     }
 
     if (/^<\/form\s*>$/i.test(tag)) {
-      if (candidate?.hasLoginId && candidate.hasPassword) return true;
+      if (formDepth === 0) continue;
+      formDepth -= 1;
+      if (formDepth > 0) continue;
+      if (!formRegionTainted && candidate?.hasLoginId && candidate.hasPassword) return true;
       candidate = undefined;
+      formRegionTainted = false;
       continue;
     }
 
-    if (!candidate || !/^<input\b/i.test(tag)) continue;
+    if (formDepth !== 1 || formRegionTainted || !candidate || !/^<input\b/i.test(tag)) continue;
     const inputName = attrOf(tag, "name")?.toLowerCase();
     if (inputName === "txtloginid") candidate.hasLoginId = true;
     if (inputName === "txtpassword") candidate.hasPassword = true;
