@@ -290,9 +290,24 @@ test("notifications menu shows dashboard notifications", async ({ page }) => {
   await expect(page.getByText("No notifications right now.").or(page.getByRole("menuitem").first())).toBeVisible();
 });
 
-test("grades merge summer term into term two and show term GPA", async ({ page }) => {
+test("grades default to the newest term, merge summer into term two, and expand row details", async ({ page }) => {
   await loginDemo(page);
   await page.goto("/grades");
+
+  // Default selection is the newest term only, not the full stacked transcript.
+  await expect(page.getByRole("heading", { name: "Semester 1, 2025–2026" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Semester 2, 2024–2025" })).toHaveCount(0);
+  await expect(page.getByText("Web Application Development")).toBeVisible();
+
+  // The Note column is gone; letter grades render as toned badges instead.
+  await expect(page.getByRole("columnheader", { name: "Note" })).toHaveCount(0);
+  await expect(page.getByTestId("letter-badge")).toHaveCount(2);
+  await expect(page.getByTestId("letter-badge").nth(0)).toHaveText("B+");
+  await expect(page.getByTestId("letter-badge").nth(1)).toHaveText("A");
+
+  // Switching terms via the dropdown reveals the merged summer group.
+  await page.getByRole("combobox", { name: "Term" }).click();
+  await page.getByRole("option", { name: "Semester 2, 2024–2025" }).click();
   await expect(page.getByRole("heading", { name: "Semester 2, 2024–2025" })).toBeVisible();
   await expect(page.getByText("20242", { exact: true })).toHaveCount(0);
   await expect(page.getByTestId("term-summary").first()).toBeVisible();
@@ -301,6 +316,17 @@ test("grades merge summer term into term two and show term GPA", async ({ page }
   await expect(page.getByText("Signals and Systems")).toBeVisible();
   await expect(page.getByText("Term GPA").first()).toBeVisible();
   await expect(page.getByText("3.40")).toBeVisible();
+  await expect(page.getByText("A+", { exact: true }).first()).toBeVisible();
+
+  // Expanding a row shows the detail panel with its humanized (summer) term.
+  const detailToggle = page.getByRole("button", { name: "Toggle details for Signals and Systems" });
+  await expect(detailToggle).toHaveAttribute("aria-expanded", "false");
+  await detailToggle.click();
+  await expect(detailToggle).toHaveAttribute("aria-expanded", "true");
+  await expect(page.getByText("Summer semester, 2024–2025")).toBeVisible();
+  await detailToggle.click();
+  await expect(detailToggle).toHaveAttribute("aria-expanded", "false");
+
   await page.getByRole("button", { name: "Point 10" }).first().click();
   await expect(page.getByRole("columnheader", { name: /Point 10/ }).first()).toHaveAttribute("aria-sort", "ascending");
   await page.getByRole("button", { name: "Point 10" }).first().click();
