@@ -501,6 +501,64 @@ test("CAPTCHA verification field exposes a persistent accessible label", async (
   await expect(page.getByLabel("Verification code")).toBeVisible();
 });
 
+test("session death triggers inline CAPTCHA re-auth instead of a login redirect", async ({ page }) => {
+  // First import-session call (the login) succeeds immediately with a token
+  // the real worker cannot decrypt, so the very first dashboard request dies
+  // with a genuine INVALID_SESSION 401 from the backend. With credentials
+  // stored by the successful login, that session death must open the inline
+  // re-auth dialog in place instead of bouncing back to /login. The second
+  // import-session call (the re-auth) relays a CAPTCHA and completes once
+  // the answer is submitted.
+  await page.addInitScript(() => {
+    let importCalls = 0;
+    let reauthStream: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const encode = (event: string, data: unknown) => new TextEncoder().encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : (input as Request).url;
+      if (url.includes("/api/uet/auth/import-session") && init?.method === "POST") {
+        importCalls += 1;
+        const isReauth = importCalls > 1;
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            if (isReauth) {
+              // Held open until the CAPTCHA answer arrives, like production.
+              reauthStream = controller;
+              controller.enqueue(encode("captcha_required", { challengeId: `smoke-reauth-${importCalls}`, image: "data:image/png;base64,QQ==" }));
+            } else {
+              controller.enqueue(encode("done", { token: "expired-token", session: { studentCode: "PH000001" } }));
+              controller.close();
+            }
+          },
+        });
+        return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+      }
+      if (url.includes("/api/uet/auth/solve-captcha")) {
+        reauthStream?.enqueue(encode("done", { token: "fresh-token", session: { studentCode: "PH000001" } }));
+        reauthStream?.close();
+        return new Response(JSON.stringify({ data: { accepted: true } }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return originalFetch(input, init);
+    };
+  });
+
+  await page.goto("/login");
+  await page.getByRole("combobox", { name: "School" }).click();
+  await page.getByRole("option", { name: "VNU-UET" }).click();
+  await page.getByLabel("Student or parent code").fill("PH000001");
+  await page.getByLabel("Password", { exact: true }).fill("test-password");
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+
+  // The re-auth dialog appears on the app route - no redirect to /login.
+  await expect(page.getByText("Session expired — verify to continue")).toBeVisible();
+  await expect(page.getByLabel("Verification code")).toBeVisible();
+  expect(new URL(page.url()).pathname).not.toBe("/login");
+
+  await page.getByLabel("Verification code").fill("ABCD");
+  await page.getByRole("button", { name: "Submit" }).click();
+  await expect(page.getByText("You're signed back in.")).toBeVisible();
+});
+
 test("settings About section shows version and commit information", async ({ page }) => {
   await loginDemo(page);
   await page.goto("/settings");

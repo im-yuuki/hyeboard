@@ -2,6 +2,7 @@ import type { ApiResponse, Assignment, ClassSession, Course, DashboardSummary, D
 import { mapExamRow, mapGpaSummary, mapGradeRow, mapProfile, mapSyllabusRow, mapTerms, mapTrainingPoints } from "@hyeboard/university-adapters/src/vnu/mapper";
 import { parseExamTermOptions, parseExamsHtml, parseGradesHtml, parseProfileHtml, parseStudyProgressHtml, parseSyllabusHtml } from "@hyeboard/university-adapters/src/vnu/parser";
 import { createLinkedAbortController } from "./abort-deadline";
+import { canReauthenticateInline, requestInlineReauth } from "./reauth";
 import { readUetSessionStream } from "./uet-session-stream";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
@@ -182,7 +183,19 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
   if (!response.ok || payload.error) {
     const code = payload.error?.code;
-    if (code ? SESSION_INVALID_CODES.has(code) : response.status === 401) clearSessionToken();
+    const sessionDied = code ? SESSION_INVALID_CODES.has(code) : response.status === 401;
+    // The worker's lazy upstream refresh can stall on a StudentHub CAPTCHA
+    // its server-side OCR couldn't solve. With stored credentials that is
+    // recoverable inline too, so it joins the re-auth path instead of
+    // surfacing a dead-end error - but it never clears the session on its
+    // own, because the Hyeboard session itself is still valid.
+    const refreshNeedsCaptcha = code === "STUDENTHUB_CAPTCHA_REQUIRED";
+    if (sessionDied || refreshNeedsCaptcha) {
+      // A recoverable UET session death shows the inline re-auth dialog
+      // (see components/reauth.tsx) instead of signing the user out.
+      if (canReauthenticateInline(getActiveAccount()?.universityId)) requestInlineReauth();
+      else if (sessionDied) clearSessionToken();
+    }
     throw new ApiError(payload.error?.message ?? `Request failed: ${response.status}`, code, response.status);
   }
   // Silent session refresh: the worker may refresh an expired UET upstream

@@ -331,6 +331,14 @@ function buildDictionary() {
       missingCredential: "Enter both your username/email and password.",
       serverConfigError: "Automated sign-in isn't available on this server right now.",
     },
+    reauth: {
+      title: "Session expired — verify to continue",
+      reconnectDesc: "Your university session expired. Hyeboard is signing you back in with your saved details.",
+      signingBackIn: "Signing you back in...",
+      success: "You're signed back in.",
+      failed: "Couldn't sign you back in. Please sign in again.",
+      cancelAndSignOut: "Cancel and sign out",
+    },
     canvasRequired: {
       title: "Learning-platform login required",
       addToken: "Add learning-platform token",
@@ -665,6 +673,14 @@ function vi(): typeof en {
       invalidCredential: "Sai tên đăng nhập hoặc mật khẩu.",
       missingCredential: "Nhập cả tên đăng nhập/email và mật khẩu.",
       serverConfigError: "Đăng nhập tự động hiện không khả dụng trên máy chủ này.",
+    },
+    reauth: {
+      title: "Phiên đã hết hạn — xác minh để tiếp tục",
+      reconnectDesc: "Phiên đăng nhập trường của bạn đã hết hạn. Hyeboard đang đăng nhập lại bằng thông tin đã lưu.",
+      signingBackIn: "Đang đăng nhập lại...",
+      success: "Đã đăng nhập lại thành công.",
+      failed: "Không thể đăng nhập lại. Vui lòng đăng nhập lại.",
+      cancelAndSignOut: "Hủy và đăng xuất",
     },
     canvasRequired: {
       title: "Cần đăng nhập nền tảng học tập",

@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
+import { SessionReauthGate } from "@/components/reauth";
 import { universityLogoUrl } from "@/components/shared";
 import { SESSION_CLEARED_EVENT, type StoredAccount } from "@/lib/api";
 import { type Translations, useLocale } from "@/lib/i18n";
@@ -115,6 +116,7 @@ export function RootLayout() {
 
   return (
     <div className="min-h-screen bg-background text-foreground">
+      <SessionReauthGate />
       <div className={cn("app-shell grid min-h-screen", sidebarCollapsed ? "lg:grid-cols-[76px_1fr]" : "lg:grid-cols-[270px_1fr]")}>
         <aside className="sticky top-0 hidden h-screen self-start overflow-hidden border-r border-border bg-sidebar lg:flex lg:flex-col">
           <div className={cn("transition-[padding] duration-300 ease-[var(--ease-out-quint)]", sidebarCollapsed ? "px-0 pb-2" : "flex items-center")}>

@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { CaptchaDialog, useCaptchaRelay } from "@/components/captcha-dialog";
 import { universityLogoUrl } from "@/components/shared";
 import { api, ApiError, getSessionToken } from "@/lib/api";
 import { LOCALES, type Locale, type Translations, useLocale } from "@/lib/i18n";
@@ -96,8 +97,8 @@ export function LoginPage() {
   const [vnuPassword, setVnuPassword] = useState(() => sessionStored(RELOGIN_KEYS.vnuPassword));
   const [status, setStatus] = useState<string>();
   const [busy, setBusy] = useState(false);
-  const [uetGoogleEmail, setUetGoogleEmail] = useState("");
-  const [uetGooglePassword, setUetGooglePassword] = useState("");
+  const [uetGoogleEmail, setUetGoogleEmail] = useState(() => sessionStored(RELOGIN_KEYS.uetGoogleEmail));
+  const [uetGooglePassword, setUetGooglePassword] = useState(() => sessionStored(RELOGIN_KEYS.uetGooglePassword));
   const [showManualFallback, setShowManualFallback] = useState(false);
   // Parent/guardian accounts use a "PH..." account code and log in with a
   // direct StudentHub username/password instead of VNU Google SSO — same
@@ -105,13 +106,12 @@ export function LoginPage() {
   // importUetGoogleSession and har-notes.md's "parent/guardian account"
   // section).
   const isUetParentLogin = /^ph/i.test(uetGoogleEmail.trim());
-  // Set only while a parent/guardian direct-login is waiting on a CAPTCHA
-  // the server's own OCR couldn't confidently solve (see
-  // api.importUetGoogleSession's onCaptchaNeeded and app.ts's
-  // "captcha_required" SSE event). The stream aborts and clears this prompt
+  // Holds a pending challenge only while a parent/guardian direct-login is
+  // waiting on a CAPTCHA the server's own OCR couldn't confidently solve
+  // (see api.importUetGoogleSession's onCaptchaNeeded and app.ts's
+  // "captcha_required" SSE event). The stream aborts and clears the prompt
   // if the relay fails or disconnects before the user submits an answer.
-  const [captchaChallenge, setCaptchaChallenge] = useState<{ image: string; resolve: (answer: string) => void }>();
-  const [captchaAnswer, setCaptchaAnswer] = useState("");
+  const captcha = useCaptchaRelay(t.login.verificationCancelled);
   const uetLoginControllerRef = useRef<AbortController | null>(null);
 
   // The global palette can be left over from a previous session (e.g. still
@@ -199,29 +199,14 @@ export function LoginPage() {
       await api.importUetGoogleSession(
         { uetGoogleEmail: studentCodeInput, uetGooglePassword },
         (message) => setStatus(message),
-        (imageDataUrl, signal) => new Promise<string>((resolve, reject) => {
-          const challenge = {
-            image: imageDataUrl,
-            resolve: (answer: string) => {
-              signal.removeEventListener("abort", onAbort);
-              setCaptchaChallenge((current) => current === challenge ? undefined : current);
-              setCaptchaAnswer("");
-              resolve(answer);
-            },
-          };
-          const onAbort = () => {
-            setCaptchaChallenge((current) => current === challenge ? undefined : current);
-            setCaptchaAnswer("");
-            reject(signal.reason ?? new DOMException(t.login.verificationCancelled, "AbortError"));
-          };
-          if (signal.aborted) onAbort();
-          else {
-            signal.addEventListener("abort", onAbort, { once: true });
-            setCaptchaChallenge(challenge);
-          }
-        }),
+        captcha.relayCaptcha,
         loginController.signal,
       );
+      // Keep the working credentials for this tab so an expired session can
+      // be re-authenticated inline later (see components/reauth.tsx). An
+      // explicit sign-out clears them with the other RELOGIN_KEYS secrets.
+      setSessionStored(RELOGIN_KEYS.uetGoogleEmail, studentCodeInput);
+      setSessionStored(RELOGIN_KEYS.uetGooglePassword, uetGooglePassword);
       state.selectUniversity("uet", { clearSession: false });
       state.refreshSession();
       setStatus(t.login.sessionReadyOpening);
@@ -242,13 +227,6 @@ export function LoginPage() {
         setBusy(false);
       }
     }
-  };
-
-  const submitCaptchaAnswer = () => {
-    if (!captchaChallenge) return;
-    const answer = captchaAnswer.trim();
-    if (!answer) return;
-    captchaChallenge.resolve(answer);
   };
 
   const importVnuSession = async () => {
@@ -417,31 +395,13 @@ export function LoginPage() {
           </CardContent>
         </Card>
       </div>
-      {captchaChallenge ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-          <Card className="w-full max-w-sm">
-            <CardHeader>
-              <CardTitle>{t.login.enterVerificationCode}</CardTitle>
-              <CardDescription>{t.login.verificationCodeDesc}</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <img src={captchaChallenge.image} alt={t.login.verificationImageAlt} className="w-full rounded-lg border border-border" />
-              <div className="grid gap-2">
-                <label htmlFor="captcha-answer" className="text-sm font-medium">{t.login.verificationCodeLabel}</label>
-                <Input
-                  id="captcha-answer"
-                  name="captcha-answer"
-                  autoFocus
-                  value={captchaAnswer}
-                  onChange={(event) => setCaptchaAnswer(event.target.value)}
-                  placeholder={t.login.enterCodeShown}
-                  onKeyDown={(event) => { if (event.key === "Enter") submitCaptchaAnswer(); }}
-                />
-              </div>
-              <Button onClick={submitCaptchaAnswer} disabled={!captchaAnswer.trim()} className="w-full">{t.common.submit}</Button>
-            </CardContent>
-          </Card>
-        </div>
+      {captcha.challenge ? (
+        <CaptchaDialog
+          image={captcha.challenge.image}
+          answer={captcha.answer}
+          onAnswerChange={captcha.setAnswer}
+          onSubmit={captcha.submitAnswer}
+        />
       ) : null}
     </main>
   );

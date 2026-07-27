@@ -1,6 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import { ACCOUNT_SWITCHED_EVENT, api, clearSessionToken, getActiveAccount, getActiveAccountId, getSessionToken, listAccounts, removeAccount, type StoredAccount, switchAccount } from "@/lib/api";
+import { UET_REAUTH_CREDENTIAL_KEYS } from "@/lib/reauth";
 
 export type Palette = "geist" | "uet" | "vnu";
 export type Mode = "light" | "dark";
@@ -24,6 +25,10 @@ function stored<T extends string>(key: string, fallback: T): T {
 
 export const RELOGIN_KEYS = {
   uetCanvasToken: "hyeboard.relogin.uet.canvasToken",
+  // UET sign-in credentials captured on successful login so an expired
+  // session can be re-authenticated inline (see components/reauth.tsx).
+  uetGoogleEmail: UET_REAUTH_CREDENTIAL_KEYS.email,
+  uetGooglePassword: UET_REAUTH_CREDENTIAL_KEYS.password,
   vnuUsername: "hyeboard.relogin.vnu.username",
   vnuPassword: "hyeboard.relogin.vnu.password",
 } as const;
