@@ -11,13 +11,14 @@ async function loginDemo(page: import("@playwright/test").Page) {
 
 async function startMockedVnuSession(
   page: import("@playwright/test").Page,
-  error: { code: string; status: number; message: string },
+  error: { code?: string; status: number; message: string },
 ) {
   let releaseRawRequests!: () => void;
   const featureNavigationReady = new Promise<void>((resolve) => {
     releaseRawRequests = resolve;
   });
 
+  await page.route("**/api/uet/dashboard**", (route) => route.abort());
   await page.route("**/api/vnu/auth/import-session", async (route) => {
     await route.fulfill({
       status: 200,
@@ -186,12 +187,14 @@ test("VNU session expiry clears account and preserves relogin credentials", asyn
 });
 
 for (const error of [
+  { status: 401, message: "Synthetic code-less VNU failure" },
+  { code: "VNU_UNKNOWN_FAILURE", status: 401, message: "Synthetic unknown VNU failure" },
   { code: "VNU_REQUEST_FAILED", status: 401, message: "Synthetic VNU request failed" },
   { code: "VNU_RATE_LIMITED", status: 429, message: "Synthetic VNU rate limit" },
   { code: "VNU_UPSTREAM_UNAVAILABLE", status: 502, message: "Synthetic VNU upstream unavailable" },
   { code: "VNU_CROSS_LOOKUP_NOT_FOUND", status: 404, message: "Synthetic VNU lookup not found" },
 ]) {
-  test(`${error.code} remains inline and keeps the active account`, async ({ page }) => {
+  test(`${error.code ?? "VNU code-less 401"} remains inline and keeps the active account`, async ({ page }) => {
     await startMockedVnuSession(page, error);
 
     await expect(page).not.toHaveURL(/\/login$/);

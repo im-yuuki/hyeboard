@@ -188,7 +188,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
   if (!response.ok || payload.error) {
     const code = payload.error?.code;
-    const sessionDied = code ? isSessionDeathCode(code) : response.status === 401;
+    const sessionDied = isSessionDeathCode(code);
     // The worker's lazy upstream refresh can stall on a StudentHub CAPTCHA
     // its server-side OCR couldn't solve. With stored credentials that is
     // recoverable inline too, so it joins the re-auth path instead of
