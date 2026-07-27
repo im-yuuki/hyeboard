@@ -12,13 +12,29 @@ async function loginDemo(page: import("@playwright/test").Page) {
 async function startMockedVnuSession(
   page: import("@playwright/test").Page,
   error: { code?: string; status: number; message: string },
+  options: { deferRawResponses?: boolean } = {},
 ) {
+  const initialAccountCount = await page.evaluate(() => {
+    const accounts = JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as unknown[];
+    return accounts.length;
+  });
   let releaseRawRequests!: () => void;
   const featureNavigationReady = new Promise<void>((resolve) => {
     releaseRawRequests = resolve;
   });
+  let rawRequestsStarted = 0;
+  let markAllRawRequestsStarted!: () => void;
+  const allRawRequestsStarted = new Promise<void>((resolve) => {
+    markAllRawRequestsStarted = resolve;
+  });
+  let rawResponsesFulfilled = 0;
+  let markAllRawResponsesFulfilled!: () => void;
+  const allRawResponsesFulfilled = new Promise<void>((resolve) => {
+    markAllRawResponsesFulfilled = resolve;
+  });
 
   await page.route("**/api/uet/dashboard**", (route) => route.abort());
+  await page.route("**/api/mock/**", (route) => route.abort());
   await page.route("**/api/vnu/auth/import-session", async (route) => {
     await route.fulfill({
       status: 200,
@@ -36,12 +52,16 @@ async function startMockedVnuSession(
     });
   });
   await page.route("**/api/vnu/raw/**", async (route) => {
+    rawRequestsStarted += 1;
+    if (rawRequestsStarted === 3) markAllRawRequestsStarted();
     await featureNavigationReady;
     await route.fulfill({
       status: error.status,
       contentType: "application/json",
       body: JSON.stringify({ error: { code: error.code, message: error.message } }),
     });
+    rawResponsesFulfilled += 1;
+    if (rawResponsesFulfilled === 3) markAllRawResponsesFulfilled();
   });
 
   await page.goto("/login");
@@ -53,9 +73,10 @@ async function startMockedVnuSession(
   await expect.poll(() => page.evaluate(() => {
     const accounts = JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as unknown[];
     return accounts.length;
-  })).toBe(1);
+  })).toBe(initialAccountCount + 1);
   await expect(page).toHaveURL(/\/$/);
-  releaseRawRequests();
+  if (!options.deferRawResponses) releaseRawRequests();
+  return { releaseRawRequests, allRawRequestsStarted, allRawResponsesFulfilled };
 }
 
 async function openMockedLookup(page: import("@playwright/test").Page) {
@@ -184,6 +205,73 @@ test("VNU session expiry clears account and preserves relogin credentials", asyn
   await page.getByRole("option", { name: "VNU (daotao)" }).click();
   await expect(page.getByLabel("Username")).toHaveValue("synthetic-vnu-user");
   await expect(page.getByLabel("Password", { exact: true })).toHaveValue("synthetic-vnu-password");
+
+  const credentialStorage = await page.evaluate(() => {
+    const credentialEntries = Object.entries(sessionStorage).filter(([, value]) => value === "synthetic-vnu-user" || value === "synthetic-vnu-password");
+    return {
+      sessionCredentials: Object.fromEntries(credentialEntries),
+      localStorageSerialized: JSON.stringify({ ...localStorage }),
+    };
+  });
+  expect(credentialStorage.sessionCredentials).toEqual({
+    "hyeboard.relogin.vnu.username": "synthetic-vnu-user",
+    "hyeboard.relogin.vnu.password": "synthetic-vnu-password",
+  });
+  expect(credentialStorage.localStorageSerialized).not.toContain("synthetic-vnu-user");
+  expect(credentialStorage.localStorageSerialized).not.toContain("synthetic-vnu-password");
+
+  const newTab = await page.context().newPage();
+  await newTab.goto("/login");
+  await newTab.getByRole("combobox", { name: "School" }).click();
+  await newTab.getByRole("option", { name: "VNU (daotao)" }).click();
+  await expect(newTab.getByLabel("Username")).toHaveValue("");
+  await expect(newTab.getByLabel("Password", { exact: true })).toHaveValue("");
+  expect(await newTab.evaluate(() => ({
+    username: sessionStorage.getItem("hyeboard.relogin.vnu.username"),
+    password: sessionStorage.getItem("hyeboard.relogin.vnu.password"),
+  }))).toEqual({ username: null, password: null });
+  await newTab.close();
+});
+
+test("concurrent VNU session expiry removes only its originating account", async ({ page }) => {
+  await loginDemo(page);
+  const survivingAccount = await page.evaluate(() => {
+    const accounts = JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ id: string; universityId: string; token: string }>;
+    return accounts.find((account) => account.universityId === "mock");
+  });
+  expect(survivingAccount).toBeDefined();
+
+  const mockedSession = await startMockedVnuSession(page, {
+    code: "VNU_SESSION_EXPIRED",
+    status: 401,
+    message: "Synthetic concurrent VNU session expiry",
+  }, { deferRawResponses: true });
+  await mockedSession.allRawRequestsStarted;
+
+  await page.getByRole("button", { name: "Open account menu" }).click();
+  await page.getByTestId("account-switch-item").filter({ hasText: "(MOCK)" }).click();
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("hyeboard.activeAccountId"))).toBe(survivingAccount?.id);
+
+  mockedSession.releaseRawRequests();
+  await mockedSession.allRawResponsesFulfilled;
+  await page.waitForLoadState("networkidle");
+  await expect.poll(() => page.evaluate((expectedAccount) => {
+    const accounts = JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ id: string; universityId: string; token: string }>;
+    return {
+      accountCount: accounts.length,
+      survivingIdMatches: accounts[0]?.id === expectedAccount?.id,
+      survivingTokenMatches: accounts[0]?.token === expectedAccount?.token,
+      survivingUniversityMatches: accounts[0]?.universityId === expectedAccount?.universityId,
+      activeAccountMatches: localStorage.getItem("hyeboard.activeAccountId") === expectedAccount?.id,
+    };
+  }, survivingAccount)).toEqual({
+    accountCount: 1,
+    survivingIdMatches: true,
+    survivingTokenMatches: true,
+    survivingUniversityMatches: true,
+    activeAccountMatches: true,
+  });
+  await expect(page).not.toHaveURL(/\/login$/);
 });
 
 for (const error of [
