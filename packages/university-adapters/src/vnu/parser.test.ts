@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { parseGradesHtml, parseTranscriptHtml } from "./parser";
+import { isDaotaoSessionExpired, parseGradesHtml, parseTranscriptHtml } from "./parser";
+import {
+  loginFormHtml,
+  mixedAttributeLoginFormHtml,
+  standaloneSessionEndedNoticeHtml,
+} from "./session-expiry-fixtures";
 
 const transcriptHtml = `
   <table>
@@ -64,5 +69,48 @@ describe("parseTranscriptHtml", () => {
       totals: {},
       notice: undefined,
     });
+  });
+});
+
+describe("isDaotaoSessionExpired", () => {
+  const authenticatedUrl = "https://daotao.vnu.edu.vn/StdInfo/StudentProfile.asp";
+
+  it("matches the trusted login URL case-insensitively and permits a query", () => {
+    expect(isDaotaoSessionExpired("https://daotao.vnu.edu.vn/DKMH/LOGIN.ASP?return=profile", "")).toBe(true);
+  });
+
+  it("rejects a login-looking URL on a foreign origin", () => {
+    expect(isDaotaoSessionExpired("https://example.com/dkmh/login.asp", "")).toBe(false);
+  });
+
+  it.each([loginFormHtml, mixedAttributeLoginFormHtml])("matches a complete login form", (html) => {
+    expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(true);
+  });
+
+  it.each([
+    `<form action="/dkmh/login.asp"><input name="txtLoginId"></form>`,
+    `<form action='/dkmh/login.asp'><input name='txtPassword'></form>`,
+  ])("rejects a login form missing one required control", (html) => {
+    expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(false);
+  });
+
+  it("matches the complete standalone session-ended notice", () => {
+    expect(isDaotaoSessionExpired(authenticatedUrl, standaloneSessionEndedNoticeHtml)).toBe(true);
+  });
+
+  it("uses body evidence when the final URL is malformed", () => {
+    expect(isDaotaoSessionExpired("not a URL", standaloneSessionEndedNoticeHtml)).toBe(true);
+  });
+
+  it.each([
+    "Please log in because your session may have ended.",
+    `<html><body><form><input name="StdCode" value="SYNTHETIC"></form><table><tr><td>Current term</td></tr></table></body></html>`,
+    `<html><body><table><tr><td><font color="red">Unrelated notice.</font></td></tr></table></body></html>`,
+    `<html><body><table><tr><td>Phiên làm việc đã kết thúc.</td></tr></table></body></html>`,
+    `<html><body><header>Authenticated profile</header><table><tr><td>Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.</td></tr></table></body></html>`,
+    `<html><body><table><tr><td>Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.<input name="state"></td></tr></table></body></html>`,
+    `<html><body><table><tr><td>Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.</td></tr></table><table><tr><td></td></tr></table></body></html>`,
+  ])("rejects non-standalone prose and authenticated content", (html) => {
+    expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(false);
   });
 });

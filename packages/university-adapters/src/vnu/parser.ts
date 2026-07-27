@@ -19,6 +19,10 @@ import type {
   VnuTranscriptHeader,
 } from "./types";
 
+const DAOTAO_ORIGIN = "https://daotao.vnu.edu.vn";
+const DAOTAO_LOGIN_PATH = "/dkmh/login.asp";
+const DAOTAO_SESSION_ENDED_SENTENCE = "Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.";
+
 function decodeEntities(text: string): string {
   return text
     .replaceAll("&nbsp;", " ")
@@ -27,6 +31,11 @@ function decodeEntities(text: string): string {
     .replaceAll("&gt;", ">")
     .replaceAll("&#39;", "'")
     .replaceAll("&quot;", '"')
+    .replace(/&#(?:x([0-9a-f]+)|(\d+));/gi, (entity, hexadecimal: string | undefined, decimal: string | undefined) => {
+      const codePoint = Number.parseInt(hexadecimal ?? decimal ?? "", hexadecimal ? 16 : 10);
+      if (codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) return entity;
+      return String.fromCodePoint(codePoint);
+    })
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -43,15 +52,15 @@ function parseOptionalNumber(value: string | undefined): number | undefined {
 }
 
 function attrOf(tag: string, attr: string): string | undefined {
-  const match = tag.match(new RegExp(`${attr}\\s*=\\s*"([^"]*)"`, "i"));
-  return match?.[1];
+  const match = tag.match(new RegExp(`(?:^|\\s)${attr}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, "i"));
+  return match?.[1] ?? match?.[2];
 }
 
 function tagWithAttr(html: string, tag: string, attrName: string, attrValue: string): string | undefined {
   const re = new RegExp(`<${tag}\\b[^>]*>`, "gi");
   let match: RegExpExecArray | null;
   while ((match = re.exec(html))) {
-    if (new RegExp(`${attrName}\\s*=\\s*"${attrValue}"`, "i").test(match[0])) return match[0];
+    if (attrOf(match[0], attrName)?.toLowerCase() === attrValue.toLowerCase()) return match[0];
   }
   return undefined;
 }
@@ -442,6 +451,59 @@ export function parsePortalNotice(html: string): string | undefined {
   return phraseMatch?.[0].trim() || undefined;
 }
 
+function hasCompleteLoginForm(html: string): boolean {
+  const lowerHtml = html.toLowerCase();
+  const formStartRe = /<form\b[^>]*>/gi;
+  let formStart: RegExpExecArray | null;
+
+  while ((formStart = formStartRe.exec(html))) {
+    if (attrOf(formStart[0], "action")?.toLowerCase() !== DAOTAO_LOGIN_PATH) continue;
+
+    const formEnd = lowerHtml.indexOf("</form", formStartRe.lastIndex);
+    if (formEnd === -1) continue;
+
+    const inputNames = new Set<string>();
+    const inputRe = /<input\b[^>]*>/gi;
+    const formBody = html.slice(formStartRe.lastIndex, formEnd);
+    let input: RegExpExecArray | null;
+    while ((input = inputRe.exec(formBody))) {
+      const name = attrOf(input[0], "name")?.toLowerCase();
+      if (name) inputNames.add(name);
+    }
+
+    if (inputNames.has("txtloginid") && inputNames.has("txtpassword")) return true;
+  }
+
+  return false;
+}
+
+function isTrustedLoginUrl(finalUrl: string): boolean {
+  try {
+    const url = new URL(finalUrl);
+    return url.origin === DAOTAO_ORIGIN && url.pathname.toLowerCase() === DAOTAO_LOGIN_PATH;
+  } catch {
+    return false;
+  }
+}
+
+function isStandaloneSessionEndedNotice(html: string): boolean {
+  const bodyMatch = html.match(/<body\b[^>]*>([\s\S]*?)<\/body\s*>/i);
+  if (!bodyMatch) return false;
+
+  const body = bodyMatch[1];
+  if ((body.match(/<table\b/gi) ?? []).length !== 1) return false;
+  if (/<(?:form|input|select|textarea)\b/i.test(body)) return false;
+  if (!/^\s*<table\b[^>]*>\s*<tr\b[^>]*>\s*<td\b[^>]*>[\s\S]*<\/td\s*>\s*<\/tr\s*>\s*<\/table\s*>\s*$/i.test(body)) return false;
+
+  return stripTags(body) === DAOTAO_SESSION_ENDED_SENTENCE;
+}
+
+export function isDaotaoSessionExpired(finalUrl: string, html: string): boolean {
+  if (isTrustedLoginUrl(finalUrl)) return true;
+  if (hasCompleteLoginForm(html)) return true;
+  return isStandaloneSessionEndedNotice(html);
+}
+
 export function hasLoginForm(html: string): boolean {
-  return html.includes('name="txtLoginId"') || html.includes("name='txtLoginId'");
+  return hasCompleteLoginForm(html);
 }
