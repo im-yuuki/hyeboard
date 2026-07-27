@@ -455,6 +455,59 @@ async function vnuImportCacheKey(username: string, password: string): Promise<st
   return `vnu/import/${await hmacHex(`${username.trim()}\n${password}`)}`;
 }
 
+type AuthenticatedSessionMetadata = {
+  universityId: string;
+  studentCode?: string;
+  expiresAt: string;
+  authenticated: true;
+};
+
+type CachedVnuImport = {
+  seed: string;
+  session: AuthenticatedSessionMetadata;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseCachedVnuImport(value: unknown): CachedVnuImport | undefined {
+  if (!isRecord(value) || typeof value.seed !== "string" || value.seed.length === 0 || !isRecord(value.session)) return undefined;
+
+  const session = value.session;
+  if (session.authenticated !== true || typeof session.universityId !== "string" || typeof session.expiresAt !== "string") return undefined;
+  if (session.studentCode !== undefined && typeof session.studentCode !== "string") return undefined;
+
+  return {
+    seed: value.seed,
+    session: {
+      universityId: session.universityId,
+      studentCode: session.studentCode,
+      expiresAt: session.expiresAt,
+      authenticated: true,
+    },
+  };
+}
+
+async function restoreCachedVnuImport(value: unknown, secret: string): Promise<{ token: string; session: AuthenticatedSessionMetadata } | undefined> {
+  const cached = parseCachedVnuImport(value);
+  if (!cached) return undefined;
+
+  try {
+    const session = await decryptSession(cached.seed, secret);
+    const expiresAt = Date.parse(session.expiresAt);
+    if (session.universityId !== "vnu" || session.vnu?.kind !== "cookie" || typeof session.vnu.value !== "string" || session.vnu.value.length === 0) return undefined;
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) return undefined;
+    if (cached.session.universityId !== session.universityId) return undefined;
+    if (cached.session.studentCode !== session.studentCode) return undefined;
+    if (cached.session.expiresAt !== session.expiresAt) return undefined;
+
+    return { token: await encryptSession(session, secret), session: cached.session };
+  } catch {
+    return undefined;
+  }
+}
+
 // ── Google-login rate limiting + token revocation ───────────────────────
 
 const GOOGLE_LOGIN_RATE_LIMIT = 5;
@@ -687,13 +740,19 @@ export function createApp(adapter: any) {
       }
       if (params.universityId === "vnu" && body.vnuUsername && body.vnuPassword) {
         const cacheKey = await vnuImportCacheKey(body.vnuUsername, body.vnuPassword);
-        const cached = await cacheGet<{ token: string; session: { universityId: string; studentCode?: string; expiresAt: string; authenticated: true } }>(cacheKey);
-        if (cached && Date.parse(cached.session.expiresAt) > Date.now()) return ok(cached);
+        const secret = getSessionSecret();
+        const cached = await restoreCachedVnuImport(await cacheGet<unknown>(cacheKey), secret);
+        if (cached) return ok(cached);
 
         const imported = await adapterInstance.importSession(body);
-        const token = await encryptSession(imported.session, getSessionSecret());
-        const payload = { token, session: { universityId: imported.universityId, studentCode: imported.studentCode, expiresAt: imported.expiresAt, authenticated: true as const } };
-        await cachePut(cacheKey, payload, Math.floor((Date.parse(imported.expiresAt) - Date.now()) / 1000));
+        const normalizedSession: EncryptedSessionPayload = {
+          ...imported.session,
+          studentCode: imported.studentCode ?? imported.session.studentCode,
+        };
+        const seed = await encryptSession(normalizedSession, secret);
+        const token = await encryptSession(normalizedSession, secret);
+        const payload = { token, session: { universityId: normalizedSession.universityId, studentCode: normalizedSession.studentCode, expiresAt: normalizedSession.expiresAt, authenticated: true as const } };
+        await cachePut(cacheKey, { seed, session: payload.session }, Math.floor((Date.parse(normalizedSession.expiresAt) - Date.now()) / 1000));
         return ok(payload);
       }
       const imported = await adapterInstance.importSession(body);

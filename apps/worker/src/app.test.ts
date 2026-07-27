@@ -15,6 +15,7 @@ import { createApp, createCaptchaRelayToken, resolveSession, setCaptchaRelayCoor
 import { LocalCaptchaRelayCoordinator, type CaptchaRelayCoordinator } from "./captcha-relay";
 
 const SESSION_SECRET = "worker-test-secret-worker-test-secret";
+const VNU_STUDENT_CODE = "SYNTHETIC-STUDENT-001";
 const SESSION_DEATH_CODES = ["MISSING_SESSION", "SESSION_EXPIRED", "INVALID_SESSION"];
 const SENTINELS = [
   "PARENT_USERNAME_SENTINEL",
@@ -36,6 +37,113 @@ function parentSession(): EncryptedSessionPayload {
     studenthub: { kind: "bearer", value: "ACCESS_TOKEN_SENTINEL", expiresAt: "2000-01-01T00:00:00.000Z" },
     expiresAt: "2099-01-01T00:00:00.000Z",
   };
+}
+
+type VnuImportResponse = {
+  token: string;
+  session: {
+    universityId: string;
+    studentCode?: string;
+    expiresAt: string;
+    authenticated: true;
+  };
+};
+
+class TestCache {
+  readonly store = new Map<string, { response: Response; expiresAt: number }>();
+  failMatch = false;
+  failPut = false;
+
+  constructor(private readonly currentTime: () => number) {}
+
+  async match(request: Request): Promise<Response | undefined> {
+    if (this.failMatch) throw new Error("synthetic cache read failure");
+    const cached = this.store.get(request.url);
+    if (!cached) return undefined;
+    if (cached.expiresAt <= this.currentTime()) {
+      this.store.delete(request.url);
+      return undefined;
+    }
+    return cached.response.clone();
+  }
+
+  async put(request: Request, response: Response): Promise<void> {
+    if (this.failPut) throw new Error("synthetic cache write failure");
+    const cacheControl = response.headers.get("Cache-Control") ?? "";
+    const maxAgeMatch = /max-age=(\d+)/.exec(cacheControl);
+    const maxAgeSeconds = maxAgeMatch ? Number(maxAgeMatch[1]) : 0;
+    this.store.set(request.url, {
+      response: response.clone(),
+      expiresAt: this.currentTime() + maxAgeSeconds * 1000,
+    });
+  }
+
+  importUrl(): string {
+    const url = [...this.store.keys()].find((key) => key.includes("/cache/vnu/import/"));
+    if (!url) throw new Error("VNU import cache entry was not written");
+    return url;
+  }
+
+  async importEntry(): Promise<{
+    seed: string;
+    session: VnuImportResponse["session"];
+  }> {
+    return await this.store.get(this.importUrl())!.response.clone().json() as {
+      seed: string;
+      session: VnuImportResponse["session"];
+    };
+  }
+
+  setImportEntry(value: unknown): void {
+    this.store.set(this.importUrl(), {
+      response: new Response(JSON.stringify(value), {
+        headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=3600" },
+      }),
+      expiresAt: this.currentTime() + 3_600_000,
+    });
+  }
+}
+
+function vnuSession(expiresAt = "2099-01-01T00:00:00.000Z"): EncryptedSessionPayload {
+  return {
+    version: 1,
+    universityId: "vnu",
+    vnu: { kind: "cookie", value: "SYNTHETIC_VNU_COOKIE", expiresAt },
+    expiresAt,
+  };
+}
+
+function normalizedVnuSession(expiresAt = "2099-01-01T00:00:00.000Z"): EncryptedSessionPayload {
+  return { ...vnuSession(expiresAt), studentCode: VNU_STUDENT_CODE };
+}
+
+function importedVnu(session = vnuSession()) {
+  return {
+    universityId: session.universityId,
+    studentCode: VNU_STUDENT_CODE,
+    expiresAt: session.expiresAt,
+    session,
+  };
+}
+
+async function importVnu(app: ReturnType<typeof createApp>): Promise<VnuImportResponse> {
+  const response = await app.handle(new Request("http://localhost/api/vnu/auth/import-session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ vnuUsername: "SYNTHETIC_VNU_USER", vnuPassword: "SYNTHETIC_VNU_PASSWORD" }),
+  }));
+  expect(response.status).toBe(200);
+  const body = await response.json() as { data: VnuImportResponse; error: null };
+  expect(body.error).toBeNull();
+  expect(Object.keys(body.data).sort()).toEqual(["session", "token"]);
+  expect(Object.keys(body.data.session).sort()).toEqual(["authenticated", "expiresAt", "studentCode", "universityId"]);
+  return body.data;
+}
+
+async function getVnuSession(app: ReturnType<typeof createApp>, token: string): Promise<Response> {
+  return app.handle(new Request("http://localhost/api/vnu/auth/session", {
+    headers: { Authorization: `Bearer ${token}` },
+  }));
 }
 
 describe("lazy parent session refresh", () => {
@@ -228,5 +336,236 @@ describe("UET CAPTCHA SSE cancellation", () => {
 
     expect(response.status).toBe(422);
     expect(answer).not.toHaveBeenCalled();
+  });
+});
+
+describe("VNU import session cache", () => {
+  let cache: TestCache;
+  let app: ReturnType<typeof createApp>;
+  let syntheticTime: number;
+  let dateNowSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET });
+    syntheticTime = 1_800_000_000_000;
+    dateNowSpy = vi.spyOn(Date, "now").mockImplementation(() => syntheticTime);
+    cache = new TestCache(() => syntheticTime);
+    vi.stubGlobal("caches", { default: cache });
+    adapterMocks.getAdapter.mockReturnValue({ importSession: adapterMocks.importSession });
+    adapterMocks.importSession.mockResolvedValue(importedVnu());
+    app = createApp(undefined);
+  });
+
+  afterEach(() => {
+    dateNowSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("expires cached responses at their deterministic max-age boundary", async () => {
+    const request = new Request("https://hyeboard.internal/cache/synthetic-expiry");
+    await cache.put(request, new Response("cached", {
+      headers: { "Cache-Control": "public, max-age=1" },
+    }));
+
+    await expect(cache.match(request).then((response) => response?.text())).resolves.toBe("cached");
+    syntheticTime += 1_000;
+    await expect(cache.match(request)).resolves.toBeUndefined();
+  });
+
+  it("derives a positive import-cache TTL and expires it at the exact boundary", async () => {
+    const expiresAt = new Date(syntheticTime + 2_500).toISOString();
+    const session = vnuSession(expiresAt);
+    adapterMocks.importSession.mockResolvedValue(importedVnu(session));
+
+    const first = await importVnu(app);
+    const cacheUrl = cache.importUrl();
+    expect(cache.store.get(cacheUrl)?.response.headers.get("Cache-Control")).toBe("public, max-age=2");
+    await expect(decryptSession(first.token, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession(expiresAt));
+
+    syntheticTime += 1_999;
+    await importVnu(app);
+    expect(adapterMocks.importSession).toHaveBeenCalledTimes(1);
+
+    syntheticTime += 1;
+    const boundaryLogin = await importVnu(app);
+    expect(adapterMocks.importSession).toHaveBeenCalledTimes(2);
+    expect(boundaryLogin.session.expiresAt).toBe(expiresAt);
+  });
+
+  it("skips the import cache when the derived TTL is non-positive", async () => {
+    const expiresAt = new Date(syntheticTime + 999).toISOString();
+    const session = vnuSession(expiresAt);
+    adapterMocks.importSession.mockResolvedValue(importedVnu(session));
+
+    const outward = await importVnu(app);
+
+    expect(cache.store.size).toBe(0);
+    expect(adapterMocks.importSession).toHaveBeenCalledTimes(1);
+    await expect(decryptSession(outward.token, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession(expiresAt));
+  });
+
+  it("normalizes verified VNU identity before caching and reuses it on the next import", async () => {
+    const imported = importedVnu();
+    expect(imported.session.studentCode).toBeUndefined();
+    adapterMocks.importSession.mockResolvedValue(imported);
+
+    const first = await importVnu(app);
+    const cached = await cache.importEntry();
+    const firstSession = await decryptSession(first.token, SESSION_SECRET);
+
+    expect(imported.session.studentCode).toBeUndefined();
+    expect(firstSession.studentCode).toBe(VNU_STUDENT_CODE);
+    expect(cached.session.studentCode).toBe(firstSession.studentCode);
+    await expect(decryptSession(cached.seed, SESSION_SECRET)).resolves.toEqual(firstSession);
+
+    const second = await importVnu(app);
+    expect(adapterMocks.importSession).toHaveBeenCalledTimes(1);
+    expect(second.session).toEqual(cached.session);
+    await expect(decryptSession(second.token, SESSION_SECRET)).resolves.toEqual(firstSession);
+  });
+
+  it("caches an opaque seed and returns a distinct valid token on a cache miss", async () => {
+    const outward = await importVnu(app);
+    const cached = await cache.importEntry();
+
+    expect(adapterMocks.importSession).toHaveBeenCalledTimes(1);
+    expect(cached.seed).toBeTypeOf("string");
+    expect(cached.seed).not.toBe(outward.token);
+    expect(cached.session).toEqual(outward.session);
+    await expect(decryptSession(cached.seed, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession());
+    await expect(decryptSession(outward.token, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession());
+    expect(Object.keys(cached).sort()).toEqual(["seed", "session"]);
+  });
+
+  it("re-encrypts an equivalent session with its original expiry on a cache hit", async () => {
+    const first = await importVnu(app);
+    const cached = await cache.importEntry();
+    const second = await importVnu(app);
+
+    expect(adapterMocks.importSession).toHaveBeenCalledTimes(1);
+    expect(second.token).not.toBe(first.token);
+    expect(second.token).not.toBe(cached.seed);
+    expect(second.session).toEqual(first.session);
+    const firstPayload = await decryptSession(first.token, SESSION_SECRET);
+    const secondPayload = await decryptSession(second.token, SESSION_SECRET);
+    expect(secondPayload).toEqual(firstPayload);
+    expect(secondPayload.expiresAt).toBe("2099-01-01T00:00:00.000Z");
+  });
+
+  it("keeps a cached relogin usable after the old outward token is revoked", async () => {
+    const oldLogin = await importVnu(app);
+    const independentLogin = await importVnu(app);
+
+    const logout = await app.handle(new Request("http://localhost/api/vnu/auth/logout", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${oldLogin.token}` },
+    }));
+    expect(logout.status).toBe(200);
+
+    const oldSession = await getVnuSession(app, oldLogin.token);
+    expect(oldSession.status).toBe(401);
+    await expect(oldSession.json()).resolves.toMatchObject({
+      data: null,
+      error: { code: "SESSION_EXPIRED" },
+    });
+
+    const independentSession = await getVnuSession(app, independentLogin.token);
+    expect(independentSession.status).toBe(200);
+
+    const relogin = await importVnu(app);
+    expect(adapterMocks.importSession).toHaveBeenCalledTimes(1);
+    expect(relogin.token).not.toBe(oldLogin.token);
+    expect(relogin.token).not.toBe(independentLogin.token);
+    const freshSession = await getVnuSession(app, relogin.token);
+    expect(freshSession.status).toBe(200);
+    await expect(freshSession.json()).resolves.toEqual({
+      data: {
+        universityId: "vnu",
+        studentCode: "SYNTHETIC-STUDENT-001",
+        expiresAt: "2099-01-01T00:00:00.000Z",
+        authenticated: true,
+      },
+      error: null,
+    });
+  });
+
+  it.each([
+    ["malformed seed", async () => "not-an-encrypted-session"],
+    ["wrong token version", async () => encryptSession({ ...normalizedVnuSession(), version: 2 } as unknown as EncryptedSessionPayload, SESSION_SECRET)],
+    ["failed authentication tag", async () => encryptSession(normalizedVnuSession(), "different-synthetic-secret-32-bytes")],
+    ["expired seed", async () => encryptSession(normalizedVnuSession("2000-01-01T00:00:00.000Z"), SESSION_SECRET)],
+    ["non-VNU seed", async () => encryptSession({ ...normalizedVnuSession(), universityId: "uet", vnu: undefined }, SESSION_SECRET)],
+    ["non-cookie VNU credential", async () => encryptSession({ ...normalizedVnuSession(), vnu: { ...normalizedVnuSession().vnu!, kind: "bearer" } }, SESSION_SECRET)],
+  ])("treats a %s as a cache miss", async (_label, makeSeed) => {
+    await importVnu(app);
+    const previous = await cache.importEntry();
+    cache.setImportEntry({ ...previous, seed: await makeSeed() });
+    vi.clearAllMocks();
+    adapterMocks.getAdapter.mockReturnValue({ importSession: adapterMocks.importSession });
+    adapterMocks.importSession.mockResolvedValue(importedVnu());
+
+    const recovered = await importVnu(app);
+
+    expect(adapterMocks.importSession).toHaveBeenCalledTimes(1);
+    await expect(decryptSession(recovered.token, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession());
+    const replacement = await cache.importEntry();
+    expect(Object.keys(replacement).sort()).toEqual(["seed", "session"]);
+    expect(replacement.session).toEqual(recovered.session);
+    await expect(decryptSession(replacement.seed, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession());
+
+    const cachedRelogin = await importVnu(app);
+    expect(adapterMocks.importSession).toHaveBeenCalledTimes(1);
+    expect(cachedRelogin.token).not.toBe(recovered.token);
+    expect(cachedRelogin.token).not.toBe(replacement.seed);
+    expect(cachedRelogin.session).toEqual(recovered.session);
+    await expect(decryptSession(cachedRelogin.token, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession());
+  });
+
+  it.each([
+    ["university", { universityId: "uet" }],
+    ["student code", { studentCode: "OTHER-SYNTHETIC-STUDENT" }],
+    ["expiry", { expiresAt: "2098-01-01T00:00:00.000Z" }],
+  ])("treats inconsistent %s metadata as a cache miss", async (_label, metadataPatch) => {
+    await importVnu(app);
+    const previous = await cache.importEntry();
+    cache.setImportEntry({ ...previous, session: { ...previous.session, ...metadataPatch } });
+    vi.clearAllMocks();
+    adapterMocks.getAdapter.mockReturnValue({ importSession: adapterMocks.importSession });
+    adapterMocks.importSession.mockResolvedValue(importedVnu());
+
+    const recovered = await importVnu(app);
+
+    expect(adapterMocks.importSession).toHaveBeenCalledTimes(1);
+    const replacement = await cache.importEntry();
+    expect(Object.keys(replacement).sort()).toEqual(["seed", "session"]);
+    expect(replacement.session).toEqual(recovered.session);
+    await expect(decryptSession(replacement.seed, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession());
+
+    const cachedRelogin = await importVnu(app);
+    expect(adapterMocks.importSession).toHaveBeenCalledTimes(1);
+    expect(cachedRelogin.token).not.toBe(recovered.token);
+    expect(cachedRelogin.token).not.toBe(replacement.seed);
+    expect(cachedRelogin.session).toEqual(recovered.session);
+    await expect(decryptSession(cachedRelogin.token, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession());
+  });
+
+  it("falls back to upstream login when the cache read fails", async () => {
+    cache.failMatch = true;
+
+    const outward = await importVnu(app);
+
+    expect(adapterMocks.importSession).toHaveBeenCalledTimes(1);
+    await expect(decryptSession(outward.token, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession());
+  });
+
+  it("returns the normal response when the cache write fails", async () => {
+    cache.failPut = true;
+
+    const outward = await importVnu(app);
+
+    expect(adapterMocks.importSession).toHaveBeenCalledTimes(1);
+    await expect(decryptSession(outward.token, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession());
+    expect(cache.store.size).toBe(0);
   });
 });
