@@ -80,6 +80,10 @@ class TestCache {
     });
   }
 
+  rawUrls(): string[] {
+    return [...this.store.keys()].filter((key) => key.includes("/cache/vnu/raw/"));
+  }
+
   importUrl(): string {
     const url = [...this.store.keys()].find((key) => key.includes("/cache/vnu/import/"));
     if (!url) throw new Error("VNU import cache entry was not written");
@@ -183,6 +187,12 @@ async function importVnu(app: ReturnType<typeof createApp>): Promise<VnuImportRe
 
 async function getVnuSession(app: ReturnType<typeof createApp>, token: string): Promise<Response> {
   return app.handle(new Request("http://localhost/api/vnu/auth/session", {
+    headers: { Authorization: `Bearer ${token}` },
+  }));
+}
+
+async function getVnuRawPage(app: ReturnType<typeof createApp>, token: string, page = "grades"): Promise<Response> {
+  return app.handle(new Request(`http://localhost/api/vnu/raw/${page}`, {
     headers: { Authorization: `Bearer ${token}` },
   }));
 }
@@ -385,6 +395,7 @@ describe("VNU import session cache", () => {
   let syntheticTime: number;
   let dateNowSpy: ReturnType<typeof vi.spyOn>;
   let profileSpy: ReturnType<typeof vi.spyOn>;
+  let gradesSpy: ReturnType<typeof vi.spyOn> | undefined;
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -398,10 +409,12 @@ describe("VNU import session cache", () => {
     adapterMocks.getAdapter.mockReturnValue({ importSession: adapterMocks.importSession });
     adapterMocks.importSession.mockResolvedValue(importedVnu());
     profileSpy = vi.spyOn(DaotaoClient.prototype, "getProfileHtml").mockResolvedValue(vnuProfileHtml());
+    gradesSpy = undefined;
     app = createApp(undefined);
   });
 
   afterEach(() => {
+    gradesSpy?.mockRestore();
     profileSpy.mockRestore();
     dateNowSpy.mockRestore();
     vi.unstubAllGlobals();
@@ -535,6 +548,55 @@ describe("VNU import session cache", () => {
     await expect(decryptSession(repaired.token, SESSION_SECRET)).resolves.toEqual(normalizedRepaired);
     await expect(decryptSession(replacement.seed, SESSION_SECRET)).resolves.toEqual(normalizedRepaired);
     await expect(decryptSession(cachedRelogin.token, SESSION_SECRET)).resolves.toEqual(normalizedRepaired);
+  });
+
+  it("does not cache or expose a runtime VNU_SESSION_EXPIRED response", async () => {
+    const expiryNoticeSentinel = "SYNTHETIC_EXPIRY_NOTICE_SENTINEL";
+    const outward = await importVnu(app);
+    gradesSpy = vi.spyOn(DaotaoClient.prototype, "getGradesHtml").mockRejectedValue(
+      new HyeboardError("VNU_SESSION_EXPIRED", "The university portal session has expired. Sign in again.", 401),
+    );
+
+    const response = await getVnuRawPage(app, outward.token);
+    const responseText = await response.text();
+
+    expect(response.status).toBe(401);
+    expect(JSON.parse(responseText)).toMatchObject({
+      data: null,
+      error: { code: "VNU_SESSION_EXPIRED" },
+    });
+    expect(responseText).not.toContain(expiryNoticeSentinel);
+    expect(cache.rawUrls()).toEqual([]);
+    expect(gradesSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses separate raw-cache keys for old and repaired VNU cookies", async () => {
+    const repairedSession: EncryptedSessionPayload = {
+      ...vnuSession(),
+      vnu: { kind: "cookie", value: "REPAIRED_SYNTHETIC_VNU_COOKIE", expiresAt: "2099-01-01T00:00:00.000Z" },
+    };
+    const oldOutward = await importVnu(app);
+    profileSpy.mockRejectedValueOnce(
+      new HyeboardError("VNU_SESSION_EXPIRED", "The university portal session has expired. Sign in again.", 401),
+    );
+    adapterMocks.importSession.mockResolvedValueOnce(importedVnu(repairedSession));
+    gradesSpy = vi.spyOn(DaotaoClient.prototype, "getGradesHtml").mockResolvedValue("<html>SYNTHETIC_GRADES</html>");
+
+    const repairedOutward = await importVnu(app);
+    const oldPayload = await decryptSession(oldOutward.token, SESSION_SECRET);
+    const repairedPayload = await decryptSession(repairedOutward.token, SESSION_SECRET);
+    const oldResponse = await getVnuRawPage(app, oldOutward.token);
+    const repairedResponse = await getVnuRawPage(app, repairedOutward.token);
+    const rawUrls = cache.rawUrls();
+
+    expect(oldPayload.vnu?.value).toBe("SYNTHETIC_VNU_COOKIE");
+    expect(repairedPayload.vnu?.value).toBe("REPAIRED_SYNTHETIC_VNU_COOKIE");
+    expect(oldPayload.vnu?.value).not.toBe(repairedPayload.vnu?.value);
+    expect(oldResponse.status).toBe(200);
+    expect(repairedResponse.status).toBe(200);
+    expect(rawUrls).toHaveLength(2);
+    expect(new Set(rawUrls).size).toBe(2);
+    expect(gradesSpy).toHaveBeenCalledTimes(2);
   });
 
   it.each([
