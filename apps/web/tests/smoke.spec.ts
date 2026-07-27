@@ -1,5 +1,14 @@
 import { expect, test } from "@playwright/test";
 
+async function downloadText(download: import("@playwright/test").Download): Promise<string> {
+  const stream = await download.createReadStream();
+  if (!stream) throw new Error("Playwright download stream was unavailable");
+
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 async function loginDemo(page: import("@playwright/test").Page) {
   await page.goto("/login");
   await page.getByRole("combobox", { name: "School" }).click();
@@ -434,7 +443,7 @@ test("grades default to the newest term, merge summer into term two, and expand 
   await expect(page.getByText("Includes summer term")).toBeVisible();
   await expect(page.getByText("Signals and Systems")).toBeVisible();
   await expect(page.getByText("Term GPA").first()).toBeVisible();
-  await expect(page.getByText("3.40")).toBeVisible();
+  await expect(page.getByText("Term GPA").first().locator("..")).toContainText("3.40");
   await expect(page.getByText("A+", { exact: true }).first()).toBeVisible();
 
   // Expanding a row shows the detail panel with its humanized (summer) term.
@@ -450,6 +459,146 @@ test("grades default to the newest term, merge summer into term two, and expand 
   await expect(page.getByRole("columnheader", { name: /Point 10/ }).first()).toHaveAttribute("aria-sort", "ascending");
   await page.getByRole("button", { name: "Point 10" }).first().click();
   await expect(page.getByRole("columnheader", { name: /Point 10/ }).first()).toHaveAttribute("aria-sort", "descending");
+});
+
+test("grades render derived term GPA and CPA and export current page and term state", async ({ page }) => {
+  await loginDemo(page);
+  await page.goto("/grades");
+
+  const newestTermHeader = page.getByTestId("academic-term-header").first();
+  const newestTerm = newestTermHeader.locator("..");
+  await expect(newestTermHeader.getByRole("heading", { name: "Semester 1, 2025–2026" })).toBeVisible();
+  await expect(newestTermHeader.getByText("Derived", { exact: true })).toBeVisible();
+  await expect(newestTermHeader.getByText("Term GPA").locator("..")).toContainText("3.45");
+  await expect(newestTermHeader.getByText("CPA", { exact: true }).locator("..")).toContainText("3.43");
+  await expect(newestTermHeader.getByText("Included credits").locator("..")).toContainText("6 / 6 listed");
+
+  const reportedSummary = page.getByTestId("grades-summary");
+  await expect(reportedSummary.getByText("Portal cumulative GPA", { exact: true })).toBeVisible();
+  await expect(reportedSummary.getByText("3.48", { exact: true })).toBeVisible();
+
+  await newestTerm.getByRole("button", { name: "Course" }).click();
+  await expect(newestTerm.locator("tbody > tr").nth(0)).toContainText("Web Application Development");
+  await expect(newestTerm.locator("tbody > tr").nth(2)).toContainText("Linear Algebra");
+
+  const pageExport = page.getByTestId("grades-page-export");
+  await pageExport.getByRole("button", { name: "Export" }).click();
+  const pageDownloadPromise = page.waitForEvent("download");
+  await page.getByRole("menuitem", { name: "Download JSON" }).click();
+  const pageDownload = await pageDownloadPromise;
+  expect(pageDownload.suggestedFilename()).toMatch(/^hyeboard-grades-page-\d{4}-\d{2}-\d{2}\.json$/);
+  const pageDocument = JSON.parse(await downloadText(pageDownload));
+  expect(pageDocument).toMatchObject({
+    surface: "grades-page",
+    universityId: "mock",
+    identity: { studentCode: expect.any(String), studentName: "Demo Student", managingClass: "K69CLC-C" },
+    reported: { cumulativeGpa4: 3.48, totalCredits: 18, accumulatedCredits: 92 },
+    derivedTerms: [{ termCode: "20251", estimateKind: "derived" }],
+  });
+  expect(pageDocument.derivedTerms).toHaveLength(1);
+  expect(pageDocument.derivedTerms[0].termGpa4).toBeCloseTo(3.45);
+  expect(pageDocument.derivedTerms[0].derivedCpa4).toBeCloseTo(3.43, 2);
+  expect(pageDocument.derivedTerms[0].courses.map((course: { courseName: string }) => course.courseName)).toEqual(["Web Application Development", "Linear Algebra"]);
+  expect(Object.keys(pageDocument.derivedTerms[0].courses[0])).toEqual(["courseCode", "courseName", "credits", "point10", "letter", "point4"]);
+
+  await newestTermHeader.getByRole("button", { name: "Export" }).click();
+  const termDownloadPromise = page.waitForEvent("download");
+  await page.getByRole("menuitem", { name: "Download CSV" }).click();
+  const termDownload = await termDownloadPromise;
+  expect(termDownload.suggestedFilename()).toMatch(/^hyeboard-grades-term-\d{4}-\d{2}-\d{2}\.csv$/);
+  const termCsv = await downloadText(termDownload);
+  expect(termCsv.startsWith("\ufeffrecord_type,surface,")).toBe(true);
+  expect(termCsv).toContain(",grades-term,");
+  expect(termCsv).toContain("Demo Student");
+  expect(termCsv).toContain(",3.48,");
+  expect(termCsv).toContain("'20251");
+  expect(termCsv.indexOf("Web Application Development")).toBeLessThan(termCsv.indexOf("Linear Algebra"));
+  expect(termCsv.endsWith("\r\n")).toBe(true);
+  expect(termCsv.replaceAll("\r\n", "")).not.toContain("\n");
+
+  await page.getByRole("combobox", { name: "Term" }).click();
+  await page.getByRole("option", { name: "All terms" }).click();
+  await expect(page.getByTestId("academic-term-header")).toHaveCount(2);
+  await pageExport.getByRole("button", { name: "Export" }).click();
+  const allTermsDownloadPromise = page.waitForEvent("download");
+  await page.getByRole("menuitem", { name: "Download JSON" }).click();
+  const allTermsDocument = JSON.parse(await downloadText(await allTermsDownloadPromise));
+  expect(allTermsDocument.derivedTerms.map((term: { termCode: string }) => term.termCode)).toEqual(["20251", "20242"]);
+});
+
+test("grades keep missing and reserved term identities collision-safe", async ({ page }) => {
+  await loginDemo(page);
+  await page.route("**/api/mock/grades", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: [
+          { id: "missing", courseCode: "MISS1", courseName: "Missing term", credits: 1, point4: 4 },
+          { id: "blank", courseCode: "MISS2", courseName: "Blank term", credits: 1, point4: 3, termCode: "  " },
+          { id: "unknown", courseCode: "KNOWN1", courseName: "Known unknown", credits: 1, point4: 2, termCode: "unknown" },
+          { id: "all", courseCode: "KNOWN2", courseName: "Known all", credits: 1, point4: 1, termCode: "all" },
+          { id: "reserved", courseCode: "KNOWN3", courseName: "Known reserved", credits: 1, point4: 3, termCode: "~hyeboard:known:reserved" },
+          { id: "numeric", courseCode: "NUMERIC", courseName: "Numeric term", credits: 1, point4: 3, termCode: "251" },
+          { id: "spaced", courseCode: "SPACED", courseName: "Spaced numeric term", credits: 1, point4: 3, termCode: " 251 " },
+        ],
+        error: null,
+      }),
+    });
+  });
+  await page.goto("/grades");
+
+  await page.getByRole("combobox", { name: "Term" }).click();
+  for (const option of ["Unknown term", "unknown", "all", "~hyeboard:known:reserved"]) {
+    await expect(page.getByRole("option", { name: option, exact: true })).toBeVisible();
+  }
+  await expect(page.getByRole("option", { name: "Semester 1, 2025–2026", exact: true })).toBeVisible();
+  await expect(page.getByRole("option", { name: "251", exact: true })).toBeVisible();
+  await page.getByRole("option", { name: "All terms" }).click();
+  await expect(page.getByTestId("academic-term-header")).toHaveCount(6);
+  await expect(page.getByTestId("academic-term-header").getByRole("heading", { name: "Semester 1, 2025–2026", exact: true })).toBeVisible();
+  await expect(page.getByTestId("academic-term-header").getByRole("heading", { name: "251", exact: true })).toBeVisible();
+  await expect(page.getByText("Missing term")).toBeVisible();
+  await expect(page.getByText("Blank term")).toBeVisible();
+
+  const pageExport = page.getByTestId("grades-page-export");
+  await pageExport.getByRole("button", { name: "Export" }).click();
+  const downloadPromise = page.waitForEvent("download");
+  await page.getByRole("menuitem", { name: "Download JSON" }).click();
+  const document = JSON.parse(await downloadText(await downloadPromise));
+  const termIdentities = document.derivedTerms.map((term: { termCode: string; termLabel: string }) => [term.termCode, term.termLabel]);
+  expect(termIdentities).toEqual(expect.arrayContaining([
+    ["unknown", "Unknown term"],
+    ["unknown", "unknown"],
+    ["all", "all"],
+    ["~hyeboard:known:reserved", "~hyeboard:known:reserved"],
+  ]));
+  const numericTerm = document.derivedTerms.find((term: { termCode: string }) => term.termCode === "251");
+  const spacedTerm = document.derivedTerms.find((term: { termCode: string }) => term.termCode === " 251 ");
+  expect(numericTerm.courses.map((course: { courseName: string }) => course.courseName)).toEqual(["Numeric term"]);
+  expect(spacedTerm.courses.map((course: { courseName: string }) => course.courseName)).toEqual(["Spaced numeric term"]);
+});
+
+test("grades exports wait for dashboard metadata without blocking grades", async ({ page }) => {
+  await loginDemo(page);
+  let releaseDashboard!: () => void;
+  let markDashboardRequested!: () => void;
+  const dashboardGate = new Promise<void>((resolve) => { releaseDashboard = resolve; });
+  const dashboardRequested = new Promise<void>((resolve) => { markDashboardRequested = resolve; });
+  await page.route("**/api/mock/dashboard**", async (route) => {
+    markDashboardRequested();
+    await dashboardGate;
+    const response = await route.fetch();
+    await route.fulfill({ response });
+  });
+
+  await page.goto("/grades");
+  await dashboardRequested;
+  await expect(page.getByText("Web Application Development")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Export" })).toHaveCount(0);
+
+  releaseDashboard();
+  await expect(page.getByRole("button", { name: "Export" })).toHaveCount(2);
 });
 
 test("timetable renders a responsive grid on desktop", async ({ page }) => {

@@ -30,17 +30,25 @@ export function safeExternalUrl(value?: string): string | undefined {
   }
 }
 
-type FeatureFrameProps<T> = { title: string; description: string; query: { data?: T; error: Error | null; isLoading: boolean }; children: (data: T) => ReactNode };
+type FeatureFrameProps<T> = { title: string; description: string; actions?: ReactNode; query: { data?: T; error: Error | null; isLoading: boolean }; children: (data: T) => ReactNode };
 
-export function FeatureFrame<T>({ title, description, query, children }: FeatureFrameProps<T>) {
+export function FeatureFrame<T>({ title, description, actions, query, children }: FeatureFrameProps<T>) {
   const { t } = useLocale();
   if (query.isLoading) return <PageSkeleton />;
   if (query.error) return <QueryErrorPanel error={query.error} />;
-  return <div className="animate-page space-y-4"><FeatureHeader title={title} description={description} />{query.data ? children(query.data) : <Empty text={t.common.noData} />}</div>;
+  return <div className="animate-page space-y-4"><FeatureHeader title={title} description={description} actions={actions} />{query.data ? children(query.data) : <Empty text={t.common.noData} />}</div>;
 }
 
 export function FeatureHeader({ title, description, actions }: { title: string; description: string; actions?: ReactNode }) {
-  return <div><h1 className="text-2xl font-semibold tracking-tight md:text-3xl">{title}</h1><p className="mt-1 text-sm text-muted-foreground">{description}</p>{actions}</div>;
+  return (
+    <div className="flex flex-wrap items-start justify-between gap-3">
+      <div className="min-w-0">
+        <h1 className="text-2xl font-semibold tracking-tight md:text-3xl">{title}</h1>
+        <p className="mt-1 max-w-[70ch] text-sm text-muted-foreground">{description}</p>
+      </div>
+      {actions ? <div className="shrink-0">{actions}</div> : null}
+    </div>
+  );
 }
 
 export function StatusBadge({ value }: { value?: string | null }) {

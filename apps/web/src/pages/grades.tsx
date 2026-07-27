@@ -1,21 +1,37 @@
 import type { Grade } from "@hyeboard/schemas";
 import { ChevronDown } from "lucide-react";
-import { Fragment, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
+import { ExportMenu } from "@/components/export-menu";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Empty, FeatureFrame, SummaryStat, SummaryStrip } from "@/components/shared";
 import { api } from "@/lib/api";
+import { createGradesExport, type ExportDerivedTerm } from "@/lib/data-export";
 import { useLocale } from "@/lib/i18n";
 import { formatTermLabel, letterForGrade, letterTone } from "@/lib/presentation";
+import { calculateTermAcademicSummaries, newestAcademicTermsFirst, type AcademicTermSummary } from "@/lib/term-academic-summary";
 import { cn } from "@/lib/utils";
 import { useFeatureQuery, useHyeboard } from "@/state";
 
-const ALL_TERMS = "all";
+const MISSING_TERM_KEY = "~hyeboard:missing";
+const ALL_TERMS = "~hyeboard:all";
+const ESCAPED_TERM_PREFIX = "~hyeboard:known:";
 
-function gradeTermKey(grade: Grade, universityId: string, unknownTermLabel: string) {
-  const code = grade.termCode ?? unknownTermLabel;
-  if (usesUetTermRules(universityId) && /^\d+3$/.test(code)) return `${code.slice(0, -1)}2`;
-  return code;
+function encodeGradeTermKey(termCode: string | undefined): string {
+  const trimmedTermCode = termCode?.trim();
+  if (!trimmedTermCode) return MISSING_TERM_KEY;
+
+  const rawTermCode = termCode!;
+  if (rawTermCode !== trimmedTermCode || rawTermCode === MISSING_TERM_KEY || rawTermCode === ALL_TERMS || rawTermCode.startsWith(ESCAPED_TERM_PREFIX)) {
+    return `${ESCAPED_TERM_PREFIX}${encodeURIComponent(rawTermCode)}`;
+  }
+  return rawTermCode;
+}
+
+function decodeGradeTermKey(termKey: string): string | undefined {
+  if (termKey === MISSING_TERM_KEY) return undefined;
+  if (termKey.startsWith(ESCAPED_TERM_PREFIX)) return decodeURIComponent(termKey.slice(ESCAPED_TERM_PREFIX.length));
+  return termKey;
 }
 
 function usesUetTermRules(universityId: string) {
@@ -24,17 +40,6 @@ function usesUetTermRules(universityId: string) {
 
 function isSummerGrade(grade: Grade, universityId: string) {
   return usesUetTermRules(universityId) && Boolean(grade.termCode?.endsWith("3"));
-}
-
-function summarizeGrades(grades: Grade[]) {
-  const totalCredits = grades.reduce((sum, grade) => sum + (grade.credits ?? 0), 0);
-  const weightedPoint4 = grades.reduce((sum, grade) => sum + ((grade.point4 ?? 0) * (grade.credits ?? 0)), 0);
-  const weightedPoint10 = grades.reduce((sum, grade) => sum + ((grade.point10 ?? 0) * (grade.credits ?? 0)), 0);
-  return {
-    credits: totalCredits,
-    point4: totalCredits ? weightedPoint4 / totalCredits : undefined,
-    point10: totalCredits ? weightedPoint10 / totalCredits : undefined,
-  };
 }
 
 type GradeSortKey = "name" | "credits" | "point10" | "point4";
@@ -57,6 +62,41 @@ function sortGrades(grades: Grade[], sort: GradeSortState) {
     const ordered = sort.direction === "asc" ? base : -base;
     return ordered || a.courseName.localeCompare(b.courseName);
   });
+}
+
+function CompactAcademicMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <span className="inline-flex items-baseline gap-1.5 whitespace-nowrap">
+      <span className="text-xs text-muted-foreground">{label}</span>
+      <span className="font-semibold tabular-nums">{value}</span>
+    </span>
+  );
+}
+
+export function gradeExportTerm(
+  summary: AcademicTermSummary<Grade>,
+  universityId: string,
+  label: string,
+  sortedCourses: Grade[],
+): ExportDerivedTerm {
+  const rawTermCode = decodeGradeTermKey(summary.termKey);
+  return {
+    termCode: rawTermCode ?? "unknown",
+    termLabel: label,
+    estimateKind: "derived",
+    listedCredits: summary.listedCredits,
+    includedCredits: summary.includedCredits,
+    termGpa4: summary.termGpa4,
+    derivedCpa4: summary.cpa4,
+    courses: sortedCourses.map((grade) => ({
+      courseCode: grade.courseCode,
+      courseName: grade.courseName,
+      credits: grade.credits,
+      point10: grade.point10 ?? undefined,
+      letter: letterForGrade(grade, universityId),
+      point4: grade.point4 ?? undefined,
+    })),
+  };
 }
 
 function SummerBadge() {
@@ -204,61 +244,111 @@ export function GradesPage() {
   const [selectedTerm, setSelectedTerm] = useState<string | undefined>(undefined);
   const query = useFeatureQuery("grades", () => api.grades(state.universityId));
   const gpa = state.dashboard.data?.gpa;
+  const summaries = useMemo(
+    () => newestAcademicTermsFirst(calculateTermAcademicSummaries(
+      (query.data ?? []).map((grade) => ({
+        termKey: encodeGradeTermKey(grade.termCode),
+        credits: grade.credits,
+        point4: grade.point4,
+        course: grade,
+        isSummer: isSummerGrade(grade, state.universityId),
+      })),
+      state.universityId,
+    )),
+    [query.data, state.universityId],
+  );
+  const termLabel = (rawTermCode: string | undefined) => rawTermCode
+    ? formatTermLabel(rawTermCode, state.universityId, t.terms)
+    : t.grades.unknownTerm;
+  const newestTerm = summaries[0]?.termKey;
+  const selectedSummaryExists = summaries.some((summary) => summary.termKey === selectedTerm);
+  const effectiveTerm = selectedTerm === ALL_TERMS || selectedSummaryExists ? selectedTerm : newestTerm;
+  const visibleSummaries = effectiveTerm === ALL_TERMS
+    ? summaries
+    : summaries.filter((summary) => summary.termKey === effectiveTerm);
+  const visibleTermViews = visibleSummaries.map((summary) => {
+    const rawTermCode = decodeGradeTermKey(summary.termKey);
+    const label = termLabel(rawTermCode);
+    const sortedCourses = sortGrades(summary.courses, sort);
+    const exportTerm = gradeExportTerm(summary, state.universityId, label, sortedCourses);
+    return { summary, rawTermCode, label, sortedCourses, exportTerm };
+  });
+  const exportIdentity = state.dashboard.data?.student ? {
+    studentCode: state.dashboard.data.student.studentCode,
+    studentName: state.dashboard.data.student.fullName,
+    managingClass: state.dashboard.data.student.className,
+  } : undefined;
+  const exportReported = gpa ? {
+    cumulativeGpa4: gpa.gpa ?? undefined,
+    totalCredits: gpa.totalCredits,
+    accumulatedCredits: gpa.totalAccumulatedCredits,
+  } : undefined;
+  const exportsReady = !state.dashboard.isPending;
+  const pageExportModel = summaries.length && exportsReady ? createGradesExport({
+    surface: "grades-page",
+    universityId: state.universityId,
+    identity: exportIdentity,
+    reported: exportReported,
+    derivedTerms: visibleTermViews.map((view) => view.exportTerm),
+  }) : undefined;
+
   return (
-    <FeatureFrame title={t.grades.title} description={t.grades.description} query={query}>
-      {(items) => {
-        const byTerm = items.reduce<Record<string, Grade[]>>((acc, g) => {
-          const key = gradeTermKey(g, state.universityId, t.grades.unknownTerm);
-          (acc[key] ??= []).push(g);
-          return acc;
-        }, {});
-        const termKeys = Object.keys(byTerm).sort((a, b) => b.localeCompare(a));
-        const newestTerm = termKeys[0];
-        const effectiveTerm = selectedTerm && (selectedTerm === ALL_TERMS || byTerm[selectedTerm]) ? selectedTerm : newestTerm;
-        const visibleTerms = effectiveTerm === ALL_TERMS ? termKeys : termKeys.filter((term) => term === effectiveTerm);
-        return (
+    <FeatureFrame
+      title={t.grades.title}
+      description={t.grades.description}
+      query={query}
+      actions={pageExportModel ? <div data-testid="grades-page-export"><ExportMenu model={pageExportModel} /></div> : undefined}
+    >
+      {() => (
           <div className="space-y-6">
             <SummaryStrip testId="grades-summary">
-              <SummaryStat label={t.dashboard.gpa} value={gpa?.gpa?.toFixed(2) ?? "-"} detail={t.grades.gpaDetail} />
-              <SummaryStat label={t.grades.cpa} value={gpa?.cpa?.toFixed(2) ?? "-"} detail={state.universityId === "vnu" ? t.grades.cpaDetailVnu : t.grades.cpaDetailOther} />
+              <SummaryStat label={t.grades.reportedCumulativeGpa} value={gpa?.gpa?.toFixed(2) ?? "-"} detail={t.grades.gpaDetail} />
+              <SummaryStat label={t.grades.reportedSecondaryGpa} value={gpa?.cpa?.toFixed(2) ?? "-"} detail={state.universityId === "vnu" ? t.grades.cpaDetailVnu : t.grades.cpaDetailOther} />
               <SummaryStat label={t.grades.credits} value={String(gpa?.totalAccumulatedCredits ?? "-")} detail={t.grades.creditsCompleted} />
             </SummaryStrip>
-            {termKeys.length ? (
+            {summaries.length ? (
               <Select value={effectiveTerm ?? ""} onValueChange={setSelectedTerm}>
-                <SelectTrigger className="h-9 w-[220px]" aria-label={t.exams.term} data-testid="grades-term-select">
+                <SelectTrigger className="min-h-11 w-full sm:w-[260px]" aria-label={t.exams.term} data-testid="grades-term-select">
                   <SelectValue placeholder={t.exams.term} />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value={ALL_TERMS}>{t.grades.allTerms}</SelectItem>
-                  {termKeys.map((term) => (
-                    <SelectItem key={term} value={term}>{formatTermLabel(term, state.universityId, t.terms)}</SelectItem>
+                  {summaries.map((summary) => (
+                    <SelectItem key={summary.termKey} value={summary.termKey}>{termLabel(decodeGradeTermKey(summary.termKey))}</SelectItem>
                   ))}
                 </SelectContent>
               </Select>
             ) : null}
-            {visibleTerms.map((term) => {
-              const grades = byTerm[term];
-              const summary = summarizeGrades(grades);
-              const includesSummer = usesUetTermRules(state.universityId) && grades.some((grade) => grade.termCode && grade.termCode !== term && grade.termCode.endsWith("3"));
-              const sortedGrades = sortGrades(grades, sort);
-              const displayTerm = formatTermLabel(term, state.universityId, t.terms);
+            {!summaries.length ? <Empty text={t.grades.noGrades} /> : null}
+            {visibleTermViews.map(({ summary, label, sortedCourses, exportTerm }) => {
+              const termExportModel = exportsReady ? createGradesExport({
+                surface: "grades-term",
+                universityId: state.universityId,
+                identity: exportIdentity,
+                reported: exportReported,
+                derivedTerms: [exportTerm],
+              }) : undefined;
+              const headingId = `grade-term-${encodeURIComponent(summary.termKey)}`;
               return (
-              <div key={term} className="space-y-2">
-                <div className="flex flex-wrap items-center gap-2">
-                  <h2 className="text-base font-semibold">{displayTerm}</h2>
-                  {includesSummer ? <Badge className="border border-border bg-background text-foreground">{t.grades.includesSummer}</Badge> : null}
-                </div>
-                <SummaryStrip testId="term-summary">
-                  <SummaryStat label={t.grades.termGpa} value={summary.point4?.toFixed(2) ?? "-"} />
-                  <SummaryStat label={t.grades.average10} value={summary.point10?.toFixed(2) ?? "-"} />
-                  <SummaryStat label={t.grades.credits} value={String(summary.credits || "-")} />
-                </SummaryStrip>
-                <GradeTable grades={sortedGrades} sort={sort} onSortChange={setSort} universityId={state.universityId} />
-              </div>
+              <section key={summary.termKey} aria-labelledby={headingId} data-testid="term-summary" className="space-y-2">
+                <header data-testid="academic-term-header" className="flex flex-wrap items-center gap-x-4 gap-y-2 border-y border-border py-3">
+                  <div className="flex min-w-0 flex-wrap items-center gap-2">
+                    <h2 id={headingId} className="text-base font-semibold">{label}</h2>
+                    {summary.includesSummer ? <Badge className="border border-border bg-background text-foreground">{t.grades.includesSummer}</Badge> : null}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+                    <Badge className="border border-border bg-muted text-foreground" title={t.grades.derivedDetail}>{t.grades.derived}</Badge>
+                    <CompactAcademicMetric label={t.grades.termGpa} value={summary.termGpa4?.toFixed(2) ?? "-"} />
+                    <CompactAcademicMetric label={t.grades.cpa} value={summary.cpa4?.toFixed(2) ?? "-"} />
+                    <CompactAcademicMetric label={t.grades.includedCredits} value={t.grades.creditRatio(summary.includedCredits, summary.listedCredits)} />
+                  </div>
+                  {termExportModel ? <ExportMenu model={termExportModel} className="ml-auto" /> : null}
+                </header>
+                <GradeTable grades={sortedCourses} sort={sort} onSortChange={setSort} universityId={state.universityId} />
+              </section>
             );})}
           </div>
-        );
-      }}
+      )}
     </FeatureFrame>
   );
 }
