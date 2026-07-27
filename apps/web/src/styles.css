@@ -238,7 +238,7 @@ textarea.control {
 
 .summary-strip {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 1rem;
   border-radius: 0.85rem;
   border: 1px solid hsl(var(--border));
@@ -246,9 +246,32 @@ textarea.control {
   background: hsl(var(--card));
 }
 
-.summary-stat + .summary-stat {
+/* Two-column layout: dividers are deterministic per grid position, so a
+   wrapped odd stat never inherits a stray left border. */
+.summary-strip > .summary-stat:nth-child(even) {
   border-left: 1px solid hsl(var(--border));
   padding-left: 1rem;
+}
+
+.summary-strip > .summary-stat:nth-child(n + 3) {
+  border-top: 1px solid hsl(var(--border));
+  padding-top: 1rem;
+}
+
+@media (min-width: 64rem) {
+  /* Single row: auto-flow column never wraps, so sibling dividers are safe. */
+  .summary-strip {
+    grid-template-columns: none;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(0, 1fr);
+  }
+
+  .summary-strip > .summary-stat:nth-child(n + 2) {
+    border-top: 0;
+    padding-top: 0;
+    border-left: 1px solid hsl(var(--border));
+    padding-left: 1rem;
+  }
 }
 
 .section-panel {

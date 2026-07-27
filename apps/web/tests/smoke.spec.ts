@@ -155,6 +155,14 @@ test("dashboard summary strip stays contained on mobile", async ({ page }) => {
   expect(third).not.toBeNull();
   expect(Math.abs(first!.y - second!.y)).toBeLessThan(5);
   expect(third!.y).toBeGreaterThan(first!.y);
+
+  await page.goto("/grades");
+  const gradesStats = page.getByTestId("grades-summary").locator(".summary-stat");
+  await expect(gradesStats).toHaveCount(3);
+  const wrappedStatBorderLeft = await gradesStats
+    .nth(2)
+    .evaluate((element) => getComputedStyle(element).borderLeftWidth);
+  expect(wrappedStatBorderLeft).toBe("0px");
 });
 
 test("status labels render as readable text", async ({ page }) => {
