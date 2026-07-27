@@ -1,4 +1,5 @@
 import { configureLogger, decryptSession, encryptSession, HyeboardError, type EncryptedSessionPayload } from "@hyeboard/core";
+import { DaotaoClient } from "@hyeboard/university-adapters";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const adapterMocks = vi.hoisted(() => ({
@@ -11,12 +12,13 @@ vi.mock("@hyeboard/university-adapters", async (importOriginal) => {
   return { ...actual, getAdapter: adapterMocks.getAdapter };
 });
 
-import { createApp, createCaptchaRelayToken, resolveSession, setCaptchaRelayCoordinator, setRuntimeConfig } from "./app";
+import { createApp, createCaptchaRelayToken, isVnuFarWalkEnabled, resolveSession, setCaptchaRelayCoordinator, setRuntimeConfig, setVnuProbeBudgetCoordinator, type RuntimeConfig } from "./app";
 import { LocalCaptchaRelayCoordinator, type CaptchaRelayCoordinator } from "./captcha-relay";
+import { selfHostedRuntimeConfig } from "./start";
+import type { VnuProbeBudgetCoordinator } from "./vnu-probe-budget";
 
 const SESSION_SECRET = "worker-test-secret-worker-test-secret";
 const VNU_STUDENT_CODE = "SYNTHETIC-STUDENT-001";
-const SESSION_DEATH_CODES = ["MISSING_SESSION", "SESSION_EXPIRED", "INVALID_SESSION"];
 const SENTINELS = [
   "PARENT_USERNAME_SENTINEL",
   "PARENT_PASSWORD_SENTINEL",
@@ -126,6 +128,37 @@ function importedVnu(session = vnuSession()) {
   };
 }
 
+class TestVnuProbeBudget implements VnuProbeBudgetCoordinator {
+  readonly identities: string[] = [];
+  readonly amounts: number[] = [];
+  readonly counts = new Map<string, number>();
+  limit = Number.POSITIVE_INFINITY;
+  unavailable = false;
+
+  get count(): number {
+    return [...this.counts.values()].reduce((total, count) => total + count, 0);
+  }
+
+  async consume(sessionIdentity: string, amount = 1): Promise<void> {
+    this.identities.push(sessionIdentity);
+    this.amounts.push(amount);
+    if (this.unavailable) throw new Error("synthetic budget outage");
+    const count = this.counts.get(sessionIdentity) ?? 0;
+    if (count + amount > this.limit) {
+      throw new HyeboardError("VNU_RATE_LIMITED", "Synthetic budget exhausted", 429, {
+        retryAfterSeconds: 600,
+        limit: 300,
+        windowSeconds: 600,
+      });
+    }
+    this.counts.set(sessionIdentity, count + amount);
+  }
+
+  async reserve(sessionIdentity: string, amount: number): Promise<void> {
+    await this.consume(sessionIdentity, amount);
+  }
+}
+
 async function importVnu(app: ReturnType<typeof createApp>): Promise<VnuImportResponse> {
   const response = await app.handle(new Request("http://localhost/api/vnu/auth/import-session", {
     method: "POST",
@@ -205,7 +238,6 @@ describe("lazy parent session refresh", () => {
 
     expect(caught).toBe(error);
     expect(caught).toMatchObject({ code, status });
-    expect(SESSION_DEATH_CODES).not.toContain(code);
     expect(adapterMocks.importSession.mock.calls[0]).toHaveLength(1);
     await expect(decryptSession(token, SESSION_SECRET)).resolves.toEqual(parentSession());
     for (const sentinel of SENTINELS) expect(logOutput.join("\n")).not.toContain(sentinel);
@@ -567,5 +599,508 @@ describe("VNU import session cache", () => {
     expect(adapterMocks.importSession).toHaveBeenCalledTimes(1);
     await expect(decryptSession(outward.token, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession());
     expect(cache.store.size).toBe(0);
+  });
+});
+
+describe("VNU cross-transcript route", () => {
+  let cache: TestCache;
+  let app: ReturnType<typeof createApp>;
+  let profileSpy: ReturnType<typeof vi.spyOn>;
+  let transcriptSpy: ReturnType<typeof vi.spyOn>;
+  let probeBudget: TestVnuProbeBudget;
+
+  const profileHtml = `<input name="hidStdID" value="1000"><input name="StdCode" value="20000000">`;
+  const targetTranscriptHtml = `<table>
+    <tr><td>Sinh viên: SYNTHETIC TARGET</td><td>Mã số: 20000001</td><td>Lớp quản lý: QH-SYNTHETIC</td></tr>
+    <tr><td>HỌC KỲ 1 - 2025-2026. MÃ HỌC KỲ 251</td></tr>
+    <tr><td>1</td><td>INT1001</td><td>Reliable Systems</td><td>3</td><td>8</td><td>B+</td><td>3.5</td><td></td></tr>
+  </table><div>Tổng tín chỉ: 3</div>`;
+
+  async function authorizedRequest(query: string, route = "transcript", sessionCookie = "SYNTHETIC_TRANSCRIPT_COOKIE"): Promise<Response> {
+    const session = { ...vnuSession(), vnu: { ...vnuSession().vnu!, value: sessionCookie } };
+    const token = await encryptSession(session, SESSION_SECRET);
+    return app.handle(new Request(`http://localhost/api/vnu/cross-lookup/${route}?${query}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    }));
+  }
+
+  async function bulkRequest(body: unknown, session: EncryptedSessionPayload = { ...vnuSession(), vnu: { ...vnuSession().vnu!, value: "SYNTHETIC_TRANSCRIPT_COOKIE" } }): Promise<Response> {
+    return bulkRawRequest(JSON.stringify(body), session);
+  }
+
+  async function bulkRawRequest(body: string, session?: EncryptedSessionPayload): Promise<Response> {
+    const token = session ? await encryptSession(session, SESSION_SECRET) : undefined;
+    return app.handle(new Request("http://localhost/api/vnu/cross-lookup/bulk", {
+      method: "POST",
+      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), "Content-Type": "application/json" },
+      body,
+    }));
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET });
+    cache = new TestCache(() => Date.now());
+    vi.stubGlobal("caches", { default: cache });
+    probeBudget = new TestVnuProbeBudget();
+    setVnuProbeBudgetCoordinator(probeBudget);
+    profileSpy = vi.spyOn(DaotaoClient.prototype, "getProfileHtml").mockResolvedValue(profileHtml);
+    transcriptSpy = vi.spyOn(DaotaoClient.prototype, "getTranscriptByStdIdHtml").mockResolvedValue(targetTranscriptHtml);
+    app = createApp(undefined);
+  });
+
+  afterEach(() => {
+    profileSpy.mockRestore();
+    transcriptSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("rejects invalid target combinations before reading the own profile", async () => {
+    const response = await authorizedRequest("stdId=1001&stdCode=20000001&allowCrossLookup=true");
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_CROSS_LOOKUP_QUERY_INCOMPLETE" } });
+    expect(profileSpy).not.toHaveBeenCalled();
+    expect(transcriptSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["neither target", "allowCrossLookup=true"],
+    ["malformed StdID", "stdId=abc&allowCrossLookup=true"],
+    ["empty StdID", "stdId=&allowCrossLookup=true"],
+    ["malformed student code", "stdCode=1234567&allowCrossLookup=true"],
+  ])("rejects %s before reading the own profile or transcript oracle", async (_label, query) => {
+    const response = await authorizedRequest(query);
+
+    expect(response.status).toBe(400);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_CROSS_LOOKUP_QUERY_INCOMPLETE" } });
+    expect(profileSpy).not.toHaveBeenCalled();
+    expect(transcriptSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["missing", "stdId=1001"],
+    ["incorrect", "stdId=1001&allowCrossLookup=1"],
+  ])("rejects %s explicit opt-in before reading the own profile or transcript oracle", async (_label, query) => {
+    const response = await authorizedRequest(query);
+
+    expect(response.status).toBe(400);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_CROSS_LOOKUP_NOT_EXPLICITLY_ALLOWED" } });
+    expect(profileSpy).not.toHaveBeenCalled();
+    expect(transcriptSpy).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-VNU session before profile or transcript access", async () => {
+    const token = await encryptSession(parentSession(), SESSION_SECRET);
+    const response = await app.handle(new Request("http://localhost/api/vnu/cross-lookup/transcript?stdId=1001&allowCrossLookup=true", {
+      headers: { Authorization: `Bearer ${token}` },
+    }));
+
+    expect(response.status).toBe(403);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "SESSION_UNIVERSITY_MISMATCH" } });
+    expect(profileSpy).not.toHaveBeenCalled();
+    expect(transcriptSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["normalized zero-padded own StdID", "stdId=00000001000&allowCrossLookup=true"],
+    ["own student code", "stdCode=20000000&allowCrossLookup=true"],
+  ])("rejects %s before transcript oracle access", async (_label, query) => {
+    const response = await authorizedRequest(query);
+
+    expect(response.status).toBe(400);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_CROSS_LOOKUP_SELF_TARGET" } });
+    expect(profileSpy).toHaveBeenCalledTimes(1);
+    expect(transcriptSpy).not.toHaveBeenCalled();
+  });
+
+  it("rejects a normalized zero-padded own StdID on the student-code route before oracle access", async () => {
+    const response = await authorizedRequest("stdId=00000001000&allowCrossLookup=true", "student-code");
+
+    expect(response.status).toBe(400);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_CROSS_LOOKUP_SELF_TARGET" } });
+    expect(probeBudget.count).toBe(0);
+    expect(transcriptSpy).not.toHaveBeenCalled();
+  });
+
+  // Regression: Number("not-a-number") is NaN and NaN never equals the
+  // target, so a truthy-but-malformed own-profile id silently bypassed the
+  // old self-target guard — the route then spent budget and fetched Brc1
+  // with an unverified caller identity. Identity parsing now fails closed.
+  it.each([
+    ["student-code", "stdId=1002&allowCrossLookup=true"],
+    ["student-id", "stdCode=20000001&allowCrossLookup=true"],
+    ["transcript", "stdId=1002&allowCrossLookup=true"],
+  ])("fails closed on a malformed own-profile identity for %s without budget or Brc1 access", async (route, query) => {
+    profileSpy.mockResolvedValue(`<input name="hidStdID" value="not-a-number"><input name="StdCode" value="20000000">`);
+
+    const response = await authorizedRequest(query, route);
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_LOGIN_REQUIRED" } });
+    expect(probeBudget.count).toBe(0);
+    expect(transcriptSpy).not.toHaveBeenCalled();
+  });
+
+  it("fails closed on a malformed own-profile identity for bulk without budget or Brc1 access", async () => {
+    profileSpy.mockResolvedValue(`<input name="hidStdID" value="not-a-number"><input name="StdCode" value="20000000">`);
+
+    const response = await bulkRequest({ mode: "stdid-to-code", targets: ["1002"], allowCrossLookup: true });
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_LOGIN_REQUIRED" } });
+    expect(probeBudget.count).toBe(0);
+    expect(transcriptSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns parsed JSON only and spends one probe for direct StdID mode", async () => {
+    const response = await authorizedRequest("stdId=1001&allowCrossLookup=true");
+    const body = await response.json() as { data: Record<string, unknown> };
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(body.data).toMatchObject({
+      header: { studentCode: "20000001", studentName: "SYNTHETIC TARGET" },
+      terms: [{ maHK: "251", rows: [{ courseCode: "INT1001", grade10: 8 }] }],
+      totals: { totalCredits: 3 },
+    });
+    expect(JSON.stringify(body)).not.toContain("<table>");
+    expect(transcriptSpy).toHaveBeenCalledTimes(1);
+    expect(probeBudget.count).toBe(1);
+  });
+
+  it("removes upstream notice prose from transcript responses", async () => {
+    const upstreamNoticeSentinel = "UPSTREAM_NOTICE_SENTINEL_DO_NOT_EXPOSE";
+    transcriptSpy.mockResolvedValue(`${targetTranscriptHtml}<script>alert('${upstreamNoticeSentinel}')</script>`);
+
+    const response = await authorizedRequest("stdId=1001&allowCrossLookup=true");
+    const payload = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(payload).not.toContain(upstreamNoticeSentinel);
+    expect(payload).not.toContain("notice");
+  });
+
+  it("spends resolver probes plus one separate transcript fetch for student-code mode", async () => {
+    const response = await authorizedRequest("stdCode=20000001&allowCrossLookup=true");
+    const body = await response.json() as { data: Record<string, unknown> };
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(body.data).toMatchObject({ header: { studentCode: "20000001" }, terms: [{ maHK: "251" }] });
+    expect(JSON.stringify(body)).not.toContain("<table>");
+    expect(transcriptSpy).toHaveBeenCalledTimes(2);
+    expect(transcriptSpy).toHaveBeenNthCalledWith(1, "1001");
+    expect(transcriptSpy).toHaveBeenNthCalledWith(2, "00000001001");
+    expect(probeBudget.count).toBe(2);
+  });
+
+  it("blocks the final transcript fetch when resolver probes exhaust the budget", async () => {
+    probeBudget.limit = 1;
+
+    const response = await authorizedRequest("stdCode=20000001&allowCrossLookup=true");
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_RATE_LIMITED" } });
+    expect(transcriptSpy).toHaveBeenCalledTimes(1);
+    expect(transcriptSpy).toHaveBeenCalledWith("1001");
+  });
+
+  it("keeps separate budget identifiers and counters for separate VNU sessions", async () => {
+    probeBudget.limit = 1;
+
+    const first = await authorizedRequest("stdId=1001&allowCrossLookup=true", "transcript", "SYNTHETIC_SESSION_A");
+    const exhaustedFirst = await authorizedRequest("stdId=1002&allowCrossLookup=true", "transcript", "SYNTHETIC_SESSION_A");
+    const second = await authorizedRequest("stdId=1002&allowCrossLookup=true", "transcript", "SYNTHETIC_SESSION_B");
+
+    expect(first.status).toBe(200);
+    expect(exhaustedFirst.status).toBe(429);
+    expect(second.status).toBe(200);
+    expect(new Set(probeBudget.identities).size).toBe(2);
+    expect([...probeBudget.counts.values()].sort()).toEqual([1, 1]);
+    expect(transcriptSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["headerless transcript", `<table><tr><td>1</td><td>INT1001</td><td>Foreign grade</td><td>3</td><td>8</td><td>B+</td><td>3.5</td><td></td></tr></table>`],
+    ["invalid portal response", "<html><body>not a transcript</body></html>"],
+  ])("returns no foreign result for an %s", async (_label, html) => {
+    transcriptSpy.mockResolvedValue(html);
+
+    const response = await authorizedRequest("stdId=1001&allowCrossLookup=true");
+    const body = await response.json() as { data: unknown; error: { code: string } };
+
+    expect(response.status).toBe(404);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(body).toMatchObject({ data: null, error: { code: "VNU_CROSS_LOOKUP_NOT_FOUND" } });
+    expect(JSON.stringify(body)).not.toContain("Foreign grade");
+  });
+
+  it("shares one HMAC budget across student-code and student-id routes for the same session", async () => {
+    const byId = await authorizedRequest("stdId=1002&allowCrossLookup=true", "student-code");
+    const byCode = await authorizedRequest("stdCode=20000001&allowCrossLookup=true", "student-id");
+
+    expect(byId.status).toBe(200);
+    expect(byCode.status).toBe(200);
+    expect(byId.headers.get("Cache-Control")).toBe("no-store");
+    expect(byCode.headers.get("Cache-Control")).toBe("no-store");
+    expect(probeBudget.count).toBe(2);
+    expect(new Set(probeBudget.identities).size).toBe(1);
+    expect(probeBudget.identities[0]).toMatch(/^[0-9a-f]{64}$/);
+    expect(probeBudget.identities.join(" ")).not.toContain("SYNTHETIC_TRANSCRIPT_COOKIE");
+    expect(probeBudget.identities.join(" ")).not.toMatch(/20000001|1002/);
+  });
+
+  it.each([
+    ["student-code", "stdId=bad&allowCrossLookup=true"],
+    ["student-id", "stdCode=bad&allowCrossLookup=true"],
+  ])("sets no-store on %s resolver errors", async (route, query) => {
+    const response = await authorizedRequest(query, route);
+
+    expect(response.status).toBe(400);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("maps a headerless portal notice to not-found without exposing its prose", async () => {
+    const upstreamNoticeSentinel = "UPSTREAM_NOTICE_SENTINEL_DO_NOT_EXPOSE";
+    transcriptSpy.mockResolvedValue(`<script>alert('${upstreamNoticeSentinel}')</script>`);
+
+    const response = await authorizedRequest("stdId=1001&allowCrossLookup=true", "student-code");
+    const payload = await response.text();
+
+    expect(response.status).toBe(404);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(payload).toContain("VNU_CROSS_LOOKUP_NOT_FOUND");
+    expect(payload).not.toContain(upstreamNoticeSentinel);
+  });
+
+  it("rejects confirmed exhaustion before the upstream Brc1 fetch without session-death semantics", async () => {
+    probeBudget.limit = 0;
+
+    const response = await authorizedRequest("stdId=1002&allowCrossLookup=true", "student-code");
+    const body = await response.json() as { error: { code: string; details: Record<string, unknown> } };
+
+    expect(response.status).toBe(429);
+    expect(body.error).toMatchObject({ code: "VNU_RATE_LIMITED", details: { retryAfterSeconds: 600 } });
+    expect(transcriptSpy).not.toHaveBeenCalled();
+    expect(JSON.stringify(body)).not.toContain("SYNTHETIC_TRANSCRIPT_COOKIE");
+    expect(JSON.stringify(body)).not.toMatch(/20000001|1002/);
+  });
+
+  it("reports budget unavailability as 503 without session-death semantics", async () => {
+    probeBudget.unavailable = true;
+
+    const response = await authorizedRequest("stdId=1002&allowCrossLookup=true", "student-code");
+    const body = await response.json() as { error: { code: string; details: Record<string, unknown> } };
+
+    expect(response.status).toBe(503);
+    expect(body.error).toMatchObject({ code: "VNU_PROBE_BUDGET_UNAVAILABLE", details: { retryAfterSeconds: 5 } });
+    expect(transcriptSpy).not.toHaveBeenCalled();
+  });
+
+  describe("bulk lookup", () => {
+    it("runs authentication, university, explicit opt-in, body, then own-profile guards", async () => {
+      const missingSession = await bulkRawRequest("{");
+      expect(missingSession.status).toBe(401);
+      await expect(missingSession.json()).resolves.toMatchObject({ error: { code: "MISSING_SESSION" } });
+
+      const wrongUniversity = await bulkRawRequest("{", parentSession());
+      expect(wrongUniversity.status).toBe(403);
+      await expect(wrongUniversity.json()).resolves.toMatchObject({ error: { code: "SESSION_UNIVERSITY_MISMATCH" } });
+
+      const missingOptIn = await bulkRequest({ mode: "stdid-to-code", targets: ["1001"], allowCrossLookup: false });
+      expect(missingOptIn.status).toBe(400);
+      await expect(missingOptIn.json()).resolves.toMatchObject({ error: { code: "VNU_CROSS_LOOKUP_NOT_EXPLICITLY_ALLOWED" } });
+
+      const malformed = await bulkRequest({ mode: "unknown", targets: ["1001"], allowCrossLookup: true });
+      expect(malformed.status).toBe(400);
+      expect(profileSpy).not.toHaveBeenCalled();
+
+      profileSpy.mockResolvedValueOnce("<html>no profile identity</html>");
+      const noProfile = await bulkRequest({ mode: "stdid-to-code", targets: ["1001"], allowCrossLookup: true });
+      expect(noProfile.status).toBe(401);
+      expect(transcriptSpy).not.toHaveBeenCalled();
+      expect(probeBudget.count).toBe(0);
+    });
+
+    it.each([
+      ["string", "true", 400],
+      ["number", 1, 400],
+      ["boolean", true, 200],
+    ] as const)("accepts only boolean true for allowCrossLookup (%s)", async (_label, allowCrossLookup, status) => {
+      const response = await bulkRequest({ mode: "stdid-to-code", targets: ["1001"], allowCrossLookup });
+
+      expect(response.status).toBe(status);
+      if (status === 400) await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_CROSS_LOOKUP_NOT_EXPLICITLY_ALLOWED" } });
+    });
+
+    it.each([
+      ["stdid-to-code", 6],
+      ["stdid-to-transcript", 6],
+      ["code-to-stdid", 4],
+    ] as const)("rejects an oversized %s chunk at the chunk boundary", async (mode, size) => {
+      const target = mode === "code-to-stdid" ? "20000001" : "1001";
+      const response = await bulkRequest({ mode, targets: Array.from({ length: size }, () => target), allowCrossLookup: true });
+
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_CROSS_LOOKUP_CHUNK_TOO_LARGE" } });
+      expect(profileSpy).not.toHaveBeenCalled();
+      expect(transcriptSpy).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["stdid-to-code", []],
+      ["stdid-to-transcript", []],
+      ["code-to-stdid", []],
+    ] as const)("rejects empty targets for %s", async (mode, targets) => {
+      const response = await bulkRequest({ mode, targets, allowCrossLookup: true });
+      expect(response.status).toBe(400);
+    });
+
+    it("isolates malformed, self, not-found, and successful direct-code targets in input order", async () => {
+      transcriptSpy.mockImplementation(async (stdId: string) => stdId === "1002"
+        ? `<table><tr><td>Sinh viên: LATER TARGET</td><td>Mã số: 20000002</td><td>Lớp quản lý: QH-LATER</td></tr></table>`
+        : "<html>headerless</html>");
+
+      const response = await bulkRequest({ mode: "stdid-to-code", targets: ["bad", "1000", "1001", "1002"], allowCrossLookup: true });
+      const payload = await response.json() as { data: { items: Array<Record<string, unknown>> } };
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("Cache-Control")).toBe("no-store");
+      expect(payload.data.items).toEqual([
+        { target: "bad", status: "error", errorCode: "VNU_CROSS_LOOKUP_INVALID_TARGET" },
+        { target: "1000", status: "error", errorCode: "VNU_CROSS_LOOKUP_SELF_TARGET" },
+        { target: "1001", status: "error", errorCode: "VNU_CROSS_LOOKUP_NOT_FOUND" },
+        { target: "1002", status: "ok", result: { studentCode: "20000002", studentName: "LATER TARGET", className: "QH-LATER" } },
+      ]);
+      expect(transcriptSpy.mock.calls.map((call: unknown[]) => call[0] as string)).toEqual(["1001", "1002"]);
+      expect(probeBudget.amounts).toEqual([4]);
+      expect(JSON.stringify(payload)).not.toContain("<html>");
+    });
+
+    it("reserves the resolver hard maximum once per code target without per-fetch double charging", async () => {
+      transcriptSpy.mockImplementation(async (stdId: string) => {
+        const code = 20_000_000 + Number(stdId) - 1_000;
+        return `<table><tr><td>Sinh viên: TARGET</td><td>Mã số: ${code}</td><td>Lớp quản lý: QH-TARGET</td></tr></table>`;
+      });
+
+      const response = await bulkRequest({ mode: "code-to-stdid", targets: ["20000001", "20000002"], allowCrossLookup: true });
+      const payload = await response.json() as { data: { items: Array<Record<string, unknown>> } };
+
+      expect(response.status).toBe(200);
+      expect(payload.data.items).toMatchObject([
+        { target: "20000001", status: "ok", result: { stdId: "00000001001", probes: 1 } },
+        { target: "20000002", status: "ok", result: { stdId: "00000001002", probes: 1 } },
+      ]);
+      expect(probeBudget.amounts).toEqual([44]);
+      expect(transcriptSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it("rejects the whole chunk reservation before any Brc1 request", async () => {
+      probeBudget.limit = 4;
+      const response = await bulkRequest({ mode: "stdid-to-transcript", targets: ["1001", "1002", "1003", "1004", "1005"], allowCrossLookup: true });
+
+      expect(response.status).toBe(429);
+      await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_RATE_LIMITED" } });
+      expect(transcriptSpy).not.toHaveBeenCalled();
+    });
+
+    it("fails with 503 before Brc1 when the reservation service is unavailable", async () => {
+      probeBudget.unavailable = true;
+      const response = await bulkRequest({ mode: "stdid-to-code", targets: ["1001"], allowCrossLookup: true });
+
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_PROBE_BUDGET_UNAVAILABLE" } });
+      expect(transcriptSpy).not.toHaveBeenCalled();
+    });
+
+    it("returns full parsed transcript models and no raw HTML", async () => {
+      const response = await bulkRequest({ mode: "stdid-to-transcript", targets: ["1001"], allowCrossLookup: true });
+      const payload = await response.json() as { data: { items: Array<Record<string, unknown>> } };
+
+      expect(response.status).toBe(200);
+      expect(payload.data.items).toMatchObject([{ target: "1001", status: "ok", result: { header: { studentCode: "20000001" }, terms: [{ maHK: "251" }], totals: { totalCredits: 3 } } }]);
+      expect(JSON.stringify(payload)).not.toContain("<table>");
+      expect(probeBudget.amounts).toEqual([1]);
+    });
+
+    it("removes upstream notice prose from bulk transcript results", async () => {
+      const upstreamNoticeSentinel = "UPSTREAM_NOTICE_SENTINEL_DO_NOT_EXPOSE";
+      transcriptSpy.mockResolvedValue(`${targetTranscriptHtml}<font color="red">${upstreamNoticeSentinel}</font>`);
+
+      const response = await bulkRequest({ mode: "stdid-to-transcript", targets: ["1001"], allowCrossLookup: true });
+      const payload = await response.text();
+
+      expect(response.status).toBe(200);
+      expect(payload).not.toContain(upstreamNoticeSentinel);
+      expect(payload).not.toContain("notice");
+    });
+
+    it("keeps reservations isolated between sessions", async () => {
+      probeBudget.limit = 1;
+      const first = await bulkRequest({ mode: "stdid-to-code", targets: ["1001"], allowCrossLookup: true }, { ...vnuSession(), vnu: { ...vnuSession().vnu!, value: "BULK_SESSION_A" } });
+      const exhausted = await bulkRequest({ mode: "stdid-to-code", targets: ["1002"], allowCrossLookup: true }, { ...vnuSession(), vnu: { ...vnuSession().vnu!, value: "BULK_SESSION_A" } });
+      const second = await bulkRequest({ mode: "stdid-to-code", targets: ["1002"], allowCrossLookup: true }, { ...vnuSession(), vnu: { ...vnuSession().vnu!, value: "BULK_SESSION_B" } });
+
+      expect([first.status, exhausted.status, second.status]).toEqual([200, 429, 200]);
+      expect(new Set(probeBudget.identities).size).toBe(2);
+    });
+  });
+
+  it("keeps far walking disabled by default before any Brc1 fetch", async () => {
+    const response = await authorizedRequest("stdCode=20000065&allowCrossLookup=true", "student-id");
+
+    expect(response.status).toBe(404);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_CROSS_LOOKUP_NOT_CONVERGED" } });
+    expect(probeBudget.count).toBe(0);
+    expect(transcriptSpy).not.toHaveBeenCalled();
+  });
+
+  it("permits far walking only when the test environment sets literal true", async () => {
+    setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET, VNU_FAR_WALK_ENABLED: "true" });
+    transcriptSpy.mockImplementation(async (stdId: string) => {
+      const studentCode = 20_000_000 + Number(stdId) - 1_000;
+      return `<table><tr><td>Sinh viên: SYNTHETIC TARGET</td><td>Mã số: ${studentCode}</td><td>Lớp quản lý: QH-SYNTHETIC</td></tr></table>`;
+    });
+
+    const response = await authorizedRequest("stdCode=20000100&allowCrossLookup=true", "student-id");
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ data: { stdId: "00000001100", stdCode: "20000100" } });
+    expect(probeBudget.count).toBeGreaterThan(0);
+  });
+
+  it.each([true, "true", 1, "1", "TRUE", "True"])("ignores config-file far-walk value %j", (configValue) => {
+    const fileConfig = { VNU_FAR_WALK_ENABLED: configValue } as unknown as RuntimeConfig;
+
+    const config = selfHostedRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET }, fileConfig);
+
+    expect(config.VNU_FAR_WALK_ENABLED).toBeUndefined();
+    expect(isVnuFarWalkEnabled(config.VNU_FAR_WALK_ENABLED)).toBe(false);
+  });
+
+  it.each([undefined, "false", "1", "TRUE", "True", " true", "true "])("rejects non-literal environment value %j", (environmentValue) => {
+    const config = selfHostedRuntimeConfig({
+      HYEB_SESSION_SECRET: SESSION_SECRET,
+      VNU_FAR_WALK_ENABLED: environmentValue,
+    }, {});
+
+    expect(isVnuFarWalkEnabled(config.VNU_FAR_WALK_ENABLED)).toBe(false);
+  });
+
+  it("enables far walking for the exact environment string true", () => {
+    const config = selfHostedRuntimeConfig({
+      HYEB_SESSION_SECRET: SESSION_SECRET,
+      VNU_FAR_WALK_ENABLED: "true",
+    }, {});
+
+    expect(isVnuFarWalkEnabled(config.VNU_FAR_WALK_ENABLED)).toBe(true);
   });
 });

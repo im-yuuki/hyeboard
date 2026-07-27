@@ -1,5 +1,5 @@
 import type { ApiResponse, Assignment, ClassSession, Course, DashboardSummary, DocumentItem, ExamSession, Grade, NewsItem, ServiceRequest, Term, TrainingPoint, TuitionStatus, University } from "@hyeboard/schemas";
-import type { VnuExamCatalogRow, VnuPointDetail, VnuProfile } from "@hyeboard/university-adapters/src/vnu/types";
+import type { VnuExamCatalogRow, VnuPointDetail, VnuProfile, VnuTranscript } from "@hyeboard/university-adapters/src/vnu/types";
 import { mapExamRow, mapGpaSummary, mapGradeRow, mapProfile, mapSyllabusRow, mapTerms, mapTrainingPoints } from "@hyeboard/university-adapters/src/vnu/mapper";
 import { parseExamCatalogHtml, parseExamTermOptions, parseExamsHtml, parseGradesHtml, parsePointDetailHtml, parseProfileHtml, parseStudyProgressHtml, parseSyllabusHtml } from "@hyeboard/university-adapters/src/vnu/parser";
 import { createLinkedAbortController } from "./abort-deadline";
@@ -24,7 +24,11 @@ function uuid(): string {
 // (e.g. a feature that needs a learning-platform credential the user never provided) is
 // a feature-specific problem that should NOT log the user out of a session
 // that is otherwise perfectly valid.
-const SESSION_INVALID_CODES = new Set(["MISSING_SESSION", "SESSION_EXPIRED", "INVALID_SESSION"]);
+const SESSION_INVALID_CODES: ReadonlySet<string> = new Set(["MISSING_SESSION", "SESSION_EXPIRED", "INVALID_SESSION"]);
+
+export function isSessionDeathCode(code: string | undefined): boolean {
+  return code !== undefined && SESSION_INVALID_CODES.has(code);
+}
 
 // Fired only when the LAST remaining account's session dies/is signed out -
 // the app shell listens for this to bounce the user to /login. If other
@@ -184,7 +188,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
   if (!response.ok || payload.error) {
     const code = payload.error?.code;
-    const sessionDied = code ? SESSION_INVALID_CODES.has(code) : response.status === 401;
+    const sessionDied = code ? isSessionDeathCode(code) : response.status === 401;
     // The worker's lazy upstream refresh can stall on a StudentHub CAPTCHA
     // its server-side OCR couldn't solve. With stored credentials that is
     // recoverable inline too, so it joins the re-auth path instead of
@@ -286,7 +290,17 @@ async function vnuPointDetail(params: { id: string; Term: string }): Promise<Vnu
   return parsePointDetailHtml(page.html);
 }
 
-export type VnuCrossStudentCode = { studentCode?: string; studentName?: string; className?: string; notice?: string };
+export type VnuCrossStudentCode = { studentCode?: string; studentName?: string; className?: string };
+
+export type VnuCrossTranscript = Omit<VnuTranscript, "notice">;
+
+function sanitizeCrossStudentCode(result: VnuCrossStudentCode): VnuCrossStudentCode {
+  return { studentCode: result.studentCode, studentName: result.studentName, className: result.className };
+}
+
+function sanitizeCrossTranscript(result: VnuTranscript): VnuCrossTranscript {
+  return { header: result.header, terms: result.terms, totals: result.totals };
+}
 
 // Cross-student StdID -> student-code resolver (crossLookup capability, vnu
 // only). The dedicated worker route requires the explicit
@@ -296,9 +310,9 @@ export type VnuCrossStudentCode = { studentCode?: string; studentName?: string; 
 // student-role StdID -> identity source), parses the identity header itself,
 // and returns only the resolved fields — their raw transcript HTML (and the
 // grade table inside it) never reaches the client. A StdID that resolves to
-// no header yields an undefined studentCode, never a fabricated one.
+// no identity header fails with the stable VNU_CROSS_LOOKUP_NOT_FOUND code.
 async function vnuCrossStudentCode(params: { stdId: string }): Promise<VnuCrossStudentCode> {
-  return request<VnuCrossStudentCode>(`/api/vnu/cross-lookup/student-code${queryString({ stdId: params.stdId, allowCrossLookup: "true" })}`);
+  return sanitizeCrossStudentCode(await request<VnuCrossStudentCode>(`/api/vnu/cross-lookup/student-code${queryString({ stdId: params.stdId, allowCrossLookup: "true" })}`));
 }
 
 export type VnuCrossStudentId = { stdId: string; stdCode: string; probes: number };
@@ -312,6 +326,36 @@ export type VnuCrossStudentId = { stdId: string; stdCode: string; probes: number
 // (surfaced as an inline empty state, not a session error).
 async function vnuCrossStudentId(params: { stdCode: string }): Promise<VnuCrossStudentId> {
   return request<VnuCrossStudentId>(`/api/vnu/cross-lookup/student-id${queryString({ stdCode: params.stdCode, allowCrossLookup: "true" })}`);
+}
+
+export type VnuCrossTranscriptInput =
+  | { mode: "stdId"; stdId: string }
+  | { mode: "stdCode"; stdCode: string };
+
+async function vnuCrossTranscript(input: VnuCrossTranscriptInput): Promise<VnuCrossTranscript> {
+  const target = input.mode === "stdId" ? { stdId: input.stdId } : { stdCode: input.stdCode };
+  return sanitizeCrossTranscript(await request<VnuTranscript>(`/api/vnu/cross-lookup/transcript${queryString({ ...target, allowCrossLookup: "true" })}`));
+}
+
+export type VnuBulkLookupMode = "stdid-to-code" | "code-to-stdid" | "stdid-to-transcript";
+export type VnuBulkLookupResult = VnuCrossStudentCode | VnuCrossStudentId | VnuCrossTranscript;
+export type VnuBulkLookupItem =
+  | { target: string; status: "ok"; result: VnuBulkLookupResult }
+  | { target: string; status: "error"; errorCode: string };
+
+async function vnuCrossLookupBulk(mode: VnuBulkLookupMode, targets: string[], signal?: AbortSignal): Promise<VnuBulkLookupItem[]> {
+  const response = await request<{ items: VnuBulkLookupItem[] }>("/api/vnu/cross-lookup/bulk", {
+    method: "POST",
+    body: JSON.stringify({ mode, targets, allowCrossLookup: true }),
+    signal,
+  });
+  return response.items.map((item) => {
+    if (item.status === "error") return item;
+    if (mode === "stdid-to-code") return { ...item, result: sanitizeCrossStudentCode(item.result as VnuCrossStudentCode) };
+    if (mode === "stdid-to-transcript") return { ...item, result: sanitizeCrossTranscript(item.result as VnuTranscript) };
+    const result = item.result as VnuCrossStudentId;
+    return { ...item, result: { stdId: result.stdId, stdCode: result.stdCode, probes: result.probes } };
+  });
 }
 
 async function vnuDocuments(): Promise<DocumentItem[]> {
@@ -343,6 +387,8 @@ export const api = {
   vnuPointDetail: (params: { id: string; Term: string }) => vnuPointDetail(params),
   vnuCrossStudentCode: (params: { stdId: string }) => vnuCrossStudentCode(params),
   vnuCrossStudentId: (params: { stdCode: string }) => vnuCrossStudentId(params),
+  vnuCrossTranscript: (input: VnuCrossTranscriptInput) => vnuCrossTranscript(input),
+  vnuCrossLookupBulk: (mode: VnuBulkLookupMode, targets: string[], signal?: AbortSignal) => vnuCrossLookupBulk(mode, targets, signal),
   importSession: async (universityId: string, body: { studentCode?: string; studenthubGoogleCredential?: string; studenthubToken?: string; studenthubCookie?: string; canvasToken?: string; canvasCookie?: string; canvasCsrfToken?: string; vnuUsername?: string; vnuPassword?: string }) => {
     const data = await request<{ token: string; session?: { studentCode?: string } }>(`/api/${universityId}/auth/import-session`, { method: "POST", body: JSON.stringify(body) });
     upsertAccount(universityId, data.token, data.session?.studentCode);

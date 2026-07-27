@@ -26,13 +26,54 @@ export type VnuGradeRow = {
   point10?: number;
   letter?: string;
   point4?: number;
+  // Both lifted from the row's "Chi tiết" cell <img onClick="detailPoint(
+  // '{classId}','{grade10}','{stdId}','{termOrdinal}')"> — absent when the
+  // row renders no detail link. Only the cross-transcript parser consumes
+  // these; the own-grades mapper ignores them.
+  classId?: string;
+  termOrdinal?: string;
 };
 
 export type VnuGradesResult = {
   rows: VnuGradeRow[];
+  terms: VnuGradeTerm[];
   totalCredits?: number;
   totalAccumulatedCredits?: number;
   cumulativeGpa4?: number;
+};
+
+export type VnuGradeTerm = {
+  termCode: string;
+  termLabel?: string;
+  rows: VnuGradeRow[];
+};
+
+export type VnuTranscriptRow = {
+  courseCode: string;
+  courseName: string;
+  credits?: number;
+  grade10?: number;
+  letterGrade?: string;
+  grade4?: number;
+  classId?: string;
+  termOrdinal?: string;
+};
+
+export type VnuTranscriptTerm = {
+  maHK: string;
+  label?: string;
+  rows: VnuTranscriptRow[];
+};
+
+export type VnuTranscript = {
+  header: VnuTranscriptHeader;
+  terms: VnuTranscriptTerm[];
+  totals: {
+    totalCredits?: number;
+    accumulatedCredits?: number;
+    gpa4?: number;
+  };
+  notice?: string;
 };
 
 export type VnuTermProgressRow = {

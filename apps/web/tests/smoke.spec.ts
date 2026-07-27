@@ -9,6 +9,26 @@ async function loginDemo(page: import("@playwright/test").Page) {
   await expect(page.getByRole("heading", { name: /Welcome back, Demo Student/i })).toBeVisible();
 }
 
+async function openMockedLookup(page: import("@playwright/test").Page) {
+  await page.route("**/api/universities", async (route) => {
+    const response = await route.fetch();
+    const payload = await response.json() as { data: Array<{ id: string; capabilities: Record<string, boolean> }> };
+    const mock = payload.data.find((university) => university.id === "mock");
+    if (mock) {
+      mock.capabilities.classLookup = true;
+      mock.capabilities.crossLookup = true;
+    }
+    await route.fulfill({ response, json: payload });
+  });
+  await page.route("**/api/vnu/raw/profile", async (route) => {
+    const html = '<input name="StdCode" value="24000000"><input name="StdName" value="Demo Student"><input name="hidStdID" value="123456">';
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { html } }) });
+  });
+  await loginDemo(page);
+  await page.goto("/lookup");
+  await expect(page.getByRole("heading", { name: "Lookup", exact: true })).toBeVisible();
+}
+
 test.beforeEach(async ({ page }) => {
   await page.goto("/login");
   await page.evaluate(() => {
@@ -313,6 +333,72 @@ test("Lookup nav item is absent for the mock demo account (vnu-only capability)"
   await expect(page.getByRole("heading", { name: "Resolve another student's code" })).toHaveCount(0);
   await expect(page.getByTestId("cross-student-id")).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Resolve another student's internal ID" })).toHaveCount(0);
+  await expect(page.getByTestId("cross-transcript")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Look up another student's transcript" })).toHaveCount(0);
+  await expect(page.getByTestId("bulk-lookup")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Bulk cross-lookup" })).toHaveCount(0);
+});
+
+test("lookup groups use progressive modes, accessible labels, and responsive touch targets", async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 812 });
+  await openMockedLookup(page);
+
+  await expect(page.getByTestId("class-identifier-tools")).toBeVisible();
+  await expect(page.getByTestId("student-record-tools")).toBeVisible();
+  await expect(page.getByTestId("bulk-lookup")).toBeVisible();
+  await expect(page.getByLabel("Course code")).toBeVisible();
+  await expect(page.getByLabel("Class number (optional)")).toBeVisible();
+  await expect(page.getByRole("group", { name: "Class lookup direction" })).toBeVisible();
+  await expect(page.getByRole("group", { name: "Student record tool" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Class ID to course" }).click();
+  await expect(page.getByLabel("Internal class ID")).toBeVisible();
+  await page.getByRole("button", { name: "Code → ID" }).click();
+  await expect(page.getByLabel("Target student code")).toBeVisible();
+  await page.getByRole("button", { name: "Transcript", exact: true }).click();
+  await expect(page.getByRole("group", { name: "Transcript lookup identifier" })).toBeVisible();
+
+  const principalControls = page.locator('[data-testid="class-identifier-tools"] button:visible, [data-testid="class-identifier-tools"] input:visible, [data-testid="student-record-tools"] button:visible, [data-testid="student-record-tools"] input:visible, [data-testid="bulk-lookup"] button:visible, [data-testid="bulk-lookup"] textarea:visible, [data-testid="bulk-lookup"] [role="combobox"]:visible');
+  const controlCount = await principalControls.count();
+  expect(controlCount).toBeGreaterThan(0);
+  for (let index = 0; index < controlCount; index++) {
+    const box = await principalControls.nth(index).boundingBox();
+    expect(box).not.toBeNull();
+    expect(box!.height).toBeGreaterThanOrEqual(43.9);
+  }
+
+  for (const viewport of [{ width: 375, height: 812 }, { width: 768, height: 1024 }, { width: 1440, height: 900 }]) {
+    await page.setViewportSize(viewport);
+    await expectNoPageOverflow(page);
+  }
+});
+
+test("cross-student forms reject malformed identifiers client-side before any request", async ({ page }) => {
+  await openMockedLookup(page);
+
+  // StdID -> code section: a malformed internal id shows the localized
+  // validation message, marks the input invalid, and keeps submit disabled
+  // (same contract as the transcript form; the worker still rejects too).
+  const codeInput = page.getByLabel("Target internal student ID");
+  await codeInput.fill("12ab");
+  await expect(codeInput).toHaveAttribute("aria-invalid", "true");
+  await expect(page.getByText("Enter 1 to 11 digits for the internal student ID.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Look up" })).toBeDisabled();
+  await codeInput.fill("123456");
+  await expect(codeInput).toHaveAttribute("aria-invalid", "false");
+  await expect(page.getByText("That is your own internal ID — your own ID mapping is shown above.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Look up" })).toBeDisabled();
+
+  // Code -> StdID section: same contract for the 8-digit code form.
+  await page.getByRole("button", { name: "Code → ID" }).click();
+  const idInput = page.getByLabel("Target student code");
+  await idInput.fill("1234567");
+  await expect(idInput).toHaveAttribute("aria-invalid", "true");
+  await expect(page.getByText("Enter an 8-digit student code.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Look up" })).toBeDisabled();
+  await idInput.fill("24000000");
+  await expect(page.getByText("That is your own student code — your own ID mapping is shown above.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Look up" })).toBeDisabled();
 });
 
 test("notifications menu shows dashboard notifications", async ({ page }) => {

@@ -1,8 +1,10 @@
 import { cors } from "@elysiajs/cors";
 import { decryptSession, encryptSession, fail, getLogger, HyeboardError, isExpired, ok, parseBearerToken, type EncryptedSessionPayload } from "@hyeboard/core";
-import { DaotaoClient, getAdapter, listUniversities, parsePortalNotice, parseProfileHtml, parseTranscriptHeader, type BrowserBinding, type BrowserConnection } from "@hyeboard/university-adapters";
+import { DaotaoClient, getAdapter, listUniversities, parseProfileHtml, parseTranscriptHeader, parseTranscriptHtml, type BrowserBinding, type BrowserConnection, type VnuTranscript } from "@hyeboard/university-adapters";
 import { Elysia, t } from "elysia";
 import { LocalCaptchaRelayCoordinator, captchaRelayCancelled, captchaRelayNotFound, type CaptchaRelayCoordinator, type PreparedCaptchaRelay } from "./captcha-relay";
+import { probeBudgetUnavailable, type VnuProbeBudgetCoordinator } from "./vnu-probe-budget";
+import { resolveVnuStudentId, VNU_STUDENT_ID_RESOLVER_MAX_PROBES } from "./vnu-student-id-resolver";
 
 // ─── Runtime config ───────────────────────────────────────────
 // Self-hosted (Node/Bun) loads config from config.json + env var overrides
@@ -12,7 +14,7 @@ import { LocalCaptchaRelayCoordinator, captchaRelayCancelled, captchaRelayNotFou
 //
 // HYEB_SESSION_SECRET is NEVER read from config.json — only from env vars
 // or setRuntimeConfig(), to keep it out of files that might be checked in.
-interface RuntimeConfig {
+export interface RuntimeConfig {
   HYEB_SESSION_SECRET?: string;
   HYEB_ALLOWED_ORIGINS?: string;
   HYEB_BROWSER_WS_ENDPOINT?: string;
@@ -21,6 +23,7 @@ interface RuntimeConfig {
   HYEB_CHROME_PATH?: string;
   HYEB_BROWSER_IDLE_EVICTION_MS?: string;
   HYEB_LOG_LEVEL?: string;
+  VNU_FAR_WALK_ENABLED?: string;
   HOST?: string;
   PORT?: string;
   HYEB_STATIC_DIR?: string;
@@ -122,6 +125,14 @@ function browserConnection(): BrowserConnection {
   return { kind: "cloudflare", binding: cloudflareBrowserBinding as BrowserBinding };
 }
 
+export function isVnuFarWalkEnabled(value: string | undefined): boolean {
+  return value === "true";
+}
+
+function vnuFarWalkEnabled(): boolean {
+  return isVnuFarWalkEnabled(runtimeConfig.VNU_FAR_WALK_ENABLED);
+}
+
 // ─── Auth ─────────────────────────────────────────────────────
 
 async function getSession(headers: Headers | Record<string, string | undefined>) {
@@ -207,13 +218,15 @@ function errorPayload(error: unknown): { code: string; message: string; status: 
   return { code: "GOOGLE_SIGNIN_FAILURE", message: `Google sign-in did not complete: ${reason}`, status: 502 };
 }
 
-function routeError(error: unknown, requestId?: string) {
+function routeError(error: unknown, requestId?: string, requestUrl?: string) {
   const id = requestId ?? "-";
   const log = getLogger();
+  const headers = new Headers({ "Content-Type": "application/json" });
+  if (requestUrl && new URL(requestUrl).pathname.startsWith("/api/vnu/cross-lookup/")) headers.set("Cache-Control", "no-store");
   if (error instanceof HyeboardError) {
     const level = error.status >= 500 ? "error" : "warn";
     log[level]({ reqId: id, code: error.code, status: error.status }, error.message);
-    return new Response(JSON.stringify(fail(error.code, error.message, error.details)), { status: error.status, headers: { "Content-Type": "application/json" } });
+    return new Response(JSON.stringify(fail(error.code, error.message, error.details)), { status: error.status, headers });
   }
   // Elysia's own error classes (ValidationError, ParseError, NotFoundError,
   // InternalServerError) are plain Errors with .code/.status, not
@@ -225,10 +238,10 @@ function routeError(error: unknown, requestId?: string) {
     const level = status >= 500 ? "error" : "warn";
     log[level]({ reqId: id, code, status }, "request rejected");
     const message = status < 500 ? "The request was invalid. Check the fields you submitted and try again." : "Unexpected API error";
-    return new Response(JSON.stringify(fail(code, message)), { status, headers: { "Content-Type": "application/json" } });
+    return new Response(JSON.stringify(fail(code, message)), { status, headers });
   }
   log.error({ reqId: id, errorType: typeof error, stack: error instanceof Error ? error.stack : undefined }, "Unhandled error type");
-  return new Response(JSON.stringify(fail("INTERNAL_ERROR", "Unexpected API error")), { status: 500, headers: { "Content-Type": "application/json" } });
+  return new Response(JSON.stringify(fail("INTERNAL_ERROR", "Unexpected API error")), { status: 500, headers });
 }
 
 // ─── Schemas ──────────────────────────────────────────────────
@@ -274,19 +287,109 @@ const vnuCrossLookupQuery = t.Object({
   allowCrossLookup: t.Optional(t.String()),
 });
 
-// Cap for the student-code -> StdID offset walk (see the cross-lookup
-// student-id route): codes and StdIDs run near-parallel within a cohort
-// (verified drift of ~2 per 60), so a handful of corrective probes
-// converges; anything beyond this means the anchor model does not apply.
-const VNU_CROSS_LOOKUP_MAX_PROBES = 8;
-// A single corrective step larger than this means the target code is not in
-// the caller's cohort at all — stop instead of wandering across the id space.
-const VNU_CROSS_LOOKUP_MAX_STEP = 5000;
-// Polite spacing between upstream transcript probes during the walk.
-const VNU_CROSS_LOOKUP_PROBE_DELAY_MS = 250;
+type VnuBulkLookupMode = "stdid-to-code" | "code-to-stdid" | "stdid-to-transcript";
+type VnuBulkLookupBody = { mode: VnuBulkLookupMode; targets: unknown[]; allowCrossLookup: true };
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+const VNU_BULK_MODE_LIMITS: Record<VnuBulkLookupMode, number> = {
+  "stdid-to-code": 5,
+  "code-to-stdid": 3,
+  "stdid-to-transcript": 5,
+};
+
+function parseVnuBulkLookupBody(value: unknown): VnuBulkLookupBody {
+  if (!isRecord(value)) throw new HyeboardError("VNU_CROSS_LOOKUP_BODY_INVALID", "Bulk cross-lookup needs a JSON object body.", 400);
+  if (value.allowCrossLookup !== true) throw new HyeboardError("VNU_CROSS_LOOKUP_NOT_EXPLICITLY_ALLOWED", "Cross-student lookup requires the literal allowCrossLookup: true opt-in.", 400);
+  if (value.mode !== "stdid-to-code" && value.mode !== "code-to-stdid" && value.mode !== "stdid-to-transcript") {
+    throw new HyeboardError("VNU_CROSS_LOOKUP_MODE_INVALID", "Bulk cross-lookup mode is invalid.", 400);
+  }
+  if (!Array.isArray(value.targets) || value.targets.length === 0) throw new HyeboardError("VNU_CROSS_LOOKUP_TARGETS_INVALID", "Bulk cross-lookup needs at least one target.", 400);
+  if (value.targets.length > VNU_BULK_MODE_LIMITS[value.mode]) throw new HyeboardError("VNU_CROSS_LOOKUP_CHUNK_TOO_LARGE", "Bulk cross-lookup chunk exceeds the selected mode limit.", 400);
+  return { mode: value.mode, targets: value.targets, allowCrossLookup: true };
+}
+
+async function parseVnuBulkLookupRequest(request: Request): Promise<VnuBulkLookupBody> {
+  try {
+    return parseVnuBulkLookupBody(await request.json());
+  } catch (error) {
+    if (error instanceof HyeboardError) throw error;
+    throw new HyeboardError("VNU_CROSS_LOOKUP_BODY_INVALID", "Bulk cross-lookup needs a valid JSON object body.", 400);
+  }
+}
+
+type VnuCrossLookupTranscript = Omit<VnuTranscript, "notice">;
+
+function parseVnuCrossLookupTranscript(html: string): VnuCrossLookupTranscript {
+  const { notice: _upstreamNotice, ...transcript } = parseTranscriptHtml(html);
+  return transcript;
+}
+
+const VNU_PORTAL_STD_ID_PATTERN = /^\d{1,11}$/;
+const VNU_PORTAL_STUDENT_CODE_PATTERN = /^\d{8}$/;
+
+type VnuOwnIdentity = { ownStdId: number; ownCode?: number };
+
+// Parse, don't validate: the session owner's portal identity is parsed into
+// trusted positive integers exactly once, at this boundary, and every cross
+// route below consumes only that result. A malformed profile value fails
+// closed here with VNU_LOGIN_REQUIRED instead of slipping past a self-target
+// guard through NaN semantics — Number(garbage) is NaN, NaN === NaN is false,
+// so a raw Number() comparison can never be trusted as a guard.
+function parseVnuOwnIdentity(
+  profile: { internalStudentId?: string; studentCode?: string },
+  options: { requireStudentCode: true; errorMessage: string },
+): { ownStdId: number; ownCode: number };
+function parseVnuOwnIdentity(
+  profile: { internalStudentId?: string; studentCode?: string },
+  options: { requireStudentCode: boolean; errorMessage: string },
+): VnuOwnIdentity;
+function parseVnuOwnIdentity(
+  profile: { internalStudentId?: string; studentCode?: string },
+  options: { requireStudentCode: boolean; errorMessage: string },
+): VnuOwnIdentity {
+  const stdIdText = profile.internalStudentId ?? "";
+  const ownStdId = Number(stdIdText);
+  const stdIdValid = VNU_PORTAL_STD_ID_PATTERN.test(stdIdText) && Number.isSafeInteger(ownStdId) && ownStdId > 0;
+  if (!stdIdValid) throw new HyeboardError("VNU_LOGIN_REQUIRED", options.errorMessage, 401);
+
+  const codeText = profile.studentCode ?? "";
+  const ownCode = Number(codeText);
+  const codeValid = VNU_PORTAL_STUDENT_CODE_PATTERN.test(codeText) && Number.isSafeInteger(ownCode) && ownCode > 0;
+  if (codeValid) return { ownStdId, ownCode };
+  if (options.requireStudentCode) throw new HyeboardError("VNU_LOGIN_REQUIRED", options.errorMessage, 401);
+  return { ownStdId };
+}
+
+// Normalized numeric self-target comparisons. Targets reaching these helpers
+// have already passed their own regex gates (^\d{1,11}$ / ^\d{8}$), so
+// Number() on them is always a safe integer and leading-zero spellings of the
+// same id ("00000001000" vs "1000") correctly compare equal.
+function isOwnStdId(identity: VnuOwnIdentity, targetStdId: string): boolean {
+  return Number(targetStdId) === identity.ownStdId;
+}
+
+function isOwnStudentCode(identity: VnuOwnIdentity, targetStdCode: string): boolean {
+  return identity.ownCode !== undefined && Number(targetStdCode) === identity.ownCode;
+}
+
+type VnuBulkAllowance = { consume(): void };
+
+function createVnuBulkAllowance(units: number): VnuBulkAllowance {
+  let remaining = units;
+  return {
+    consume() {
+      if (remaining <= 0) throw new Error("Reserved VNU probe allowance exhausted");
+      remaining -= 1;
+    },
+  };
+}
+
+function vnuBulkReservationUnits(body: VnuBulkLookupBody): number {
+  const unitsPerTarget = body.mode === "code-to-stdid" ? VNU_STUDENT_ID_RESOLVER_MAX_PROBES : 1;
+  return body.targets.length * unitsPerTarget;
+}
+
+function waitBetweenBulkItems(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 300));
 }
 
 // ─── Cache abstraction ────────────────────────────────────────
@@ -449,6 +552,51 @@ async function appCache(): Promise<CacheLike> {
   if (storage.default) return storage.default;
   if (typeof storage.open === "function") return storage.open("hyeboard");
   return memoryCache;
+}
+
+let vnuProbeBudgetCoordinator: VnuProbeBudgetCoordinator = {
+  async consume() { throw probeBudgetUnavailable(); },
+  async reserve() { throw probeBudgetUnavailable(); },
+};
+
+// True only once a genuinely shared probe-budget coordinator backs the
+// cross-lookup routes — in practice the authoritative Cloudflare Durable
+// Object coordinator installed by index.ts. Self-hosted Node/Bun runtimes
+// never install one, so their cross-lookup routes always fail closed with
+// 503 and the capability must serialize as unavailable (see
+// serializeUniversities below) rather than teasing UI that can only error.
+let probeBudgetCoordinatorInstalled = false;
+
+export function setVnuProbeBudgetCoordinator(coordinator: VnuProbeBudgetCoordinator): void {
+  vnuProbeBudgetCoordinator = coordinator;
+  probeBudgetCoordinatorInstalled = true;
+}
+
+async function vnuProbeBudgetKey(session: EncryptedSessionPayload): Promise<string> {
+  if (session.universityId !== "vnu" || !session.vnu?.value) throw new HyeboardError("VNU_LOGIN_REQUIRED", "VNU lookup probes need an active daotao.vnu.edu.vn session. Sign in again.", 401);
+  return hmacHex(`${session.vnu.value}\n${session.expiresAt}`);
+}
+
+// Shared boundary for every Brc1 oracle fetch. Upcoming transcript/bulk routes
+// must call this immediately before each upstream request. The opaque HMAC
+// identity binds one Durable Object to one VNU session without exposing cookie
+// or student identifiers in its name or storage.
+export async function consumeVnuOracleProbe(session: EncryptedSessionPayload, amount = 1): Promise<void> {
+  try {
+    await vnuProbeBudgetCoordinator.consume(await vnuProbeBudgetKey(session), amount);
+  } catch (error) {
+    if (error instanceof HyeboardError) throw error;
+    throw probeBudgetUnavailable();
+  }
+}
+
+async function reserveVnuOracleProbes(session: EncryptedSessionPayload, amount: number): Promise<void> {
+  try {
+    await vnuProbeBudgetCoordinator.reserve(await vnuProbeBudgetKey(session), amount);
+  } catch (error) {
+    if (error instanceof HyeboardError) throw error;
+    throw probeBudgetUnavailable();
+  }
 }
 
 async function vnuImportCacheKey(username: string, password: string): Promise<string> {
@@ -626,6 +774,23 @@ function corsPlugin() {
 // adapter (and, via setRuntimeConfig/setCloudflareBrowserBinding, how config
 // values are sourced) differs per entry point.
 
+// Worker-side serialization point for university capability data. The static
+// adapter record (vnu: crossLookup=true) describes the Cloudflare deployment,
+// where the authoritative Durable Object probe-budget coordinator exists. A
+// self-hosted runtime has no such coordinator — every cross-lookup route
+// there fails closed with 503 — so advertising the capability would render
+// cross-lookup UI whose every request errors. Mask it honestly at this
+// boundary instead of touching the shared static record (correct for
+// Cloudflare; listUniversities() returns the adapters' own objects, so the
+// masked list must be a copy, never a mutation).
+function serializeUniversities() {
+  const universities = listUniversities();
+  if (probeBudgetCoordinatorInstalled) return universities;
+  return universities.map((university) => university.capabilities.crossLookup
+    ? { ...university, capabilities: { ...university.capabilities, crossLookup: false } }
+    : university);
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function createApp(adapter: any) {
   const app = new Elysia({ adapter });
@@ -634,10 +799,11 @@ export function createApp(adapter: any) {
   if (plugin) app.use(plugin);
 
   return app
-    .onRequest(({ request }) => {
+    .onRequest(({ request, set }) => {
       const req = request as unknown as { _hyebReqId?: string; _hyebStart?: number };
       req._hyebReqId = requestId();
       req._hyebStart = Date.now();
+      if (new URL(request.url).pathname.startsWith("/api/vnu/cross-lookup/")) set.headers["Cache-Control"] = "no-store";
       // Set HYEB_LOG_LEVEL=debug (Node/Bun .env, or a Cloudflare secret/var)
       // to see one line per incoming request here.
       getLogger().debug({ reqId: req._hyebReqId, method: request.method, url: request.url }, "request received");
@@ -646,11 +812,11 @@ export function createApp(adapter: any) {
       const req = request as unknown as { _hyebReqId?: string; _hyebStart?: number };
       getLogger().debug({ reqId: req._hyebReqId, status: set.status, durationMs: req._hyebStart ? Date.now() - req._hyebStart : undefined }, "request completed");
     })
-    .onError(({ error, request }) => routeError(error, (request as unknown as { _hyebReqId?: string })._hyebReqId))
+    .onError(({ error, request }) => routeError(error, (request as unknown as { _hyebReqId?: string })._hyebReqId, request.url))
 
     // ── Public — no session required ──
     .get("/api/health", () => ok({ status: "ok", service: "hyeboard" }))
-    .get("/api/universities", () => ok(listUniversities()))
+    .get("/api/universities", () => ok(serializeUniversities()))
     .post("/api/:universityId/auth/import-session", async ({ params, body, request }) => {
       const adapterInstance = getAdapter(params.universityId);
       // Keep parent/guardian direct API logins on this SSE route so a
@@ -801,7 +967,7 @@ export function createApp(adapter: any) {
     // self-targeting rejection. Responses are NEVER cached: no shared-cache
     // path exists here, so one caller's cross-lookup result can never bleed
     // into another caller's cache entries. The fetched transcript HTML is
-    // parsed here, server-side, and only the resolved code/name/class/notice
+    // parsed here, server-side, and only the resolved code/name/class
     // ever cross the network — the target student's full grade table (which
     // the same HTML contains) is never sent to the browser. A header-less
     // response is a clean not-found, not an error.
@@ -810,23 +976,28 @@ export function createApp(adapter: any) {
       if (session.universityId !== "vnu") throw new HyeboardError("SESSION_UNIVERSITY_MISMATCH", "Session university does not match route", 403);
       if (query.allowCrossLookup !== "true") throw new HyeboardError("VNU_CROSS_LOOKUP_NOT_EXPLICITLY_ALLOWED", "Cross-student lookup requires the explicit allowCrossLookup=true opt-in.", 400);
       if (!query.stdId || !/^\d{1,11}$/.test(query.stdId)) throw new HyeboardError("VNU_CROSS_LOOKUP_QUERY_INCOMPLETE", "Cross-student student-code lookup needs a target student id.", 400);
-      // Fails closed when the caller's own id is unavailable: without it the
-      // self-targeting check below cannot run, so the request is rejected
-      // rather than allowed through unverified.
-      const ownProfile = parseProfileHtml(await vnuRawHtml(session, "profile", {}));
-      if (!ownProfile.internalStudentId) throw new HyeboardError("VNU_LOGIN_REQUIRED", "VNU (daotao) cross-lookup needs your own portal student id, which this session could not provide. Sign in again.", 401);
-      if (Number(query.stdId) === Number(ownProfile.internalStudentId)) throw new HyeboardError("VNU_CROSS_LOOKUP_SELF_TARGET", "That is your own student id. Your own ID mapping is on the Lookup page; cross-lookup is only for other students.", 400);
+      // Fails closed when the caller's own id is unavailable or malformed:
+      // without a parsed own identity the self-targeting check below cannot
+      // run, so the request is rejected rather than allowed through
+      // unverified (see parseVnuOwnIdentity).
+      const ownIdentity = parseVnuOwnIdentity(parseProfileHtml(await vnuRawHtml(session, "profile", {})), {
+        requireStudentCode: false,
+        errorMessage: "VNU (daotao) cross-lookup needs your own portal student id, which this session could not provide. Sign in again.",
+      });
+      if (isOwnStdId(ownIdentity, query.stdId)) throw new HyeboardError("VNU_CROSS_LOOKUP_SELF_TARGET", "That is your own student id. Your own ID mapping is on the Lookup page; cross-lookup is only for other students.", 400);
+      await consumeVnuOracleProbe(session);
       const html = await new DaotaoClient(session).getTranscriptByStdIdHtml(query.stdId);
       const { studentCode, studentName, className } = parseTranscriptHeader(html);
-      return ok({ studentCode, studentName, className, notice: parsePortalNotice(html) });
+      if (!studentCode) throw new HyeboardError("VNU_CROSS_LOOKUP_NOT_FOUND", "The portal did not return a student for that identifier.", 404);
+      return ok({ studentCode, studentName, className });
     }, { query: vnuCrossLookupQuery })
     // Cross-student student-code -> StdID resolver (the reverse direction of
     // the route above). No portal endpoint maps a public student code back to
-    // an internal StdID, so this walks the live-verified Brc1 oracle: within
-    // a cohort, codes and StdIDs run near-parallel (verified drift of ~2 per
-    // 60 — see har-notes.md), so starting from the caller's OWN (StdID, code)
-    // anchor pair and correcting each guess by the observed delta converges
-    // in a few probes. Same gate as the sibling route: session guard,
+    // an internal StdID, so this walks the live-verified Brc1 oracle. Near
+    // targets use the verified cohort-local correction. Far targets first
+    // bisect a mirrored interval under a provisional monotonicity assumption,
+    // then correct linearly from the closest valid result. Same gate as the
+    // sibling route: session guard,
     // vnu-only, explicit allowCrossLookup=true, self-target rejection, never
     // cached. Fails closed with VNU_CROSS_LOOKUP_NOT_CONVERGED (404) when the
     // anchor model does not apply (different cohort, oscillation, invalid
@@ -836,31 +1007,141 @@ export function createApp(adapter: any) {
       if (session.universityId !== "vnu") throw new HyeboardError("SESSION_UNIVERSITY_MISMATCH", "Session university does not match route", 403);
       if (query.allowCrossLookup !== "true") throw new HyeboardError("VNU_CROSS_LOOKUP_NOT_EXPLICITLY_ALLOWED", "Cross-student lookup requires the explicit allowCrossLookup=true opt-in.", 400);
       if (!query.stdCode || !/^\d{8}$/.test(query.stdCode)) throw new HyeboardError("VNU_CROSS_LOOKUP_QUERY_INCOMPLETE", "Cross-student student-id lookup needs a target 8-digit student code.", 400);
-      const ownProfile = parseProfileHtml(await vnuRawHtml(session, "profile", {}));
-      const ownStdId = Number(ownProfile.internalStudentId);
-      const ownCode = Number(ownProfile.studentCode);
-      if (!ownProfile.internalStudentId || !ownProfile.studentCode || !Number.isFinite(ownStdId) || !Number.isFinite(ownCode)) throw new HyeboardError("VNU_LOGIN_REQUIRED", "VNU (daotao) cross-lookup needs your own portal student id and code, which this session could not provide. Sign in again.", 401);
-      if (query.stdCode === ownProfile.studentCode) throw new HyeboardError("VNU_CROSS_LOOKUP_SELF_TARGET", "That is your own student code. Your own ID mapping is on the Lookup page; cross-lookup is only for other students.", 400);
+      const ownIdentity = parseVnuOwnIdentity(parseProfileHtml(await vnuRawHtml(session, "profile", {})), {
+        requireStudentCode: true,
+        errorMessage: "VNU (daotao) cross-lookup needs your own portal student id and code, which this session could not provide. Sign in again.",
+      });
+      if (isOwnStudentCode(ownIdentity, query.stdCode)) throw new HyeboardError("VNU_CROSS_LOOKUP_SELF_TARGET", "That is your own student code. Your own ID mapping is on the Lookup page; cross-lookup is only for other students.", 400);
 
-      const targetCode = Number(query.stdCode);
       const client = new DaotaoClient(session);
-      const notConverged = () => new HyeboardError("VNU_CROSS_LOOKUP_NOT_CONVERGED", "Could not resolve an internal student id for that code near your own cohort. The code-to-id mapping only holds within one cohort.", 404);
-      const visited = new Set<number>();
-      let guess = ownStdId + (targetCode - ownCode);
-      for (let probes = 1; probes <= VNU_CROSS_LOOKUP_MAX_PROBES; probes += 1) {
-        if (visited.has(guess)) throw notConverged();
-        visited.add(guess);
-        if (probes > 1) await delay(VNU_CROSS_LOOKUP_PROBE_DELAY_MS);
-        const html = await client.getTranscriptByStdIdHtml(String(guess));
-        const headerCode = Number(parseTranscriptHeader(html).studentCode);
-        if (!Number.isFinite(headerCode)) throw notConverged();
-        if (headerCode === targetCode) return ok({ stdId: String(guess).padStart(11, "0"), stdCode: query.stdCode, probes });
-        const delta = targetCode - headerCode;
-        if (Math.abs(delta) > VNU_CROSS_LOOKUP_MAX_STEP) throw notConverged();
-        guess += delta;
-      }
-      throw notConverged();
+      return ok(await resolveVnuStudentId({
+        ownStdId: ownIdentity.ownStdId,
+        ownCode: ownIdentity.ownCode,
+        targetCode: Number(query.stdCode),
+        farWalkEnabled: vnuFarWalkEnabled(),
+        fetchStudentCode: async (stdId) => {
+          await consumeVnuOracleProbe(session);
+          const html = await client.getTranscriptByStdIdHtml(String(stdId));
+          return parseTranscriptHeader(html).studentCode;
+        },
+      }));
     }, { query: vnuCrossLookupQuery })
+    .get("/api/vnu/cross-lookup/transcript", async ({ headers, query, set }) => {
+      set.headers["Cache-Control"] = "no-store";
+      const session = await getSession(headers);
+      if (session.universityId !== "vnu") throw new HyeboardError("SESSION_UNIVERSITY_MISMATCH", "Session university does not match route", 403);
+      if (query.allowCrossLookup !== "true") throw new HyeboardError("VNU_CROSS_LOOKUP_NOT_EXPLICITLY_ALLOWED", "Cross-student lookup requires the explicit allowCrossLookup=true opt-in.", 400);
+
+      const hasStdId = query.stdId !== undefined;
+      const hasStdCode = query.stdCode !== undefined;
+      if (hasStdId === hasStdCode || (hasStdId && !/^\d{1,11}$/.test(query.stdId!)) || (hasStdCode && !/^\d{8}$/.test(query.stdCode!))) {
+        throw new HyeboardError("VNU_CROSS_LOOKUP_QUERY_INCOMPLETE", "Cross-student transcript lookup needs exactly one valid target: stdId or 8-digit stdCode.", 400);
+      }
+
+      const ownIdentity = parseVnuOwnIdentity(parseProfileHtml(await vnuRawHtml(session, "profile", {})), {
+        requireStudentCode: true,
+        errorMessage: "VNU (daotao) cross-lookup needs your own portal student id and code, which this session could not provide. Sign in again.",
+      });
+      if (hasStdId && isOwnStdId(ownIdentity, query.stdId!)) throw new HyeboardError("VNU_CROSS_LOOKUP_SELF_TARGET", "That is your own student id. Your own transcript is on the Grades page; cross-lookup is only for other students.", 400);
+      if (hasStdCode && isOwnStudentCode(ownIdentity, query.stdCode!)) throw new HyeboardError("VNU_CROSS_LOOKUP_SELF_TARGET", "That is your own student code. Your own transcript is on the Grades page; cross-lookup is only for other students.", 400);
+
+      const client = new DaotaoClient(session);
+      let targetStdId = query.stdId;
+      if (query.stdCode) {
+        const resolvedTarget = await resolveVnuStudentId({
+          ownStdId: ownIdentity.ownStdId,
+          ownCode: ownIdentity.ownCode,
+          targetCode: Number(query.stdCode),
+          farWalkEnabled: vnuFarWalkEnabled(),
+          fetchStudentCode: async (stdId) => {
+            await consumeVnuOracleProbe(session);
+            return parseTranscriptHeader(await client.getTranscriptByStdIdHtml(String(stdId))).studentCode;
+          },
+        });
+        targetStdId = resolvedTarget.stdId;
+      }
+
+      await consumeVnuOracleProbe(session);
+      const transcript = parseVnuCrossLookupTranscript(await client.getTranscriptByStdIdHtml(targetStdId!));
+      if (!transcript.header.studentCode) throw new HyeboardError("VNU_CROSS_LOOKUP_NOT_FOUND", "The portal did not return a student for that identifier.", 404);
+      return ok(transcript);
+    }, { query: vnuCrossLookupQuery })
+    .post("/api/vnu/cross-lookup/bulk", async ({ headers, request }) => {
+      const session = await getSession(headers);
+      if (session.universityId !== "vnu") throw new HyeboardError("SESSION_UNIVERSITY_MISMATCH", "Session university does not match route", 403);
+      const body = await parseVnuBulkLookupRequest(request);
+
+      const needsOwnCode = body.mode === "code-to-stdid";
+      const ownIdentity = parseVnuOwnIdentity(parseProfileHtml(await vnuRawHtml(session, "profile", {})), {
+        requireStudentCode: needsOwnCode,
+        errorMessage: "VNU (daotao) bulk cross-lookup needs your own portal identifiers, which this session could not provide. Sign in again.",
+      });
+
+      const reservedUnits = vnuBulkReservationUnits(body);
+      await reserveVnuOracleProbes(session, reservedUnits);
+      const allowance = createVnuBulkAllowance(reservedUnits);
+      const client = new DaotaoClient(session);
+      const items: Array<{ target: string; status: "ok"; result: unknown } | { target: string; status: "error"; errorCode: string }> = [];
+
+      for (let index = 0; index < body.targets.length; index += 1) {
+        if (index > 0) await waitBetweenBulkItems();
+        const rawTarget = body.targets[index];
+        const target = typeof rawTarget === "string" ? rawTarget : "";
+        const pattern = body.mode === "code-to-stdid" ? /^\d{8}$/ : /^\d{1,11}$/;
+        if (typeof rawTarget !== "string" || !pattern.test(target)) {
+          items.push({ target, status: "error", errorCode: "VNU_CROSS_LOOKUP_INVALID_TARGET" });
+          continue;
+        }
+
+        const selfTarget = body.mode === "code-to-stdid"
+          ? isOwnStudentCode(ownIdentity, target)
+          : isOwnStdId(ownIdentity, target);
+        if (selfTarget) {
+          items.push({ target, status: "error", errorCode: "VNU_CROSS_LOOKUP_SELF_TARGET" });
+          continue;
+        }
+
+        try {
+          if (body.mode === "stdid-to-code") {
+            allowance.consume();
+            const header = parseTranscriptHeader(await client.getTranscriptByStdIdHtml(target));
+            if (!header.studentCode) throw new HyeboardError("VNU_CROSS_LOOKUP_NOT_FOUND", "Student not found", 404);
+            items.push({ target, status: "ok", result: { studentCode: header.studentCode, studentName: header.studentName, className: header.className } });
+            continue;
+          }
+
+          if (body.mode === "stdid-to-transcript") {
+            allowance.consume();
+            const transcript = parseVnuCrossLookupTranscript(await client.getTranscriptByStdIdHtml(target));
+            if (!transcript.header.studentCode) throw new HyeboardError("VNU_CROSS_LOOKUP_NOT_FOUND", "Student not found", 404);
+            items.push({ target, status: "ok", result: transcript });
+            continue;
+          }
+
+          const resolution = await resolveVnuStudentId({
+            ownStdId: ownIdentity.ownStdId,
+            // Guaranteed defined: this branch only runs for code-to-stdid,
+            // which required the owner code during identity parsing above.
+            ownCode: ownIdentity.ownCode!,
+            targetCode: Number(target),
+            farWalkEnabled: vnuFarWalkEnabled(),
+            fetchStudentCode: async (stdId) => {
+              allowance.consume();
+              return parseTranscriptHeader(await client.getTranscriptByStdIdHtml(String(stdId))).studentCode;
+            },
+          });
+          items.push({ target, status: "ok", result: resolution });
+        } catch (error) {
+          items.push({
+            target,
+            status: "error",
+            errorCode: error instanceof HyeboardError ? error.code : "VNU_CROSS_LOOKUP_FAILED",
+          });
+        }
+      }
+
+      return ok({ items });
+    }, { parse: "none" })
 
     // ── Authenticated — session+adapter injected via resolve() ──
     .group("/api/:universityId", (g) =>

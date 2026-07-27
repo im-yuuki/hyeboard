@@ -28,8 +28,8 @@ export const universityCapabilitiesSchema = z.object({
   classLookup: z.boolean(),
   // Lookup of ANOTHER student's data by internal id. Only honest where the
   // upstream genuinely fails to session-bind the target id (live-verified
-  // IDOR on daotao.vnu.edu.vn's StdExamination.asp) AND the deployment is
-  // authorized to expose it — must stay false everywhere else.
+  // IDOR on daotao.vnu.edu.vn's ListPoint/listpoint_Brc1.asp) AND the
+  // deployment is authorized to expose it — must stay false everywhere else.
   crossLookup: z.boolean(),
 });
 

@@ -1,5 +1,5 @@
 import { configureLogger, getLogger } from "@hyeboard/core";
-import { createApp, loadConfigFile, setCaptchaRelayCoordinator, setRuntimeConfig } from "./app";
+import { createApp, loadConfigFile, setCaptchaRelayCoordinator, setRuntimeConfig, type RuntimeConfig } from "./app";
 import { LocalCaptchaRelayCoordinator } from "./captcha-relay";
 import { registerStaticAssets } from "./serve-static";
 
@@ -10,6 +10,23 @@ declare const Bun: unknown;
 declare const process: { env: Record<string, string | undefined> };
 
 const isBun = typeof Bun !== "undefined";
+
+export function selfHostedRuntimeConfig(
+  environment: Record<string, string | undefined>,
+  fileConfig: RuntimeConfig,
+): RuntimeConfig {
+  return {
+    HYEB_SESSION_SECRET: environment.HYEB_SESSION_SECRET,
+    HYEB_ALLOWED_ORIGINS: environment.HYEB_ALLOWED_ORIGINS ?? fileConfig.HYEB_ALLOWED_ORIGINS,
+    HYEB_BROWSER_WS_ENDPOINT: environment.HYEB_BROWSER_WS_ENDPOINT ?? fileConfig.HYEB_BROWSER_WS_ENDPOINT,
+    HYEB_BROWSER_LOCAL: environment.HYEB_BROWSER_LOCAL ?? fileConfig.HYEB_BROWSER_LOCAL,
+    HYEB_BROWSER_HEADLESS: environment.HYEB_BROWSER_HEADLESS ?? fileConfig.HYEB_BROWSER_HEADLESS,
+    HYEB_CHROME_PATH: environment.HYEB_CHROME_PATH ?? fileConfig.HYEB_CHROME_PATH,
+    HYEB_BROWSER_IDLE_EVICTION_MS: environment.HYEB_BROWSER_IDLE_EVICTION_MS ?? fileConfig.HYEB_BROWSER_IDLE_EVICTION_MS,
+    HYEB_LOG_LEVEL: environment.HYEB_LOG_LEVEL ?? fileConfig.HYEB_LOG_LEVEL,
+    VNU_FAR_WALK_ENABLED: environment.VNU_FAR_WALK_ENABLED,
+  };
+}
 
 export async function start(): Promise<unknown> {
     // Self-hosted config comes from process.env and config.json.
@@ -34,16 +51,7 @@ export async function start(): Promise<unknown> {
     // Load non-secret config from config.json (if present), then let env vars
     // override. HYEB_SESSION_SECRET is ALWAYS from env var only.
     const fileConfig = await loadConfigFile();
-    setRuntimeConfig({
-      HYEB_SESSION_SECRET: process.env.HYEB_SESSION_SECRET,
-      HYEB_ALLOWED_ORIGINS: process.env.HYEB_ALLOWED_ORIGINS ?? fileConfig.HYEB_ALLOWED_ORIGINS,
-      HYEB_BROWSER_WS_ENDPOINT: process.env.HYEB_BROWSER_WS_ENDPOINT ?? fileConfig.HYEB_BROWSER_WS_ENDPOINT,
-      HYEB_BROWSER_LOCAL: process.env.HYEB_BROWSER_LOCAL ?? fileConfig.HYEB_BROWSER_LOCAL,
-      HYEB_BROWSER_HEADLESS: process.env.HYEB_BROWSER_HEADLESS ?? fileConfig.HYEB_BROWSER_HEADLESS,
-      HYEB_CHROME_PATH: process.env.HYEB_CHROME_PATH ?? fileConfig.HYEB_CHROME_PATH,
-      HYEB_BROWSER_IDLE_EVICTION_MS: process.env.HYEB_BROWSER_IDLE_EVICTION_MS ?? fileConfig.HYEB_BROWSER_IDLE_EVICTION_MS,
-      HYEB_LOG_LEVEL: process.env.HYEB_LOG_LEVEL ?? fileConfig.HYEB_LOG_LEVEL,
-    });
+    setRuntimeConfig(selfHostedRuntimeConfig(process.env, fileConfig));
 
     // google-login-automation.ts (and its Patchright variant) live in
     // @hyeboard/university-adapters and read HYEB_CHROME_PATH /

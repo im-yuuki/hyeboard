@@ -27,7 +27,10 @@ from UET's StudentHub/Canvas. Session model is classic ASP cookie auth, not bear
 - `GET /ListPoint/listpoint_Brc1.asp`: transcript/grades, grouped by term (newest first, full
   history on one page, no pagination). Per-course columns: code, name, credits, 10-point score,
   letter grade, 4-point score. Trailing summary lines give total credits, cumulative credits, and
-  cumulative GPA (4.0 scale). `Brc2.asp`/`Brc3.asp` use the same table shape for double-major /
+  cumulative GPA (4.0 scale). Term headers use `HỌC KỲ N - YYYY-YYYY. MÃ HỌC KỲ {maHK}`. Data
+  rows have eight cells; the last cell's `detailPoint(...)` handler carries class id and term
+  ordinal alongside display arguments. The shared grades parser extracts those optional ids and
+  feeds both the own Grades mapping and the grouped server-side transcript model. `Brc2.asp`/`Brc3.asp` use the same table shape for double-major /
   transferred-in credits but are typically empty for most students.
 - `GET /StdInfo/TabStdStudy.asp`: academic-progress tabs. Only the "Thông tin học tập" section has
   reliable per-student data: a term-by-term table of conduct/training score (0-100), term GPA, and
@@ -126,17 +129,76 @@ Live re-probing (authenticated session) CORRECTED earlier notes on this surface:
   identifiers). Codes and StdIDs run near-parallel within a cohort, drifting roughly ±2 per 60
   IDs; offset-only mapping is therefore unreliable, which motivates the oracle-walk design.
 - No portal endpoint maps a public code back to an internal StdID, so
-  `GET /api/vnu/cross-lookup/student-id` walks the Brc1 oracle server-side: anchor = the caller's
-  OWN (StdID, code) pair from their profile; first guess = `ownStdId + (targetCode - ownCode)`;
-  each probe corrects by the observed delta (`guess += targetCode - headerCode`). Caps: max 8
-  probes, a single corrective step > 5000 aborts (target outside the caller's cohort), revisiting
-  a guess aborts (oscillation), and a header-less probe (invalid StdID) aborts immediately — all
-  as `VNU_CROSS_LOOKUP_NOT_CONVERGED` (404). Probes are spaced ~250ms apart to be polite. A
-  resolved id is returned zero-padded to the portal's 11-digit shape with the probe count.
-- Both cross-lookup routes are gated identically: session guard, vnu-only, the literal
+  `GET /api/vnu/cross-lookup/student-id` walks the Brc1 oracle server-side from the caller's OWN
+  `(StdID, code)` profile anchor. The verified near gate is `VERIFIED_NEAR_CODE_DELTA = 64`;
+  targets within that gate use local linear correction (`guess += targetCode - headerCode`) with
+  at most 8 exact-verification probes. Wider targets use a mirrored interval in the target
+  direction: projected StdID = own StdID + code delta, with an additional
+  `ceil(abs(delta) * 0.02) + 64` margin. The resolver bisects that interval for at most 12 probes,
+  tracks the closest valid header, then uses a separate far post-bisection linear-refinement
+  threshold of 10 code values and performs at most 10 linear-correction probes. One visited set
+  spans both stages; the exported reachable and bulk-reserved hard maximum is 22 probes
+  (12 bisection + 10 linear), and probes are spaced ~250ms apart. A malformed/header-less
+  response aborts immediately; oscillation or exhaustion returns
+  `VNU_CROSS_LOOKUP_NOT_CONVERGED` (404), never a guessed id. A resolved id is returned
+  zero-padded to the portal's 11-digit shape with the total probe count.
+- IMPORTANT RELEASE GATE: wide-span monotonic increase of `code(StdID)`, required by bisection,
+  is now live-DISPROVEN — see "Wide-span probe evidence" below; it no longer merely lacks
+  verification. Only short cohort-local drift has ever held. Far-target walking therefore stays
+  disabled: only the literal environment or Cloudflare binding string
+  `VNU_FAR_WALK_ENABLED=true` permits it, config-file values and all other string variants
+  cannot, and no deployment should set it. The committed Cloudflare deployment default remains
+  `false`.
+- All cross-lookup routes share a per-session Brc1 probe budget: 300 upstream oracle fetches per fixed
+  600-second window. Each fetch consumes one unit immediately before the upstream request. The
+  Durable Object name is an HMAC of session-bound material, so no cookie or student identifier is
+  present in its name or storage. The object stores only fixed-window `{ count, resetAt }` state;
+  serialized Durable Object handling plus an atomic storage transaction makes the cap authoritative
+  across Worker isolates and colos. Confirmed exhaustion fails before a fetch with
+  `VNU_RATE_LIMITED` (429) and window retry detail. Durable Object or storage unavailability fails
+  closed with `VNU_PROBE_BUDGET_UNAVAILABLE` (503) and a short retry hint. Neither error invalidates
+  the Hyeboard session.
+- `GET /api/vnu/cross-lookup/transcript` accepts exactly one of `stdId` or `stdCode` plus the same
+  explicit opt-in. Direct-StdID mode consumes one budget unit for its transcript fetch. Student-code
+  mode uses the shared far resolver (one unit per Brc1 oracle request), then deliberately performs
+  one additional budgeted fetch for the final transcript. Its wire payload is parsed JSON only:
+  identity `header` (`studentCode`, optional `studentName`/`className`), `terms` containing
+  maHK-grouped parsed grade `rows`, and `totals` (`totalCredits`, `accumulatedCredits`, `gpa4`). Portal
+  notice prose is never included in a foreign-student wire DTO. A missing identity header fails closed
+  with stable `VNU_CROSS_LOOKUP_NOT_FOUND` (404) and never returns parsed grade rows. Raw Brc1 HTML never leaves the worker. Transcript successes and errors send
+  `Cache-Control: no-store`; no transcript response or parsed data enters the application cache.
+- All cross-lookup routes are gated identically: session guard, vnu-only, the literal
   `allowCrossLookup=true` opt-in (400 otherwise), own-profile-derived self-target rejection (400),
-  and never cached. The wire shapes are `{ studentCode?, studentName?, className?, notice? }`
-  (StdID -> code) and `{ stdId, stdCode, probes }` (code -> StdID).
+  and never cached. The resolver wire shapes are `{ studentCode, studentName?, className? }`
+  (StdID -> code) and `{ stdId, stdCode, probes }` (code -> StdID); transcript shape is described above.
+- `POST /api/vnu/cross-lookup/bulk` runs only parsed, ordered chunks (up to 5 direct-ID
+  or transcript targets, or 3 code-resolver targets). Before any Brc1 request, one
+  Durable Object transaction reserves the entire conservative allowance: 1 unit per
+  direct target and the resolver's declared 22-unit hard maximum per code target.
+  Item fetches spend this local allowance and never charge the Durable Object again.
+  Reservations intentionally do not refund malformed, self, failed, or early-resolved
+  items; this conservative loss prevents check-then-consume races.
+  Malformed target strings remain in their original chunk and produce the per-item
+  `VNU_CROSS_LOOKUP_INVALID_TARGET` code; only an empty run or more than 50 unique client targets
+  prevents the whole run.
+
+### Wide-span probe evidence (qualitative)
+
+Wide-span live probes across wide spans from the caller's anchor settle the far-walk
+release gate above. No identifiers, codes, or per-pair deltas are recorded here — shapes only:
+
+- The StdID space spans multiple intake cohorts, with large student-code prefix jumps at cohort
+  boundaries. No single code<->StdID slope exists across the space.
+- Even WITHIN one cohort, `code(StdID)` stops being monotonic outside the immediate local neighborhood from the
+  anchor: the local drift slope changes sign, so wide probes oscillate instead of converging.
+- Consequence: neither bisection nor the linear far-walk can converge reliably at wide spans.
+  `VNU_FAR_WALK_ENABLED` must remain `false` on every deployment. The near walk (near-anchor walk)
+  remains the only verified-convergent range.
+- Safety property: the resolver can never return a WRONG id in any mode — success requires
+  exact equality between a probed header code and the target code. Far mode is unreliable
+  (fails to converge), never incorrect.
+- The reverse directions (StdID -> code, StdID -> transcript) are unaffected: each resolves
+  with exactly one oracle fetch at arbitrary distance and never depends on monotonicity.
 
 ## Raw-proxy hardening (worker-side)
 

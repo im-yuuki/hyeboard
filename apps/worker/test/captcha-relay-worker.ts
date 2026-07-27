@@ -1,4 +1,5 @@
 export { CaptchaRelayDurableObject } from "../src/captcha-relay-durable-object";
+export { VnuProbeBudgetDurableObject } from "../src/vnu-probe-budget-durable-object";
 
 export default {
   fetch(): Response {

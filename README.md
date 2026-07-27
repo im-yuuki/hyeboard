@@ -22,6 +22,8 @@ Required env for local dev, `apps/worker/.dev.vars` (gitignored):
 ```txt
 HYEB_SESSION_SECRET=replace-with-at-least-32-random-bytes
 HYEB_ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+# Only the literal value true enables far walking. Keep false until sanitized live evidence verifies monotonicity.
+VNU_FAR_WALK_ENABLED=false
 ```
 
 Optional, `apps/web/.env.local`:
@@ -58,7 +60,7 @@ cp .env.example .env   # fill in HYEB_SESSION_SECRET
 node dist/index.js      # or: bun run dist/index.js
 ```
 
-All non-secret runtime configuration (allowed origins, host/port, browser automation settings) lives in `dist/config.json`; only `HYEB_SESSION_SECRET` is read from the environment.
+Non-secret runtime configuration for allowed origins, host/port, and browser automation lives in `dist/config.json`; only `HYEB_SESSION_SECRET` is secret. The far-walk release gate is environment-only: exactly `VNU_FAR_WALK_ENABLED=true` enables it in Node/Bun, or the same literal string in the Cloudflare binding. Config-file values, numeric values, and mixed-case variants cannot enable it. VNU cross-lookup probe enforcement requires the Cloudflare `VNU_PROBE_BUDGET` Durable Object binding; self-hosted runtimes fail those probes closed with `VNU_PROBE_BUDGET_UNAVAILABLE`. Every cross-lookup response uses `Cache-Control: no-store`, and foreign-student DTOs exclude raw portal notices. Bulk lookup reserves each chunk's conservative worst-case units atomically before upstream work (1 per direct ID lookup/transcript, 22 per code resolver); unused reserved units remain consumed by design. Malformed targets produce ordered per-item errors; only empty input or more than 50 unique targets rejects a whole client run.
 
 ## Security
 

@@ -15,6 +15,7 @@ import type {
   VnuProfile,
   VnuSyllabusRow,
   VnuTermProgressRow,
+  VnuTranscript,
   VnuTranscriptHeader,
 } from "./types";
 
@@ -32,6 +33,13 @@ function decodeEntities(text: string): string {
 
 function stripTags(html: string): string {
   return decodeEntities(html.replace(/<[^>]+>/g, " "));
+}
+
+function parseOptionalNumber(value: string | undefined): number | undefined {
+  const normalized = value?.trim().replace(",", ".");
+  if (!normalized || !/^-?\d+(?:\.\d+)?$/.test(normalized)) return undefined;
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 function attrOf(tag: string, attr: string): string | undefined {
@@ -104,6 +112,8 @@ function tdCells(rowHtml: string): string[] {
 // plain-text cumulative summary lines after the table.
 export function parseGradesHtml(html: string): VnuGradesResult {
   const rows: VnuGradeRow[] = [];
+  const terms: VnuGradesResult["terms"] = [];
+  let currentTerm: VnuGradesResult["terms"][number] | undefined;
   let currentTermCode: string | undefined;
   let currentTermLabel: string | undefined;
   const trRe = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
@@ -116,22 +126,31 @@ export function parseGradesHtml(html: string): VnuGradesResult {
     if (termHeaderMatch && cells.length <= 2) {
       currentTermCode = termHeaderMatch[1];
       currentTermLabel = joined.replace(/\s+/g, " ").trim();
+      currentTerm = { termCode: currentTermCode, termLabel: currentTermLabel || undefined, rows: [] };
+      terms.push(currentTerm);
       continue;
     }
     if (cells.length >= 7 && /^[A-Za-zĐ]{2,6}\d{3,4}/.test(cells[1] ?? "")) {
-      const credits = Number.parseFloat(cells[3] ?? "");
-      const point10 = Number.parseFloat(cells[4] ?? "");
-      const point4 = Number.parseFloat(cells[6] ?? "");
-      rows.push({
+      const credits = parseOptionalNumber(cells[3]);
+      const point10 = parseOptionalNumber(cells[4]);
+      const point4 = parseOptionalNumber(cells[6]);
+      const detailMatch = match[1].match(/detailPoint\s*\(\s*['"]([^'"]+)['"]\s*,\s*['"][^'"]*['"]\s*,\s*['"][^'"]*['"]\s*,\s*['"]([^'"]+)['"]\s*\)/i);
+      const classId = detailMatch?.[1]?.trim();
+      const termOrdinal = detailMatch?.[2]?.trim();
+      const row: VnuGradeRow = {
         termCode: currentTermCode ?? "",
         termLabel: currentTermLabel ?? "",
         courseCode: (cells[1] ?? "").trim(),
         courseName: (cells[2] ?? "").trim(),
-        credits: Number.isFinite(credits) ? credits : undefined,
-        point10: Number.isFinite(point10) ? point10 : undefined,
+        credits,
+        point10,
         letter: cells[5]?.trim() || undefined,
-        point4: Number.isFinite(point4) ? point4 : undefined,
-      });
+        point4,
+        classId: classId && /^\d+$/.test(classId) ? classId : undefined,
+        termOrdinal: termOrdinal && /^\d+$/.test(termOrdinal) ? termOrdinal : undefined,
+      };
+      rows.push(row);
+      currentTerm?.rows.push(row);
     }
   }
   const plain = stripTags(html);
@@ -140,9 +159,40 @@ export function parseGradesHtml(html: string): VnuGradesResult {
   const cumulativeGpaMatch = plain.match(/Điểm trung bình tích lũy hệ 4:\s*([\d.]+)/i);
   return {
     rows,
+    terms,
     totalCredits: listingMatch ? Number.parseFloat(listingMatch[1]) : undefined,
     totalAccumulatedCredits: accumulatedMatch ? Number.parseFloat(accumulatedMatch[1]) : undefined,
     cumulativeGpa4: cumulativeGpaMatch ? Number.parseFloat(cumulativeGpaMatch[1]) : undefined,
+  };
+}
+
+// Full server-side model for ListPoint/listpoint_Brc1.asp. Grade-table parsing
+// remains centralized in parseGradesHtml so own Grades and cross transcript
+// cannot drift onto different row/header/footer interpretations.
+export function parseTranscriptHtml(html: string): VnuTranscript {
+  const grades = parseGradesHtml(html);
+  return {
+    header: parseTranscriptHeader(html),
+    terms: grades.terms.map((term) => ({
+      maHK: term.termCode,
+      label: term.termLabel,
+      rows: term.rows.map((row) => ({
+        courseCode: row.courseCode,
+        courseName: row.courseName,
+        credits: row.credits,
+        grade10: row.point10,
+        letterGrade: row.letter,
+        grade4: row.point4,
+        classId: row.classId,
+        termOrdinal: row.termOrdinal,
+      })),
+    })),
+    totals: {
+      totalCredits: grades.totalCredits,
+      accumulatedCredits: grades.totalAccumulatedCredits,
+      gpa4: grades.cumulativeGpa4,
+    },
+    notice: parsePortalNotice(html),
   };
 }
 

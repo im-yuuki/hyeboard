@@ -13,8 +13,8 @@ export type { VnuProfile } from "./vnu/types";
 // to the browser for the cross-lookup routes. parsePortalNotice is the
 // fail-closed portal notice extractor reused there so an invalid StdID still
 // surfaces the portal's own in-page message instead of a silent empty result.
-export { parseTranscriptHeader, parsePortalNotice } from "./vnu/parser";
-export type { VnuTranscriptHeader } from "./vnu/types";
+export { parseTranscriptHeader, parseTranscriptHtml, parsePortalNotice } from "./vnu/parser";
+export type { VnuTranscript, VnuTranscriptHeader } from "./vnu/types";
 // Static vTermID table — verified vTermID <-> maHK <-> academic-year mapping
 // (see exam-terms.ts). Pure data, safe for every runtime.
 export { VNU_EXAM_TERMS } from "./vnu/exam-terms";
