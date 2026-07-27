@@ -24,7 +24,7 @@ function uuid(): string {
 // (e.g. a feature that needs a learning-platform credential the user never provided) is
 // a feature-specific problem that should NOT log the user out of a session
 // that is otherwise perfectly valid.
-const SESSION_INVALID_CODES: ReadonlySet<string> = new Set(["MISSING_SESSION", "SESSION_EXPIRED", "INVALID_SESSION"]);
+const SESSION_INVALID_CODES: ReadonlySet<string> = new Set(["MISSING_SESSION", "SESSION_EXPIRED", "INVALID_SESSION", "VNU_SESSION_EXPIRED"]);
 
 export function isSessionDeathCode(code: string | undefined): boolean {
   return code !== undefined && SESSION_INVALID_CODES.has(code);
