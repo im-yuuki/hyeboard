@@ -81,7 +81,7 @@ class TestCache {
   }
 
   rawUrls(): string[] {
-    return [...this.store.keys()].filter((key) => key.includes("/cache/vnu/raw/"));
+    return [...this.store.keys()].filter((key) => key.startsWith("https://hyeboard.internal/cache/vnu/raw/"));
   }
 
   importUrl(): string {
@@ -552,10 +552,16 @@ describe("VNU import session cache", () => {
 
   it("does not cache or expose a runtime VNU_SESSION_EXPIRED response", async () => {
     const expiryNoticeSentinel = "SYNTHETIC_EXPIRY_NOTICE_SENTINEL";
+    const expiryNotice = "Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.";
+    const expiryNoticeHtml = `<html><body><table data-synthetic-marker="${expiryNoticeSentinel}"><tr><td>${expiryNotice}</td></tr></table></body></html>`;
+    let upstreamHtmlAtFetchBoundary: string | undefined;
+    const upstreamFetch = vi.fn(async () => {
+      upstreamHtmlAtFetchBoundary = expiryNoticeHtml;
+      return new Response(upstreamHtmlAtFetchBoundary, { status: 200, headers: { "Content-Type": "text/html" } });
+    });
     const outward = await importVnu(app);
-    gradesSpy = vi.spyOn(DaotaoClient.prototype, "getGradesHtml").mockRejectedValue(
-      new HyeboardError("VNU_SESSION_EXPIRED", "The university portal session has expired. Sign in again.", 401),
-    );
+    gradesSpy = vi.spyOn(DaotaoClient.prototype, "getGradesHtml");
+    vi.stubGlobal("fetch", upstreamFetch);
 
     const response = await getVnuRawPage(app, outward.token);
     const responseText = await response.text();
@@ -565,9 +571,13 @@ describe("VNU import session cache", () => {
       data: null,
       error: { code: "VNU_SESSION_EXPIRED" },
     });
+    expect(upstreamHtmlAtFetchBoundary).toContain(expiryNoticeSentinel);
+    expect(upstreamHtmlAtFetchBoundary).toContain(expiryNotice);
     expect(responseText).not.toContain(expiryNoticeSentinel);
+    expect(responseText).not.toContain(expiryNotice);
     expect(cache.rawUrls()).toEqual([]);
     expect(gradesSpy).toHaveBeenCalledTimes(1);
+    expect(upstreamFetch).toHaveBeenCalledTimes(1);
   });
 
   it("uses separate raw-cache keys for old and repaired VNU cookies", async () => {
