@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isDaotaoSessionExpired, parseGradesHtml, parseTranscriptHtml } from "./parser";
+import { isDaotaoSessionExpired, parseGradesHtml, parsePortalNotice, parseTranscriptHtml } from "./parser";
 import {
   loginFormHtml,
   mixedAttributeLoginFormHtml,
@@ -72,6 +72,19 @@ describe("parseTranscriptHtml", () => {
   });
 });
 
+describe("parsePortalNotice entity decoding", () => {
+  it.each([
+    ["an encoded entity", "&amp;#xEA;", "&#xEA;"],
+    ["a supplementary scalar", "&#x1F600;", "😀"],
+    ["the maximum scalar", "&#x10FFFF;", String.fromCodePoint(0x10ffff)],
+    ["a surrogate", "&#xD800;", "&#xD800;"],
+    ["an out-of-range value", "&#x110000;", "&#x110000;"],
+    ["a malformed reference", "&#xZZ;", "&#xZZ;"],
+  ])("decodes %s in one pass", (_case, entity, expected) => {
+    expect(parsePortalNotice(`<script>alert('${entity}')</script>`)).toBe(expected);
+  });
+});
+
 describe("isDaotaoSessionExpired", () => {
   const authenticatedUrl = "https://daotao.vnu.edu.vn/StdInfo/StudentProfile.asp";
 
@@ -84,6 +97,17 @@ describe("isDaotaoSessionExpired", () => {
   });
 
   it.each([loginFormHtml, mixedAttributeLoginFormHtml])("matches a complete login form", (html) => {
+    expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(true);
+  });
+
+  it.each([
+    ["a format end tag", "</format>"],
+    ["a form-invalid end tag", "</form-invalid>"],
+    ["a comment", "<!-- </form> -->"],
+    ["a script", "<script>const closingTag = '</form>';</script>"],
+  ])("ignores a fake form closing tag in %s", (_case, fakeClosingTag) => {
+    const html = `<form action="/dkmh/login.asp"><input name="txtLoginId">${fakeClosingTag}<input name="txtPassword"></form>`;
+
     expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(true);
   });
 

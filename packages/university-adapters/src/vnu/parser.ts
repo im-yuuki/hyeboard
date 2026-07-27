@@ -22,17 +22,22 @@ import type {
 const DAOTAO_ORIGIN = "https://daotao.vnu.edu.vn";
 const DAOTAO_LOGIN_PATH = "/dkmh/login.asp";
 const DAOTAO_SESSION_ENDED_SENTENCE = "Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.";
+const HTML_ENTITY_RE = /&(?:nbsp|amp|lt|gt|quot|#[^;&\s]*);/gi;
 
 function decodeEntities(text: string): string {
   return text
-    .replaceAll("&nbsp;", " ")
-    .replaceAll("&amp;", "&")
-    .replaceAll("&lt;", "<")
-    .replaceAll("&gt;", ">")
-    .replaceAll("&#39;", "'")
-    .replaceAll("&quot;", '"')
-    .replace(/&#(?:x([0-9a-f]+)|(\d+));/gi, (entity, hexadecimal: string | undefined, decimal: string | undefined) => {
-      const codePoint = Number.parseInt(hexadecimal ?? decimal ?? "", hexadecimal ? 16 : 10);
+    .replace(HTML_ENTITY_RE, (entity) => {
+      const token = entity.slice(1, -1).toLowerCase();
+      if (token === "nbsp") return " ";
+      if (token === "amp") return "&";
+      if (token === "lt") return "<";
+      if (token === "gt") return ">";
+      if (token === "quot") return '"';
+
+      const numericMatch = token.match(/^#(?:(x)([0-9a-f]+)|(\d+))$/i);
+      if (!numericMatch) return entity;
+
+      const codePoint = Number.parseInt(numericMatch[2] ?? numericMatch[3], numericMatch[1] ? 16 : 10);
       if (codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) return entity;
       return String.fromCodePoint(codePoint);
     })
@@ -452,19 +457,21 @@ export function parsePortalNotice(html: string): string | undefined {
 }
 
 function hasCompleteLoginForm(html: string): boolean {
-  const lowerHtml = html.toLowerCase();
+  const searchableHtml = html.replace(/<!--[\s\S]*?-->|<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, (ignored) => " ".repeat(ignored.length));
   const formStartRe = /<form\b[^>]*>/gi;
   let formStart: RegExpExecArray | null;
 
-  while ((formStart = formStartRe.exec(html))) {
+  while ((formStart = formStartRe.exec(searchableHtml))) {
     if (attrOf(formStart[0], "action")?.toLowerCase() !== DAOTAO_LOGIN_PATH) continue;
 
-    const formEnd = lowerHtml.indexOf("</form", formStartRe.lastIndex);
-    if (formEnd === -1) continue;
+    const formEndRe = /<\/form\s*>/gi;
+    formEndRe.lastIndex = formStartRe.lastIndex;
+    const formEnd = formEndRe.exec(searchableHtml);
+    if (!formEnd) continue;
 
     const inputNames = new Set<string>();
     const inputRe = /<input\b[^>]*>/gi;
-    const formBody = html.slice(formStartRe.lastIndex, formEnd);
+    const formBody = searchableHtml.slice(formStartRe.lastIndex, formEnd.index);
     let input: RegExpExecArray | null;
     while ((input = inputRe.exec(formBody))) {
       const name = attrOf(input[0], "name")?.toLowerCase();
