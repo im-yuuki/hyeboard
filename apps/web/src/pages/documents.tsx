@@ -26,7 +26,7 @@ function MiniPanel<T>({ title, query, children }: { title: string; query: { data
   return (
     <Card className="animate-card">
       <CardHeader className="pb-3">
-        <button type="button" className="flex w-full items-center justify-between gap-3 text-left" onClick={() => setOpen((value) => !value)} aria-expanded={open} aria-label={t.documents.toggle(title)}>
+        <button type="button" className="flex w-full items-center justify-between gap-3 text-left max-lg:min-h-11" onClick={() => setOpen((value) => !value)} aria-expanded={open} aria-label={t.documents.toggle(title)}>
           <CardTitle className="text-base">{title}</CardTitle>
           <ChevronDown className={cn("h-4 w-4 shrink-0 text-muted-foreground transition-transform", open && "rotate-180")} />
         </button>

@@ -124,7 +124,7 @@ function MobileTimetableGroups({ items, visibleWeekdays, currentWeekday }: { ite
         <Card key={day.value} className={cn(day.value === currentWeekday && "timetable-current-day")}>
           <CardContent className="p-0">
             <div className="timetable-day-heading">{t.weekday[day.key]}</div>
-            <div className="divide-y divide-border px-5">
+            <div className="divide-y divide-border px-4 sm:px-5">
               {sessions.map((item) => <ScheduleItem key={item.id} item={item} />)}
             </div>
           </CardContent>
@@ -135,7 +135,7 @@ function MobileTimetableGroups({ items, visibleWeekdays, currentWeekday }: { ite
 }
 
 function TimetableList({ items }: { items: ClassSession[] }) {
-  return <Card><CardContent className="divide-y divide-border p-5">{[...items].sort((a, b) => (a.weekday ?? 0) - (b.weekday ?? 0) || (a.periodStart ?? 0) - (b.periodStart ?? 0)).map((item) => <ScheduleItem key={item.id} item={item} />)}</CardContent></Card>;
+  return <Card><CardContent className="divide-y divide-border p-4 sm:p-5">{[...items].sort((a, b) => (a.weekday ?? 0) - (b.weekday ?? 0) || (a.periodStart ?? 0) - (b.periodStart ?? 0)).map((item) => <ScheduleItem key={item.id} item={item} />)}</CardContent></Card>;
 }
 
 export function TimetablePage() {

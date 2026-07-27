@@ -44,8 +44,8 @@ export function SettingsPage() {
             <div className="flex items-center justify-between gap-3">
               <span className="text-sm">{t.settings.themeStyle}</span>
               <div className="flex rounded-lg border border-border p-1" role="group" aria-label={t.settings.themeStyle}>
-                <Button type="button" variant={state.palette === "geist" ? "default" : "ghost"} size="sm" onClick={() => state.setPalette("geist")}>{t.settings.neutral}</Button>
-                <Button type="button" variant={state.palette !== "geist" ? "default" : "ghost"} size="sm" onClick={() => state.setPalette(state.universityId === "uet" || state.universityId === "vnu" ? state.universityId : "uet")}>{t.settings.colored}</Button>
+                <Button type="button" variant={state.palette === "geist" ? "default" : "ghost"} size="sm" className="max-lg:min-h-11" onClick={() => state.setPalette("geist")}>{t.settings.neutral}</Button>
+                <Button type="button" variant={state.palette !== "geist" ? "default" : "ghost"} size="sm" className="max-lg:min-h-11" onClick={() => state.setPalette(state.universityId === "uet" || state.universityId === "vnu" ? state.universityId : "uet")}>{t.settings.colored}</Button>
               </div>
             </div>
             {state.palette === "uet" || state.palette === "vnu" ? (
@@ -61,7 +61,7 @@ export function SettingsPage() {
                       aria-pressed={state.themeHue === preset.hue}
                       onClick={() => state.setThemeHue(preset.hue)}
                       className={cn(
-                        "h-6 w-6 shrink-0 rounded-full border transition-transform",
+                        "h-6 w-6 shrink-0 rounded-full border transition-transform max-lg:h-8 max-lg:w-8",
                         state.themeHue === preset.hue ? "border-foreground scale-110" : "border-border hover:scale-105",
                       )}
                       style={{ background: `hsl(${preset.hue} 80% 45%)` }}

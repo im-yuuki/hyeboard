@@ -27,7 +27,7 @@ const SheetContent = forwardRef<ElementRef<typeof SheetPrimitive.Content>, Compo
     <SheetPrimitive.Content
       ref={ref}
       className={cn(
-        "fixed inset-y-0 left-0 z-50 flex h-full w-72 flex-col border-r border-border bg-sidebar p-0 shadow-xl transition ease-in-out data-[state=closed]:animate-out data-[state=open]:animate-in data-[state=closed]:slide-out-to-left data-[state=open]:slide-in-from-left data-[state=closed]:duration-200 data-[state=open]:duration-300",
+        "fixed inset-y-0 left-0 z-50 flex h-full w-72 flex-col overflow-y-auto border-r border-border bg-sidebar p-0 pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] pt-[env(safe-area-inset-top)] shadow-xl transition ease-in-out data-[state=closed]:animate-out data-[state=open]:animate-in data-[state=closed]:slide-out-to-left data-[state=open]:slide-in-from-left data-[state=closed]:duration-200 data-[state=open]:duration-300",
         className,
       )}
       {...props}

@@ -595,6 +595,12 @@ for (const viewport of REFERENCE_VIEWPORTS) {
 
     await page.goto("/grades");
     await expectNoPageOverflow(page);
+
+    await page.goto("/exams");
+    await expectNoPageOverflow(page);
+
+    await page.goto("/tuition");
+    await expectNoPageOverflow(page);
   });
 }
 
@@ -654,15 +660,57 @@ test("view toggles and key settings actions meet mobile touch target size", asyn
     expect(box).not.toBeNull();
     expect(box!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET);
   }
+  const examsTermBox = await page.getByRole("combobox", { name: "Term" }).boundingBox();
+  expect(examsTermBox).not.toBeNull();
+  expect(examsTermBox!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET);
+
+  await page.goto("/grades");
+  const gradesTermBox = await page.getByTestId("grades-term-select").boundingBox();
+  expect(gradesTermBox).not.toBeNull();
+  expect(gradesTermBox!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET);
 
   await page.goto("/settings");
   const toggleBox = await page.getByRole("button", { name: "Toggle light and dark mode" }).boundingBox();
   expect(toggleBox).not.toBeNull();
   expect(toggleBox!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET);
 
+  for (const name of ["Neutral", "Colored"]) {
+    const box = await page.getByRole("button", { name, exact: true }).boundingBox();
+    expect(box).not.toBeNull();
+    expect(box!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET);
+  }
+
+  const languageBox = await page.getByRole("combobox", { name: "Language" }).boundingBox();
+  expect(languageBox).not.toBeNull();
+  expect(languageBox!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET);
+
   const signOutBox = await page.getByRole("button", { name: "Sign out" }).boundingBox();
   expect(signOutBox).not.toBeNull();
   expect(signOutBox!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET);
+});
+
+test("exam and tuition tables keep every column reachable on mobile via internal scroll", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await loginDemo(page);
+
+  for (const route of ["/exams", "/tuition"]) {
+    await page.goto(route);
+    await expectNoPageOverflow(page);
+    const wrapper = page.getByTestId("data-table").first();
+    await expect(wrapper).toBeVisible();
+    // The table is wider than the phone viewport, so the wrapper must scroll
+    // internally (not clip): scrolling to the end reveals the last column.
+    const { scrollWidth, clientWidth, overflowX } = await wrapper.evaluate((el) => ({
+      scrollWidth: el.scrollWidth,
+      clientWidth: el.clientWidth,
+      overflowX: getComputedStyle(el).overflowX,
+    }));
+    expect(overflowX).toBe("auto");
+    expect(scrollWidth).toBeGreaterThan(clientWidth);
+    const lastHeader = wrapper.locator("th").last();
+    await wrapper.evaluate((el) => { el.scrollLeft = el.scrollWidth; });
+    await expect(lastHeader).toBeInViewport();
+  }
 });
 
 test("focus-visible ring remains rendered for interactive controls in light and dark mode", async ({ page }) => {

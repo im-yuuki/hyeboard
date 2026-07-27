@@ -93,6 +93,7 @@
 }
 
 @layer base {
+  html { -webkit-tap-highlight-color: transparent; }
   body { font-family: var(--font-sans); }
   body { background: hsl(var(--background)); }
 }
@@ -181,6 +182,7 @@ textarea.control {
 }
 
 .nav-link:hover,
+.nav-link:active,
 .nav-link.active {
   background: hsl(var(--accent));
   color: hsl(var(--accent-foreground));
@@ -200,7 +202,20 @@ textarea.control {
 
 .mobile-nav-link { min-height: 2.75rem; }
 
-.app-header { min-height: 3.5rem; border-bottom: 1px solid hsl(var(--border)); }
+.app-header {
+  min-height: 3.5rem;
+  border-bottom: 1px solid hsl(var(--border));
+  /* viewport-fit=cover lets the page extend under the status bar on notched
+     phones; the sticky header absorbs that inset so its controls stay tappable. */
+  padding-top: env(safe-area-inset-top);
+}
+
+/* Keeps the floating language pill clear of the home indicator / rounded
+   corners on notched phones (env() resolves to 0 elsewhere). */
+.login-locale-toggle {
+  bottom: calc(1rem + env(safe-area-inset-bottom));
+  right: calc(1rem + env(safe-area-inset-right));
+}
 
 .login-screen {
   background: hsl(var(--background));
@@ -234,6 +249,19 @@ textarea.control {
 
 .list-row:hover {
   background: hsl(var(--muted) / 0.5);
+}
+
+/* Touch press feedback: a slightly stronger tint than hover so taps read as
+   acknowledged, replacing the suppressed webkit tap highlight. */
+.list-row:active {
+  background: hsl(var(--muted) / 0.7);
+}
+
+/* Roomier tap spacing for stacked rows below the desktop breakpoint. */
+@media (max-width: 63.9375rem) {
+  .list-row {
+    padding-block: 0.85rem;
+  }
 }
 
 .summary-strip {
@@ -284,6 +312,15 @@ textarea.control {
 
 .section-panel-header {
   margin-bottom: 0.75rem;
+}
+
+/* Match the main column's p-4 gutter on phones so panel padding, page
+   padding, and card padding share one rhythm instead of three near-misses. */
+@media (max-width: 40rem) {
+  .summary-strip,
+  .section-panel {
+    padding: 1rem;
+  }
 }
 
 [data-tone="neutral"] {
@@ -391,7 +428,8 @@ textarea.control {
   transition: background 140ms var(--ease-out-quint), border-color 140ms var(--ease-out-quint);
 }
 
-.timetable-session:hover {
+.timetable-session:hover,
+.timetable-session:active {
   background: hsl(var(--muted) / 0.5);
   border-color: hsl(var(--primary) / 0.3);
 }
@@ -402,6 +440,13 @@ textarea.control {
   padding: 0.75rem 1.25rem;
   font-size: 0.8rem;
   font-weight: 600;
+}
+
+/* Keep the day heading's left edge flush with the px-4 session rows below it. */
+@media (max-width: 40rem) {
+  .timetable-day-heading {
+    padding-inline: 1rem;
+  }
 }
 
 .timetable-current-day .timetable-day-heading {

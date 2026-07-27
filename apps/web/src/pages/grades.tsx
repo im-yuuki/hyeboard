@@ -138,7 +138,7 @@ function GradeTable({ grades, sort, onSortChange, universityId }: { grades: Grad
     </th>
   );
   return (
-    <div className="overflow-hidden rounded-xl border border-border">
+    <div className="overflow-x-auto rounded-xl border border-border">
       <table className="w-full border-collapse text-sm">
         <thead className="bg-muted text-muted-foreground">
           <tr>
@@ -166,7 +166,7 @@ function GradeTable({ grades, sort, onSortChange, universityId }: { grades: Grad
                         onClick={() => toggleExpanded(grade.id)}
                         aria-expanded={expanded}
                         aria-label={t.grades.toggleDetails(grade.courseName)}
-                        className="shrink-0 rounded-md p-0.5 text-muted-foreground hover:text-foreground"
+                        className="shrink-0 rounded-md p-0.5 text-muted-foreground hover:text-foreground max-lg:-mx-1.5 max-lg:-my-2 max-lg:p-2"
                       >
                         <ChevronDown className={cn("h-4 w-4 transition-transform", expanded && "rotate-180")} />
                       </button>

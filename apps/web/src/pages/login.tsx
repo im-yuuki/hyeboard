@@ -258,7 +258,7 @@ export function LoginPage() {
       <button
         type="button"
         onClick={() => setLocale(locale === "en" ? "vi" : "en")}
-        className="fixed bottom-4 right-4 z-10 flex items-center gap-2 rounded-full border border-border bg-background px-3 py-1.5 text-sm shadow-sm transition-colors hover:bg-muted"
+        className="login-locale-toggle fixed z-10 flex items-center gap-2 rounded-full border border-border bg-background px-3 py-1.5 text-sm shadow-sm transition-colors hover:bg-muted active:bg-muted max-lg:min-h-11 max-lg:px-4"
         aria-label={t.settings.language}
         title={t.settings.language}
       >

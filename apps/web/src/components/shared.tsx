@@ -165,7 +165,9 @@ export function FeedItem({ title, detail, url }: FeedItemProps) {
 export function DataTable({ headers, rows, emptyText }: { headers: string[]; rows: ReactNode[][]; emptyText?: string }) {
   const { t } = useLocale();
   if (!rows.length) return <Empty text={emptyText ?? t.common.noRows} />;
-  return <div className="overflow-hidden rounded-xl border border-border"><table className="w-full border-collapse text-sm"><thead className="bg-muted text-muted-foreground"><tr>{headers.map((header) => <th key={header} className="px-3 py-2 text-left font-medium">{header}</th>)}</tr></thead><tbody>{rows.map((row, index) => <tr key={index} className="border-t border-border">{row.map((cell, cellIndex) => <td key={cellIndex} className="px-3 py-2">{cell}</td>)}</tr>)}</tbody></table></div>;
+  // overflow-x-auto (not hidden): on narrow viewports the extra columns must
+  // stay reachable by scrolling inside the card instead of being clipped away.
+  return <div data-testid="data-table" className="overflow-x-auto rounded-xl border border-border"><table className="w-full border-collapse text-sm"><thead className="bg-muted text-muted-foreground"><tr>{headers.map((header) => <th key={header} className="whitespace-nowrap px-3 py-2 text-left font-medium">{header}</th>)}</tr></thead><tbody>{rows.map((row, index) => <tr key={index} className="border-t border-border">{row.map((cell, cellIndex) => <td key={cellIndex} className={cellIndex === 0 ? "px-3 py-2" : "whitespace-nowrap px-3 py-2"}>{cell}</td>)}</tr>)}</tbody></table></div>;
 }
 
 function LoginNeeded({ message }: { message: string }) {
