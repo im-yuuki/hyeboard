@@ -119,7 +119,7 @@ export function parseProfileHtml(html: string): VnuProfile {
 }
 
 function tdCells(rowHtml: string): string[] {
-  return [...rowHtml.matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/gi)].map((m) => decodeEntities(stripTags(m[1])));
+  return [...rowHtml.matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/gi)].map((m) => stripTags(m[1]));
 }
 
 // ListPoint/listpoint_Brc1.asp — term-grouped transcript table plus
@@ -353,13 +353,13 @@ export function parseSyllabusHtml(html: string): VnuSyllabusRow[] {
   while ((match = trRe.exec(html))) {
     const cellsHtml = [...match[1].matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/gi)].map((m) => m[1]);
     if (cellsHtml.length < 7) continue;
-    const codeText = decodeEntities(stripTags(cellsHtml[1] ?? ""));
+    const codeText = stripTags(cellsHtml[1] ?? "");
     if (!/^[A-Za-zĐ]{2,6}\d{3,4}/.test(codeText)) continue;
-    const nameText = decodeEntities(stripTags(cellsHtml[2] ?? ""));
-    const creditsText = decodeEntities(stripTags(cellsHtml[3] ?? ""));
+    const nameText = stripTags(cellsHtml[2] ?? "");
+    const creditsText = stripTags(cellsHtml[3] ?? "");
     const fileHrefMatch = (cellsHtml[4] ?? "").match(/href="([^"]+\.pdf)"/i);
-    const sizeText = decodeEntities(stripTags(cellsHtml[6] ?? ""));
-    const dateText = cellsHtml[7] ? decodeEntities(stripTags(cellsHtml[7])) : undefined;
+    const sizeText = stripTags(cellsHtml[6] ?? "");
+    const dateText = cellsHtml[7] ? stripTags(cellsHtml[7]) : undefined;
     const credits = Number.parseFloat(creditsText);
     rows.push({
       courseCode: codeText.trim(),
@@ -456,8 +456,77 @@ export function parsePortalNotice(html: string): string | undefined {
   return phraseMatch?.[0].trim() || undefined;
 }
 
+function isHtmlWhitespace(character: string | undefined): boolean {
+  return character === " " || character === "\t" || character === "\n" || character === "\r" || character === "\f";
+}
+
+function startsWithAsciiCaseInsensitive(text: string, token: string, index: number): boolean {
+  for (let offset = 0; offset < token.length; offset += 1) {
+    if (text[index + offset]?.toLowerCase() !== token[offset]) return false;
+  }
+  return true;
+}
+
+function isScriptOpeningAt(html: string, index: number): boolean {
+  if (!startsWithAsciiCaseInsensitive(html, "<script", index)) return false;
+  const boundary = html[index + "<script".length];
+  return boundary === undefined || boundary === ">" || boundary === "/" || isHtmlWhitespace(boundary);
+}
+
+function scriptClosingTagEndAt(html: string, index: number): number | undefined {
+  if (!startsWithAsciiCaseInsensitive(html, "</script", index)) return undefined;
+
+  let cursor = index + "</script".length;
+  while (isHtmlWhitespace(html[cursor])) cursor += 1;
+  return html[cursor] === ">" ? cursor + 1 : undefined;
+}
+
+function maskCommentsAndScripts(html: string): string {
+  const masked: string[] = [];
+  let mode: "markup" | "comment" | "script" = "markup";
+  let index = 0;
+
+  while (index < html.length) {
+    if (mode === "markup") {
+      if (html.startsWith("<!--", index)) {
+        mode = "comment";
+        masked.push(" ");
+      } else if (isScriptOpeningAt(html, index)) {
+        mode = "script";
+        masked.push(" ");
+      } else {
+        masked.push(html[index]);
+      }
+      index += 1;
+      continue;
+    }
+
+    if (mode === "comment" && html.startsWith("-->", index)) {
+      masked.push("   ");
+      mode = "markup";
+      index += 3;
+      continue;
+    }
+
+    if (mode === "script") {
+      const closingTagEnd = scriptClosingTagEndAt(html, index);
+      if (closingTagEnd !== undefined) {
+        masked.push(" ".repeat(closingTagEnd - index));
+        mode = "markup";
+        index = closingTagEnd;
+        continue;
+      }
+    }
+
+    masked.push(" ");
+    index += 1;
+  }
+
+  return masked.join("");
+}
+
 function hasCompleteLoginForm(html: string): boolean {
-  const searchableHtml = html.replace(/<!--[\s\S]*?-->|<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, (ignored) => " ".repeat(ignored.length));
+  const searchableHtml = maskCommentsAndScripts(html);
   const formStartRe = /<form\b[^>]*>/gi;
   let formStart: RegExpExecArray | null;
 

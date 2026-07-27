@@ -70,6 +70,14 @@ describe("parseTranscriptHtml", () => {
       notice: undefined,
     });
   });
+
+  it("decodes table-cell entities exactly once", () => {
+    const grades = parseGradesHtml(`<table><tr>
+      <td>1</td><td>INT1001</td><td>&amp;#xEA;</td><td>3</td><td>8.0</td><td>B</td><td>3.0</td>
+    </tr></table>`);
+
+    expect(grades.rows[0]?.courseName).toBe("&#xEA;");
+  });
 });
 
 describe("parsePortalNotice entity decoding", () => {
@@ -98,6 +106,15 @@ describe("isDaotaoSessionExpired", () => {
 
   it.each([loginFormHtml, mixedAttributeLoginFormHtml])("matches a complete login form", (html) => {
     expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(true);
+  });
+
+  it.each([
+    ["comment", "<!-- ".repeat(5_000)],
+    ["script", "<script>".repeat(5_000)],
+  ])("fails closed after repeated unterminated %s openers", (_case, openers) => {
+    const loginForm = `<form action="/dkmh/login.asp"><input name="txtLoginId"><input name="txtPassword"></form>`;
+
+    expect(isDaotaoSessionExpired(authenticatedUrl, `${openers}${loginForm}`)).toBe(false);
   });
 
   it.each([
