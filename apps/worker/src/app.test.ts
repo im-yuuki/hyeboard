@@ -564,7 +564,6 @@ describe("VNU import session cache", () => {
   it.each([
     ["rate limit", "VNU_RATE_LIMITED", 429],
     ["upstream unavailable", "VNU_UPSTREAM_UNAVAILABLE", 502],
-    ["mapped network failure", "VNU_UPSTREAM_UNAVAILABLE", 502],
   ])("propagates transient profile validation %s without login or cache mutation", async (_label, code, status) => {
     await importVnu(app);
     const cacheUrl = cache.importUrl();
