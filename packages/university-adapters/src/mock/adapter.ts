@@ -36,6 +36,10 @@ const university: University = {
     news: true,
     trainingPoints: true,
     requests: true,
+    // vnu (daotao)-only tool — no mock data source to back it honestly.
+    classLookup: false,
+    // No real upstream, so there is no honest cross-student behavior to model.
+    crossLookup: false,
   },
 };
 

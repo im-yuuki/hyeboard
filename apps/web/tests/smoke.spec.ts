@@ -282,6 +282,39 @@ test("header search filters and navigates to a page", async ({ page }) => {
   await expect(page).toHaveURL(/\/grades$/);
 });
 
+// The Lookup feature (class-code -> internal-id resolver, own StdID card) is
+// gated on the vnu-only `classLookup` capability - the mock demo adapter
+// deliberately sets it to false (see mock/adapter.ts), so both the sidebar
+// nav entry and the header search must never surface it for that account.
+//
+// NOTE: this suite has no vnu-authenticated fixture (a real vnu login needs
+// a real daotao.vnu.edu.vn username/password posted to the live portal -
+// there is no mock/stub server for it here, unlike the "mock" demo
+// university). A direct-route-render test for a signed-in vnu session is
+// intentionally not added rather than fabricating credentials or a bespoke
+// fetch-mocking harness beyond this feature's scope.
+test("Lookup nav item is absent for the mock demo account (vnu-only capability)", async ({ page }) => {
+  await loginDemo(page);
+  await expect(page.getByRole("link", { name: "Lookup" })).toHaveCount(0);
+
+  const search = page.getByPlaceholder("Search pages...");
+  await search.click();
+  await search.fill("Lookup");
+  await expect(page.getByText("No page matches that search.")).toBeVisible();
+
+  // Direct-URL access must not leak the cross-lookup sections either: the mock
+  // adapter sets crossLookup=false, and the sections are additionally gated
+  // behind the page's profile query failing for a non-vnu session. The same
+  // gating covers the phase-3 additions — the reverse class-ID resolver and
+  // the cross-student resolvers must stay equally unreachable.
+  await page.goto("/lookup");
+  await expect(page.getByTestId("reverse-class-lookup")).toHaveCount(0);
+  await expect(page.getByTestId("cross-student-code")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Resolve another student's code" })).toHaveCount(0);
+  await expect(page.getByTestId("cross-student-id")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Resolve another student's internal ID" })).toHaveCount(0);
+});
+
 test("notifications menu shows dashboard notifications", async ({ page }) => {
   await loginDemo(page);
   const notificationsButton = page.getByRole("button", { name: "Notifications" });

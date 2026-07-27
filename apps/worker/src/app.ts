@@ -1,6 +1,6 @@
 import { cors } from "@elysiajs/cors";
 import { decryptSession, encryptSession, fail, getLogger, HyeboardError, isExpired, ok, parseBearerToken, type EncryptedSessionPayload } from "@hyeboard/core";
-import { DaotaoClient, getAdapter, listUniversities, type BrowserBinding, type BrowserConnection } from "@hyeboard/university-adapters";
+import { DaotaoClient, getAdapter, listUniversities, parsePortalNotice, parseProfileHtml, parseTranscriptHeader, type BrowserBinding, type BrowserConnection } from "@hyeboard/university-adapters";
 import { Elysia, t } from "elysia";
 import { LocalCaptchaRelayCoordinator, captchaRelayCancelled, captchaRelayNotFound, type CaptchaRelayCoordinator, type PreparedCaptchaRelay } from "./captcha-relay";
 
@@ -250,10 +250,44 @@ const importSessionBody = t.Object({
 const termCodeQuery = t.Object({ termCode: t.Optional(t.String()) });
 
 const vnuRawQuery = t.Object({
+  // selUniv/selStd are still accepted so stale clients don't break, but they
+  // are NEVER honored: vnuRawHtml strips them before cache keying and derives
+  // both ids from the session's own profile for every key that needs them
+  // (see the exams and point-detail branches). vTermID stays client-supplied
+  // — it is a term selector, not a per-student id.
   selUniv: t.Optional(t.String()),
   selStd: t.Optional(t.String()),
   vTermID: t.Optional(t.String()),
+  // point-detail key only: class id, cosmetic echo value, term ordinal.
+  id: t.Optional(t.String()),
+  val: t.Optional(t.String()),
+  Term: t.Optional(t.String()),
 });
+
+// Cross-student lookup (vnu-only, see the crossLookup capability flag). Kept
+// off the /api/vnu/raw/:page allow-list so the access pattern stays auditable
+// and gated in exactly one place. allowCrossLookup must be the literal string
+// "true" — an explicit, obviously-named opt-in, never a neutral flag.
+const vnuCrossLookupQuery = t.Object({
+  stdId: t.Optional(t.String()),
+  stdCode: t.Optional(t.String()),
+  allowCrossLookup: t.Optional(t.String()),
+});
+
+// Cap for the student-code -> StdID offset walk (see the cross-lookup
+// student-id route): codes and StdIDs run near-parallel within a cohort
+// (verified drift of ~2 per 60), so a handful of corrective probes
+// converges; anything beyond this means the anchor model does not apply.
+const VNU_CROSS_LOOKUP_MAX_PROBES = 8;
+// A single corrective step larger than this means the target code is not in
+// the caller's cohort at all — stop instead of wandering across the id space.
+const VNU_CROSS_LOOKUP_MAX_STEP = 5000;
+// Polite spacing between upstream transcript probes during the walk.
+const VNU_CROSS_LOOKUP_PROBE_DELAY_MS = 250;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 // ─── Cache abstraction ────────────────────────────────────────
 // The Cloudflare Cache API (`caches.default`) is native to Workers/workerd
@@ -461,9 +495,14 @@ async function vnuRawCacheKey(session: EncryptedSessionPayload, page: string, pa
   return `vnu/raw/${await hmacHex(JSON.stringify({ cookie: session.vnu?.value ?? "", page, params }))}`;
 }
 
-async function vnuRawHtml(session: EncryptedSessionPayload, page: string, params: { selUniv?: string; selStd?: string; vTermID?: string }): Promise<string> {
+async function vnuRawHtml(session: EncryptedSessionPayload, page: string, params: { selUniv?: string; selStd?: string; vTermID?: string; id?: string; val?: string; Term?: string }): Promise<string> {
   if (!session.vnu?.value) throw new HyeboardError("VNU_LOGIN_REQUIRED", "VNU (daotao) data needs a saved daotao.vnu.edu.vn session. Sign in again.", 401);
-  const cacheKey = await vnuRawCacheKey(session, page, params);
+  // Client-supplied selStd/selUniv are never trusted for any key: per-student
+  // branches below derive both ids from the session's own profile. Strip them
+  // before cache keying too, so a smuggled value cannot even fragment this
+  // session's cache entries.
+  const { selStd: _ignoredSelStd, selUniv: _ignoredSelUniv, ...trustedParams } = params;
+  const cacheKey = await vnuRawCacheKey(session, page, trustedParams);
   const cached = await cacheGet<{ html: string }>(cacheKey);
   if (cached) return cached.html;
 
@@ -475,13 +514,35 @@ async function vnuRawHtml(session: EncryptedSessionPayload, page: string, params
   else if (page === "exam-base") html = await client.getExamBaseHtml();
   else if (page === "syllabus") html = await client.getSyllabusHtml();
   else if (page === "exams") {
-    if (!params.selUniv || !params.selStd || !params.vTermID) throw new HyeboardError("VNU_EXAM_QUERY_INCOMPLETE", "Exam lookup needs university id, student id, and term id from the VNU (daotao) profile page.", 400);
-    html = await client.getExamsHtml({ selUniv: params.selUniv, selStd: params.selStd, vTermID: params.vTermID });
+    if (!trustedParams.vTermID) throw new HyeboardError("VNU_EXAM_QUERY_INCOMPLETE", "Exam lookup needs a term id (vTermID); the student and university ids are always derived from your own profile server-side.", 400);
+    // Same hardening as point-detail: the selStd/selUniv sent upstream are
+    // ALWAYS the session owner's own internal ids, resolved from their
+    // profile here on the server. Live probing showed StdExamination.asp
+    // silently ignores selStd anyway (self-echo — see har-notes.md), but
+    // deriving the ids server-side keeps the proxy contract uniform with the
+    // genuinely un-bound endpoints (listpoint_Brc1.asp, detailPoint.asp) and
+    // stays correct if upstream behavior ever changes; cross-student access
+    // lives only on the gated cross-lookup routes. The profile read reuses
+    // this same cached path, keyed per session cookie.
+    const ownProfile = parseProfileHtml(await vnuRawHtml(session, "profile", {}));
+    if (!ownProfile.internalStudentId || !ownProfile.internalUnivId) throw new HyeboardError("VNU_LOGIN_REQUIRED", "VNU (daotao) exam lookup needs your own portal student id, which this session could not provide. Sign in again.", 401);
+    html = await client.getExamsHtml({ selUniv: ownProfile.internalUnivId, selStd: ownProfile.internalStudentId, vTermID: trustedParams.vTermID });
+  } else if (page === "point-detail") {
+    if (!trustedParams.id || !trustedParams.Term) throw new HyeboardError("VNU_POINT_DETAIL_QUERY_INCOMPLETE", "Point detail needs a class id and a term ordinal.", 400);
+    // The StdID sent upstream is ALWAYS the session owner's own internal id,
+    // resolved from their profile here on the server — this key never honors
+    // a client-supplied selStd, so the raw proxy cannot be turned into the
+    // cross-student point-detail IDOR that detailPoint.asp would otherwise
+    // allow (see har-notes.md). The profile read reuses this same cached
+    // path, keyed per session cookie.
+    const ownProfile = parseProfileHtml(await vnuRawHtml(session, "profile", {}));
+    if (!ownProfile.internalStudentId) throw new HyeboardError("VNU_LOGIN_REQUIRED", "VNU (daotao) point detail needs your own portal student id, which this session could not provide. Sign in again.", 401);
+    html = await client.getPointDetailHtml({ id: trustedParams.id, stdId: ownProfile.internalStudentId, term: trustedParams.Term, val: trustedParams.val });
   } else {
     throw new HyeboardError("VNU_RAW_PAGE_UNKNOWN", `Unknown VNU raw page: ${page}`, 404);
   }
 
-  await cachePut(cacheKey, { html }, page === "exams" ? 60 : 300);
+  await cachePut(cacheKey, { html }, page === "exams" || page === "point-detail" ? 60 : 300);
   return html;
 }
 
@@ -673,6 +734,74 @@ export function createApp(adapter: any) {
       if (session.universityId !== "vnu") throw new HyeboardError("SESSION_UNIVERSITY_MISMATCH", "Session university does not match route", 403);
       return ok({ html: await vnuRawHtml(session, params.page, query) });
     }, { query: vnuRawQuery })
+    // Cross-student StdID -> student-code resolver. listpoint_Brc1.asp
+    // HONORS selStd (live-verified — see har-notes.md): it renders the
+    // requested student's identity header (name / 8-digit code / managing
+    // class) for whatever selStd is passed. This deployment is authorized to
+    // expose that, gated server-side behind an explicit opt-in flag and a
+    // self-targeting rejection. Responses are NEVER cached: no shared-cache
+    // path exists here, so one caller's cross-lookup result can never bleed
+    // into another caller's cache entries. The fetched transcript HTML is
+    // parsed here, server-side, and only the resolved code/name/class/notice
+    // ever cross the network — the target student's full grade table (which
+    // the same HTML contains) is never sent to the browser. A header-less
+    // response is a clean not-found, not an error.
+    .get("/api/vnu/cross-lookup/student-code", async ({ headers, query }) => {
+      const session = await getSession(headers);
+      if (session.universityId !== "vnu") throw new HyeboardError("SESSION_UNIVERSITY_MISMATCH", "Session university does not match route", 403);
+      if (query.allowCrossLookup !== "true") throw new HyeboardError("VNU_CROSS_LOOKUP_NOT_EXPLICITLY_ALLOWED", "Cross-student lookup requires the explicit allowCrossLookup=true opt-in.", 400);
+      if (!query.stdId || !/^\d{1,11}$/.test(query.stdId)) throw new HyeboardError("VNU_CROSS_LOOKUP_QUERY_INCOMPLETE", "Cross-student student-code lookup needs a target student id.", 400);
+      // Fails closed when the caller's own id is unavailable: without it the
+      // self-targeting check below cannot run, so the request is rejected
+      // rather than allowed through unverified.
+      const ownProfile = parseProfileHtml(await vnuRawHtml(session, "profile", {}));
+      if (!ownProfile.internalStudentId) throw new HyeboardError("VNU_LOGIN_REQUIRED", "VNU (daotao) cross-lookup needs your own portal student id, which this session could not provide. Sign in again.", 401);
+      if (Number(query.stdId) === Number(ownProfile.internalStudentId)) throw new HyeboardError("VNU_CROSS_LOOKUP_SELF_TARGET", "That is your own student id. Your own ID mapping is on the Lookup page; cross-lookup is only for other students.", 400);
+      const html = await new DaotaoClient(session).getTranscriptByStdIdHtml(query.stdId);
+      const { studentCode, studentName, className } = parseTranscriptHeader(html);
+      return ok({ studentCode, studentName, className, notice: parsePortalNotice(html) });
+    }, { query: vnuCrossLookupQuery })
+    // Cross-student student-code -> StdID resolver (the reverse direction of
+    // the route above). No portal endpoint maps a public student code back to
+    // an internal StdID, so this walks the live-verified Brc1 oracle: within
+    // a cohort, codes and StdIDs run near-parallel (verified drift of ~2 per
+    // 60 — see har-notes.md), so starting from the caller's OWN (StdID, code)
+    // anchor pair and correcting each guess by the observed delta converges
+    // in a few probes. Same gate as the sibling route: session guard,
+    // vnu-only, explicit allowCrossLookup=true, self-target rejection, never
+    // cached. Fails closed with VNU_CROSS_LOOKUP_NOT_CONVERGED (404) when the
+    // anchor model does not apply (different cohort, oscillation, invalid
+    // intermediate StdID, or probe cap reached) — never returns a guessed id.
+    .get("/api/vnu/cross-lookup/student-id", async ({ headers, query }) => {
+      const session = await getSession(headers);
+      if (session.universityId !== "vnu") throw new HyeboardError("SESSION_UNIVERSITY_MISMATCH", "Session university does not match route", 403);
+      if (query.allowCrossLookup !== "true") throw new HyeboardError("VNU_CROSS_LOOKUP_NOT_EXPLICITLY_ALLOWED", "Cross-student lookup requires the explicit allowCrossLookup=true opt-in.", 400);
+      if (!query.stdCode || !/^\d{8}$/.test(query.stdCode)) throw new HyeboardError("VNU_CROSS_LOOKUP_QUERY_INCOMPLETE", "Cross-student student-id lookup needs a target 8-digit student code.", 400);
+      const ownProfile = parseProfileHtml(await vnuRawHtml(session, "profile", {}));
+      const ownStdId = Number(ownProfile.internalStudentId);
+      const ownCode = Number(ownProfile.studentCode);
+      if (!ownProfile.internalStudentId || !ownProfile.studentCode || !Number.isFinite(ownStdId) || !Number.isFinite(ownCode)) throw new HyeboardError("VNU_LOGIN_REQUIRED", "VNU (daotao) cross-lookup needs your own portal student id and code, which this session could not provide. Sign in again.", 401);
+      if (query.stdCode === ownProfile.studentCode) throw new HyeboardError("VNU_CROSS_LOOKUP_SELF_TARGET", "That is your own student code. Your own ID mapping is on the Lookup page; cross-lookup is only for other students.", 400);
+
+      const targetCode = Number(query.stdCode);
+      const client = new DaotaoClient(session);
+      const notConverged = () => new HyeboardError("VNU_CROSS_LOOKUP_NOT_CONVERGED", "Could not resolve an internal student id for that code near your own cohort. The code-to-id mapping only holds within one cohort.", 404);
+      const visited = new Set<number>();
+      let guess = ownStdId + (targetCode - ownCode);
+      for (let probes = 1; probes <= VNU_CROSS_LOOKUP_MAX_PROBES; probes += 1) {
+        if (visited.has(guess)) throw notConverged();
+        visited.add(guess);
+        if (probes > 1) await delay(VNU_CROSS_LOOKUP_PROBE_DELAY_MS);
+        const html = await client.getTranscriptByStdIdHtml(String(guess));
+        const headerCode = Number(parseTranscriptHeader(html).studentCode);
+        if (!Number.isFinite(headerCode)) throw notConverged();
+        if (headerCode === targetCode) return ok({ stdId: String(guess).padStart(11, "0"), stdCode: query.stdCode, probes });
+        const delta = targetCode - headerCode;
+        if (Math.abs(delta) > VNU_CROSS_LOOKUP_MAX_STEP) throw notConverged();
+        guess += delta;
+      }
+      throw notConverged();
+    }, { query: vnuCrossLookupQuery })
 
     // ── Authenticated — session+adapter injected via resolve() ──
     .group("/api/:universityId", (g) =>

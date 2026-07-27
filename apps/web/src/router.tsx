@@ -8,6 +8,7 @@ import { DocumentsPage } from "@/pages/documents";
 import { ExamsPage } from "@/pages/exams";
 import { GradesPage } from "@/pages/grades";
 import { LoginPage } from "@/pages/login";
+import { LookupPage } from "@/pages/lookup";
 import { SettingsPage } from "@/pages/settings";
 import { TimetablePage } from "@/pages/timetable";
 import { TrainingPointsPage } from "@/pages/training-points";
@@ -36,6 +37,7 @@ const routeTree = rootRoute.addChildren([
     createRoute({ getParentRoute: () => appRoute, path: "/tuition", component: TuitionPage }),
     createRoute({ getParentRoute: () => appRoute, path: "/documents", component: DocumentsPage }),
     createRoute({ getParentRoute: () => appRoute, path: "/training-points", component: TrainingPointsPage }),
+    createRoute({ getParentRoute: () => appRoute, path: "/lookup", component: LookupPage }),
     createRoute({ getParentRoute: () => appRoute, path: "/settings", component: SettingsPage }),
   ]),
 ]);

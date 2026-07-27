@@ -21,6 +21,16 @@ export const universityCapabilitiesSchema = z.object({
   news: z.boolean(),
   trainingPoints: z.boolean(),
   requests: z.boolean(),
+  // Class-code + class-number -> portal-internal class id resolver, plus the
+  // student's own internal id alongside their student code. Only verified
+  // against daotao.vnu.edu.vn's HTML shapes so far — must stay false for
+  // every other adapter until a real captured shape backs it too.
+  classLookup: z.boolean(),
+  // Lookup of ANOTHER student's data by internal id. Only honest where the
+  // upstream genuinely fails to session-bind the target id (live-verified
+  // IDOR on daotao.vnu.edu.vn's StdExamination.asp) AND the deployment is
+  // authorized to expose it — must stay false everywhere else.
+  crossLookup: z.boolean(),
 });
 
 export const universitySchema = z.object({

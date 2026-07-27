@@ -1,6 +1,7 @@
 import type { ApiResponse, Assignment, ClassSession, Course, DashboardSummary, DocumentItem, ExamSession, Grade, NewsItem, ServiceRequest, Term, TrainingPoint, TuitionStatus, University } from "@hyeboard/schemas";
+import type { VnuExamCatalogRow, VnuPointDetail, VnuProfile } from "@hyeboard/university-adapters/src/vnu/types";
 import { mapExamRow, mapGpaSummary, mapGradeRow, mapProfile, mapSyllabusRow, mapTerms, mapTrainingPoints } from "@hyeboard/university-adapters/src/vnu/mapper";
-import { parseExamTermOptions, parseExamsHtml, parseGradesHtml, parseProfileHtml, parseStudyProgressHtml, parseSyllabusHtml } from "@hyeboard/university-adapters/src/vnu/parser";
+import { parseExamCatalogHtml, parseExamTermOptions, parseExamsHtml, parseGradesHtml, parsePointDetailHtml, parseProfileHtml, parseStudyProgressHtml, parseSyllabusHtml } from "@hyeboard/university-adapters/src/vnu/parser";
 import { createLinkedAbortController } from "./abort-deadline";
 import { canReauthenticateInline, requestInlineReauth } from "./reauth";
 import { readUetSessionStream } from "./uet-session-stream";
@@ -251,16 +252,66 @@ async function vnuGrades(): Promise<Grade[]> {
 }
 
 async function vnuExams(termCode?: string): Promise<ExamSession[]> {
-  const [profilePage, basePage] = await Promise.all([vnuRaw("profile"), vnuRaw("exam-base")]);
-  const profile = parseProfileHtml(profilePage.html);
-  if (!profile.internalStudentId || !profile.internalUnivId) throw new ApiError("daotao.vnu.edu.vn did not return enough profile data to look up exams.", "VNU_PROFILE_INCOMPLETE", 500);
+  const basePage = await vnuRaw("exam-base");
   const options = parseExamTermOptions(basePage.html);
   const option = termCode
     ? options.find((item) => item.label.startsWith(`${termCode}.`))
     : (options.find((item) => item.selected) ?? options[0]);
   if (!option) return [];
-  const page = await vnuRaw("exams", { selUniv: profile.internalUnivId, selStd: profile.internalStudentId, vTermID: option.value });
+  // selStd/selUniv are derived server-side from the session's own profile
+  // (same hardening as point-detail) — the client only chooses the term.
+  const page = await vnuRaw("exams", { vTermID: option.value });
   return parseExamsHtml(page.html).map(mapExamRow);
+}
+
+// Raw profile fetch for the Lookup page - needs the hidden internalStudentId
+// (hidStdID) and internalUnivId fields that the schema-typed Student (see
+// mapProfile) intentionally doesn't carry.
+async function vnuOwnProfile(): Promise<VnuProfile> {
+  return parseProfileHtml((await vnuRaw("profile")).html);
+}
+
+async function vnuClassCatalog(params: { vTermID: string }): Promise<VnuExamCatalogRow[]> {
+  const page = await vnuRaw("exams", params);
+  return parseExamCatalogHtml(page.html);
+}
+
+// Per-component grade breakdown for one of the student's OWN classes. The
+// worker derives StdID from the session server-side — there is intentionally
+// no stdId param here. val is omitted entirely: the popup footer only echoes
+// it back unvalidated, so sending nothing keeps displayTotalEcho absent
+// instead of surfacing a cosmetic number as if it were data.
+async function vnuPointDetail(params: { id: string; Term: string }): Promise<VnuPointDetail> {
+  const page = await vnuRaw("point-detail", params);
+  return parsePointDetailHtml(page.html);
+}
+
+export type VnuCrossStudentCode = { studentCode?: string; studentName?: string; className?: string; notice?: string };
+
+// Cross-student StdID -> student-code resolver (crossLookup capability, vnu
+// only). The dedicated worker route requires the explicit
+// allowCrossLookup=true flag (sent here as the client-side acknowledgement),
+// rejects self-targets, and never caches. The worker fetches the target
+// student's transcript page (listpoint_Brc1.asp — the only verified
+// student-role StdID -> identity source), parses the identity header itself,
+// and returns only the resolved fields — their raw transcript HTML (and the
+// grade table inside it) never reaches the client. A StdID that resolves to
+// no header yields an undefined studentCode, never a fabricated one.
+async function vnuCrossStudentCode(params: { stdId: string }): Promise<VnuCrossStudentCode> {
+  return request<VnuCrossStudentCode>(`/api/vnu/cross-lookup/student-code${queryString({ stdId: params.stdId, allowCrossLookup: "true" })}`);
+}
+
+export type VnuCrossStudentId = { stdId: string; stdCode: string; probes: number };
+
+// Cross-student student-code -> StdID resolver (crossLookup capability, vnu
+// only) — the reverse direction of vnuCrossStudentCode. The worker walks the
+// Brc1 oracle from the caller's own (StdID, code) anchor pair and returns
+// the zero-padded 11-digit internal id plus how many probes the walk took.
+// Same gating: explicit allowCrossLookup=true, self-target rejection, never
+// cached. An unresolvable code fails with VNU_CROSS_LOOKUP_NOT_CONVERGED
+// (surfaced as an inline empty state, not a session error).
+async function vnuCrossStudentId(params: { stdCode: string }): Promise<VnuCrossStudentId> {
+  return request<VnuCrossStudentId>(`/api/vnu/cross-lookup/student-id${queryString({ stdCode: params.stdCode, allowCrossLookup: "true" })}`);
 }
 
 async function vnuDocuments(): Promise<DocumentItem[]> {
@@ -285,6 +336,13 @@ export const api = {
   news: (universityId: string) => request<NewsItem[]>(`/api/${universityId}/news`),
   trainingPoints: (universityId: string) => universityId === "vnu" ? vnuTrainingPoints() : request<TrainingPoint[]>(`/api/${universityId}/training-points`),
   requests: (universityId: string) => request<ServiceRequest[]>(`/api/${universityId}/requests`),
+  // vnu (daotao)-only class-code -> internal-id lookup tool - see the
+  // classLookup capability flag, gated in the UI before these are called.
+  vnuOwnProfile: () => vnuOwnProfile(),
+  vnuClassCatalog: (params: { vTermID: string }) => vnuClassCatalog(params),
+  vnuPointDetail: (params: { id: string; Term: string }) => vnuPointDetail(params),
+  vnuCrossStudentCode: (params: { stdId: string }) => vnuCrossStudentCode(params),
+  vnuCrossStudentId: (params: { stdCode: string }) => vnuCrossStudentId(params),
   importSession: async (universityId: string, body: { studentCode?: string; studenthubGoogleCredential?: string; studenthubToken?: string; studenthubCookie?: string; canvasToken?: string; canvasCookie?: string; canvasCsrfToken?: string; vnuUsername?: string; vnuPassword?: string }) => {
     const data = await request<{ token: string; session?: { studentCode?: string } }>(`/api/${universityId}/auth/import-session`, { method: "POST", body: JSON.stringify(body) });
     upsertAccount(universityId, data.token, data.session?.studentCode);

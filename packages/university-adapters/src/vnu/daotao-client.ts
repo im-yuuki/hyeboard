@@ -76,4 +76,26 @@ export class DaotaoClient {
     const query = new URLSearchParams({ selViewType: "StdExam", selBK: "0", selTG: "0", ...params });
     return this.fetchPage(`/StdExamination/StdExamination.asp?${query.toString()}`);
   }
+
+  // ListPoint/listpoint_Brc1.asp?selStd=... — transcript page for a GIVEN
+  // student. Unlike StdExamination.asp (which silently ignores selStd — see
+  // har-notes.md), this endpoint HONORS selStd (live-verified): it renders
+  // that student's identity header and full transcript. It is the only
+  // verified student-role StdID -> identity oracle, and is only ever called
+  // from the gated cross-lookup worker routes. The stdId is zero-padded to
+  // the portal's 11-digit id shape here, server-side, so callers pass the
+  // plain numeric id.
+  getTranscriptByStdIdHtml(stdId: string): Promise<string> {
+    const query = new URLSearchParams({ selStd: stdId.padStart(11, "0") });
+    return this.fetchPage(`/ListPoint/listpoint_Brc1.asp?${query.toString()}`);
+  }
+
+  // ListPoint/detailPoint.asp — per-component grade breakdown popup. The
+  // stdId here must come from the session owner's own profile (server-side),
+  // never from a client query param; val is a cosmetic echo the portal
+  // renders into the footer without validating it (see har-notes.md).
+  getPointDetailHtml(params: { id: string; stdId: string; term: string; val?: string }): Promise<string> {
+    const query = new URLSearchParams({ id: params.id, val: params.val ?? "", StdID: params.stdId, Term: params.term });
+    return this.fetchPage(`/ListPoint/detailPoint.asp?${query.toString()}`);
+  }
 }

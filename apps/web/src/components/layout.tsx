@@ -1,6 +1,6 @@
 import type { Notification } from "@hyeboard/schemas";
 import { Link, Outlet, useNavigate } from "@tanstack/react-router";
-import { Award, Bell, BookOpen, CalendarDays, Check, ClipboardCheck, Files, GraduationCap, LayoutDashboard, ListChecks, LogOut, Menu, PanelLeftClose, PanelLeftOpen, Search, Settings, UserRound, WalletCards, X } from "lucide-react";
+import { Award, Bell, BookOpen, CalendarDays, Check, ClipboardCheck, Files, GraduationCap, Hash, LayoutDashboard, ListChecks, LogOut, Menu, PanelLeftClose, PanelLeftOpen, Search, Settings, UserRound, WalletCards, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
@@ -12,8 +12,8 @@ import { type Translations, useLocale } from "@/lib/i18n";
 import { cn, formatDateTime } from "@/lib/utils";
 import { useHyeboard } from "@/state";
 
-type NavCapability = "timetable" | "courses" | "assignments" | "grades" | "exams" | "tuition" | "documentsHub" | "trainingPoints";
-type NavKey = "dashboard" | "timetable" | "courses" | "assignments" | "grades" | "exams" | "tuition" | "documents" | "trainingPoints" | "settings";
+type NavCapability = "timetable" | "courses" | "assignments" | "grades" | "exams" | "tuition" | "documentsHub" | "trainingPoints" | "classLookup";
+type NavKey = "dashboard" | "timetable" | "courses" | "assignments" | "grades" | "exams" | "tuition" | "documents" | "trainingPoints" | "lookup" | "settings";
 type NavGroupKey = "overview" | "study" | "services" | "system";
 type NavItem = { key: NavKey; to: string; icon: typeof LayoutDashboard; capability?: NavCapability };
 type NavGroup = { key: NavGroupKey; items: NavItem[] };
@@ -36,6 +36,7 @@ const navGroups: NavGroup[] = [
       { key: "tuition", to: "/tuition", icon: WalletCards, capability: "tuition" },
       { key: "documents", to: "/documents", icon: Files, capability: "documentsHub" },
       { key: "trainingPoints", to: "/training-points", icon: Award, capability: "trainingPoints" },
+      { key: "lookup", to: "/lookup", icon: Hash, capability: "classLookup" },
     ],
   },
   { key: "system", items: [{ key: "settings", to: "/settings", icon: Settings }] },

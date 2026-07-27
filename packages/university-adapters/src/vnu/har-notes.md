@@ -53,6 +53,100 @@ from UET's StudentHub/Canvas. Session model is classic ASP cookie auth, not bear
 
 ## Capability summary
 
-`profile`, `terms`, `grades`, `exams`, `trainingPoints`, `documents` (syllabus) are supported.
-`timetable`, `courses`, `assignments`, `attendance`, `notifications`, `tuition`, `news`,
+`profile`, `terms`, `grades`, `exams`, `trainingPoints`, `documents` (syllabus), `classLookup`, and
+`crossLookup` (transcript-header identity resolution, both directions, gated — see below) are
+supported. `timetable`, `courses`, `assignments`, `attendance`, `notifications`, `tuition`, `news`,
 `requests` are not — no verified real data source exists for them on this portal.
+
+## Class-code -> internal-id lookup (classLookup capability)
+
+- The `StdExamination.asp?selViewType=StdExam&vTermID=...` rows already read for `exams` also carry
+  a hidden `hidCrdID` input in the first `<td>` (STT column) holding the portal's internal 6-digit
+  class id — not exposed anywhere else. Each row's second `<td>` renders as
+  `"{maHK}-{courseCode} {classNo}"` (e.g. `252-PHI1002 6`), but classNo's own shape isn't
+  consistent: plain digits (`6`, `15`, `71`), dash-suffixed zero-padded (`241-FLF1107-01`), and
+  alphanumeric group codes (`THL1057 CN7`) have all been observed. `parseExamCatalogHtml` in
+  parser.ts treats `hidCrdID`'s presence as the row-detection signal (real data rows only) rather
+  than depending on any `<tr>` attribute, and falls back to trusting the raw remainder text as
+  classNo instead of re-validating its shape once the `maHK-courseCode` prefix is recognized.
+  `parseExamCatalogHtml` also captures the same session/hour/method/room/seat columns
+  `parseExamsHtml` does (same `<tr>`s, same column order) — a class resolved by internal id (the
+  reverse-lookup direction) shows identical detail to the forward exam-schedule view.
+- `TabStdSelf.asp` (already scraped for `profile`) exposes both the student's real student code
+  (`StdCode` input) and their internal student id (`hidStdID` hidden input) in the same response —
+  no separate endpoint needed for the "your own identifiers" half of this feature.
+- The `vTermID` <-> `maHK` <-> academic-year mapping has no endpoint of its own (the exam page's own
+  `selTermID` `<select>` only lists terms the *current* student already has exam rows for, not the
+  full historical range), so it's captured as a static, hand-verified table in exam-terms.ts instead
+  of being scraped. Ordinals are assigned per session slot chronologically, not arithmetically from
+  maHK — years from 2020-2021 onward have an extra "HK2" session (maHK ending in 3, still labeled
+  Học kỳ 2 for display) that consumes the next ordinal rather than leaving a gap.
+- Not implemented (explicitly out of scope, pending live verification): drilling into a resolved
+  class id for its own detail page. Cross-student identity resolution is now implemented — see the
+  cross-student lookup section below.
+
+## Point-detail drilldown (classLookup extension, live-verified)
+
+- `GET /ListPoint/detailPoint.asp?id={classId}&val={grade10}&StdID={stdId}&Term={ordinal}` returns a
+  per-component grade breakdown popup for one class. Header line:
+  "Điểm chi tiết môn học — Học kỳ N năm học YYYY-YYYY. Mã học kỳ ZZZ". Columns:
+  STT | Bản chất kỳ thi (exam nature, e.g. "Thi cuối kỳ" / "Giữa kỳ") | TS (weight, e.g. 0.6/0.4) |
+  Lần thi (attempt) | Điểm (score) | Ghi chú (notes, usually empty). One row per exam component.
+- The "Tổng điểm" footer is cosmetic only: it echoes the request's `val=` param back verbatim, with
+  no server-side validation or recomputation (verified by reloading with two different `val` values —
+  components identical, footer flipped). The authoritative total must come from
+  `listpoint_Brc1.asp`'s "Điểm hệ 10 cuối cùng" column. Parsers expose the footer only as
+  `displayTotalEcho`, never as a total/grade.
+
+## Cross-student lookup (crossLookup capability, live-verified)
+
+Live re-probing (authenticated session) CORRECTED earlier notes on this surface:
+
+- `StdExamination.asp?...&selStd={foreignStdId}` SILENTLY IGNORES `selStd` — it always renders the
+  SESSION OWNER's code/name/data. The earlier claim that it was a cross-student source (an IDOR)
+  was wrong: it is a self-echo, never an IDOR. The old cross-lookup exam-schedule route built on
+  that assumption was removed (it returned the caller's own data for any target StdID — a silent
+  self-echo bug), and no `vTermID` is needed by any cross-lookup route anymore.
+- `GET /ListPoint/listpoint_Brc1.asp?selStd={stdId}` (stdId zero-padded to 11 digits, e.g.
+  `00000020000`) HONORS `selStd` — it renders THAT student's transcript page. Verified live with
+  two foreign StdIDs plus the no-param self case. This is the ONLY verified student-role
+  StdID -> identity source, and simultaneously the worst IDOR on the portal: the response contains
+  the target's FULL transcript, not just the header. Hyeboard therefore never forwards this HTML —
+  the worker parses the identity header server-side and only the resolved fields cross the wire.
+- Brc1 identity header shape (verbatim, three adjacent header cells):
+  `Sinh viên: {full name}` | `Mã số: {8-digit code}` | `Lớp quản lý: {managing class, e.g. QH-20XX-I/CQ-I-XXX0}`.
+  `parseTranscriptHeader` in parser.ts extracts all three, failing closed to `{}` when the
+  `Mã số:` label is absent (invalid StdID / portal notice page).
+- `detailPoint.asp?StdID=` cross-student behavior remains as previously verified (unchanged; still
+  not exposed by Hyeboard).
+
+### Anchor/drift model (StdID <-> student code)
+
+- Three anchor pairs were verified live within one cohort (values withheld — real student
+  identifiers). Codes and StdIDs run near-parallel within a cohort, drifting roughly ±2 per 60
+  IDs; offset-only mapping is therefore unreliable, which motivates the oracle-walk design.
+- No portal endpoint maps a public code back to an internal StdID, so
+  `GET /api/vnu/cross-lookup/student-id` walks the Brc1 oracle server-side: anchor = the caller's
+  OWN (StdID, code) pair from their profile; first guess = `ownStdId + (targetCode - ownCode)`;
+  each probe corrects by the observed delta (`guess += targetCode - headerCode`). Caps: max 8
+  probes, a single corrective step > 5000 aborts (target outside the caller's cohort), revisiting
+  a guess aborts (oscillation), and a header-less probe (invalid StdID) aborts immediately — all
+  as `VNU_CROSS_LOOKUP_NOT_CONVERGED` (404). Probes are spaced ~250ms apart to be polite. A
+  resolved id is returned zero-padded to the portal's 11-digit shape with the probe count.
+- Both cross-lookup routes are gated identically: session guard, vnu-only, the literal
+  `allowCrossLookup=true` opt-in (400 otherwise), own-profile-derived self-target rejection (400),
+  and never cached. The wire shapes are `{ studentCode?, studentName?, className?, notice? }`
+  (StdID -> code) and `{ stdId, stdCode, probes }` (code -> StdID).
+
+## Raw-proxy hardening (worker-side)
+
+Because `listpoint_Brc1.asp` provably does not session-bind `selStd` (and `detailPoint.asp` does
+not bind `StdID`), the worker's self-scoped `/api/vnu/raw/:page` proxy never honors
+client-supplied `selStd`/`selUniv` for any key. For `exams` (and `point-detail` before it) both
+ids are derived server-side from the session owner's own `TabStdSelf.asp` profile (`hidStdID` /
+selected `UnivID`), the request fails closed with a 401 when the profile cannot provide them, and
+the client params are stripped before cache keying so a smuggled value cannot even fragment cache
+entries. The frontend therefore sends only `vTermID` (a term selector, not a per-student id).
+Cross-student access remains available exclusively through the dedicated, explicitly gated
+`/api/vnu/cross-lookup/*` routes above — the raw proxy can no longer be turned into an ungated
+version of the same IDOR.

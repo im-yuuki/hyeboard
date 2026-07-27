@@ -28,6 +28,18 @@ const university: University = {
     news: false,
     trainingPoints: true,
     requests: false,
+    // StdExamination.asp's hidCrdID rows + TabStdSelf.asp's hidStdID are both
+    // verified vnu-only shapes (see har-notes.md) — this is the only adapter
+    // that can honestly claim the class-lookup tool.
+    classLookup: true,
+    // Live-verified: cross-student lookup is backed by
+    // ListPoint/listpoint_Brc1.asp?selStd=..., which DOES honor arbitrary
+    // StdIDs (it renders the requested student's identity header) — unlike
+    // StdExamination.asp, which silently IGNORES selStd and always renders
+    // the session owner (see har-notes.md). This deployment is authorized
+    // to expose that behavior, gated server-side behind an explicit opt-in
+    // flag — honest here, false in mock/uet.
+    crossLookup: true,
   },
 };
 

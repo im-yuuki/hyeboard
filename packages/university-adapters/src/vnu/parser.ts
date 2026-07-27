@@ -5,13 +5,17 @@
 // structures these patterns were derived from.
 
 import type {
+  VnuExamCatalogRow,
   VnuExamRow,
   VnuExamTermOption,
   VnuGradeRow,
   VnuGradesResult,
+  VnuPointDetail,
+  VnuPointDetailComponent,
   VnuProfile,
   VnuSyllabusRow,
   VnuTermProgressRow,
+  VnuTranscriptHeader,
 } from "./types";
 
 function decodeEntities(text: string): string {
@@ -191,11 +195,78 @@ export function parseExamsHtml(html: string): VnuExamRow[] {
     const cells = tdCells(match[1]);
     if (cells.length < 8) continue;
     const examCode = (cells[1] ?? "").trim();
-    const codeMatch = examCode.match(/^(\d+)-([A-Za-zĐ]{2,6}\d{3,4})/);
+    // Groups 1-2 (maHK + course code) are byte-identical to the pattern this
+    // parser shipped with — the optional third group only skims the class
+    // number off the remainder (e.g. "252-PHI1002 6" -> "6") without changing
+    // how the course code itself was already being captured.
+    const codeMatch = examCode.match(/^(\d+)-([A-Za-zĐ]{2,6}\d{3,4})(?:[\s-]+(.*))?/);
     const sessionMatch = cells[4]?.match(/(\d+)\(([\d:]+)\)/);
     rows.push({
       termCode: codeMatch?.[1],
       courseCode: codeMatch?.[2] ?? examCode,
+      classNo: codeMatch?.[3]?.trim() || undefined,
+      courseName: (cells[2] ?? "").trim(),
+      examDate: (cells[3] ?? "").trim(),
+      session: sessionMatch ? Number.parseInt(sessionMatch[1], 10) : undefined,
+      hour: sessionMatch?.[2],
+      method: cells[5]?.trim() || undefined,
+      room: cells[6]?.trim() || undefined,
+      seatNumber: cells[7]?.trim() || undefined,
+    });
+  }
+  return rows;
+}
+
+// Splits the exam-schedule "Mã KT" cell (e.g. "252-PHI1002 6",
+// "241-FLF1107-01", "252-THL1057 CN7") into its maHK/course-code/class-number
+// parts. classNo has no single consistent shape across courses (plain
+// digits, zero-padded, or alphanumeric group codes), so once the maHK and
+// course-code prefix are recognized, whatever text remains is trusted as the
+// class number as-is rather than re-validated against a stricter pattern.
+function parseCatalogCode(raw: string): { termCode?: string; courseCode: string; classNo?: string } {
+  const strict = raw.match(/^(\d{3})-([A-Za-zĐ]{2,6}\d{3,4}[A-Za-zĐ]?)[\s-]+(.*)$/);
+  if (strict) {
+    const [, termCode, courseCode, rest] = strict;
+    return { termCode, courseCode, classNo: rest.trim() || undefined };
+  }
+  // Fallback for shapes that don't fit the common pattern: still split off a
+  // recognizable "NNN-" term prefix if present, and never throw on an odd row.
+  const loose = raw.match(/^(\d{3})-(.+)$/);
+  if (loose) {
+    const [, termCode, rest] = loose;
+    return { termCode, courseCode: rest.trim() };
+  }
+  return { courseCode: raw };
+}
+
+// StdExamination.asp?selViewType=StdExam&vTermID=... data rows, read for the
+// class-code -> internal-id resolver. Parsed separately from parseExamsHtml
+// because this also reads the row's hidden hidCrdID input — the portal's
+// internal 6-digit class id, not surfaced by any other page — though it
+// captures the same descriptive columns (session/hour/method/room/seat) so a
+// class resolved by internal id carries the same display detail as the
+// forward exam-schedule view. A row is only treated as real data when
+// hidCrdID is present, which naturally skips header rows and renders an
+// empty/invalid vTermID (or a term with no exam entries at all) as an empty
+// list rather than a parse error.
+export function parseExamCatalogHtml(html: string): VnuExamCatalogRow[] {
+  const rows: VnuExamCatalogRow[] = [];
+  const trRe = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
+  let match: RegExpExecArray | null;
+  while ((match = trRe.exec(html))) {
+    const rowHtml = match[1];
+    const classId = inputValue(rowHtml, "hidCrdID");
+    if (!classId) continue;
+    const cells = tdCells(rowHtml);
+    if (cells.length < 8) continue;
+    const { termCode, courseCode, classNo } = parseCatalogCode((cells[1] ?? "").trim());
+    if (!courseCode) continue;
+    const sessionMatch = cells[4]?.match(/(\d+)\(([\d:]+)\)/);
+    rows.push({
+      classId,
+      termCode,
+      courseCode,
+      classNo,
       courseName: (cells[2] ?? "").trim(),
       examDate: (cells[3] ?? "").trim(),
       session: sessionMatch ? Number.parseInt(sessionMatch[1], 10) : undefined,
@@ -236,6 +307,89 @@ export function parseSyllabusHtml(html: string): VnuSyllabusRow[] {
     });
   }
   return rows;
+}
+
+// ListPoint/detailPoint.asp?id=...&val=...&StdID=...&Term=... — per-component
+// grade breakdown popup (live-verified shape, see har-notes.md). Rows carry
+// STT | Bản chất kỳ thi | TS | Lần thi | Điểm | Ghi chú. The trailing
+// "Tổng điểm" row is parsed into displayTotalEcho — it merely echoes the
+// request's val= param back (verified live) and is never a computed total.
+export function parsePointDetailHtml(html: string): VnuPointDetail {
+  const plain = stripTags(html);
+  const headerMatch = plain.match(/Điểm chi tiết môn học.*?Mã học kỳ\s*[0-9A-Za-z]+/i);
+  const termCodeMatch = plain.match(/Mã học kỳ\s*([0-9A-Za-z]+)/i);
+  const components: VnuPointDetailComponent[] = [];
+  let displayTotalEcho: string | undefined;
+  const trRe = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
+  let match: RegExpExecArray | null;
+  while ((match = trRe.exec(html))) {
+    const cells = tdCells(match[1]);
+    if (!cells.length) continue;
+    const joined = cells.join(" ");
+    if (/Tổng điểm/i.test(joined)) {
+      displayTotalEcho = joined.match(/Tổng điểm\s*[:\-]?\s*([\d.,]+)/i)?.[1]?.trim() || undefined;
+      continue;
+    }
+    // Header rows render their column titles as text ("STT", ...), so a
+    // numeric first cell is what distinguishes a real component row.
+    if (cells.length < 5 || !/^\d+$/.test(cells[0] ?? "")) continue;
+    const weight = Number.parseFloat(cells[2] ?? "");
+    const attempt = Number.parseFloat(cells[3] ?? "");
+    const score = Number.parseFloat(cells[4] ?? "");
+    components.push({
+      index: Number.parseInt(cells[0] ?? "0", 10),
+      nature: (cells[1] ?? "").trim(),
+      weight: Number.isFinite(weight) ? weight : undefined,
+      attempt: Number.isFinite(attempt) ? attempt : undefined,
+      score: Number.isFinite(score) ? score : undefined,
+      notes: cells[5]?.trim() || undefined,
+    });
+  }
+  return { headerLabel: headerMatch?.[0], termCode: termCodeMatch?.[1], components, displayTotalEcho };
+}
+
+// ListPoint/listpoint_Brc1.asp?selStd=... page header — the requested
+// student's identity line, rendered for whatever selStd is passed (the ONLY
+// live-verified student-role StdID -> identity oracle, see har-notes.md). The
+// verbatim header shape is three adjacent cells:
+//   Sinh viên: {name}  |  Mã số: {8-digit code}  |  Lớp quản lý: {class}
+// Fail-closed: an invalid/unknown StdID renders no header, so an absent
+// "Mã số:" label yields an empty result and callers must surface a not-found
+// state — never a made-up code.
+export function parseTranscriptHeader(html: string): VnuTranscriptHeader {
+  const plain = stripTags(html);
+  const codeMatch = plain.match(/Mã\s+số\s*:\s*(\d{8})/i);
+  if (!codeMatch) return {};
+  // The name sits between the two neighboring labels in the same header row.
+  const nameMatch = plain.match(/Sinh\s+viên\s*:\s*(.+?)(?=\s+Mã\s+số\s*:)/i);
+  // The class code is a single whitespace-free token (e.g. "QH-20XX-I/CQ-I-XXX0").
+  const classMatch = plain.match(/Lớp\s+quản\s+lý\s*:\s*(\S+)/i);
+  return {
+    studentCode: codeMatch[1],
+    studentName: nameMatch?.[1]?.trim() || undefined,
+    className: classMatch?.[1]?.trim() || undefined,
+  };
+}
+
+// Best-effort extraction of a human-readable portal notice (validation/error
+// message). Classic ASP pages surface these as alert() scripts, red <font>
+// text, or inline Vietnamese "không ..." phrases rather than an HTTP error —
+// e.g. StdExamination.asp renders one when the requested StdID doesn't exist.
+// Returns undefined when no notice is found; callers fall back to their own
+// empty state in that case rather than inventing a message.
+export function parsePortalNotice(html: string): string | undefined {
+  const alertMatch = html.match(/alert\s*\(\s*['"]([^'"]+)['"]\s*\)/i);
+  if (alertMatch?.[1]?.trim()) return decodeEntities(alertMatch[1]);
+  const fontRe = /<font\b([^>]*)>([\s\S]*?)<\/font>/gi;
+  let fontMatch: RegExpExecArray | null;
+  while ((fontMatch = fontRe.exec(html))) {
+    if (!/color\s*=\s*"?#?(?:red|ff0000|c00000)/i.test(fontMatch[1] ?? "")) continue;
+    const text = stripTags(fontMatch[2] ?? "");
+    if (text) return text;
+  }
+  const plain = stripTags(html);
+  const phraseMatch = plain.match(/không\s+(?:tìm\s+thấy|tồn\s+tại)[^.]{0,120}/i);
+  return phraseMatch?.[0].trim() || undefined;
 }
 
 export function hasLoginForm(html: string): boolean {

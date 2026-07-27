@@ -27,6 +27,11 @@ const university: University = {
     news: true,
     trainingPoints: true,
     requests: true,
+    // vnu (daotao)-only tool — StudentHub/Canvas have no equivalent verified shape.
+    classLookup: false,
+    // StudentHub/Canvas session-bind their ids server-side; no verified
+    // cross-student exposure exists to claim here.
+    crossLookup: false,
   },
 };
 
