@@ -581,8 +581,3 @@ export function isDaotaoSessionExpired(finalUrl: string, html: string): boolean 
   if (hasCompleteLoginForm(html)) return true;
   return hasStandaloneSessionEndedNotice(html);
 }
-
-// Deprecated compatibility wrapper; Task 2 removes it when daotao-client migrates.
-export function hasLoginForm(html: string): boolean {
-  return hasCompleteLoginForm(html);
-}
