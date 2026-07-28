@@ -11,6 +11,7 @@ import {
   encryptSession,
   encryptVnuRefreshGrant,
   rotateVnuRefreshGrant,
+  VNU_REFRESH_GRANT_MAX_LENGTH,
   type EncryptedSessionPayload,
   type VnuRefreshAccessDescriptor,
 } from "./index";
@@ -68,6 +69,31 @@ async function encryptRawAccessFixture(payload: unknown): Promise<string> {
 
 function deterministicBytes(value: number): (length: number) => Uint8Array {
   return (length) => new Uint8Array(length).fill(value);
+}
+
+function boundaryGrant(password: string) {
+  return createVnuRefreshGrant({
+    username: "synthetic-boundary-user",
+    password,
+    expectedStudentCode: "SYNTHETIC-BOUNDARY-STUDENT",
+    now: NOW,
+    randomBytes: deterministicBytes(0x41),
+  });
+}
+
+function largestAcceptedAsciiPasswordLength(): number {
+  let low = 1;
+  let high = VNU_REFRESH_GRANT_MAX_LENGTH;
+  while (low < high) {
+    const candidate = Math.ceil((low + high) / 2);
+    try {
+      boundaryGrant("P".repeat(candidate));
+      low = candidate;
+    } catch {
+      high = candidate - 1;
+    }
+  }
+  return low;
 }
 
 function vnuSession(vnuRefresh?: VnuRefreshAccessDescriptor): EncryptedSessionPayload {
@@ -145,6 +171,38 @@ describe("encryptSession / decryptSession", () => {
 });
 
 describe("VNU refresh grants", () => {
+  it("bounds producer grants at the largest encoded token that can roundtrip", async () => {
+    const largestPasswordLength = largestAcceptedAsciiPasswordLength();
+    const grant = boundaryGrant("P".repeat(largestPasswordLength));
+    const token = await encryptVnuRefreshGrant(grant, SECRET);
+    expect(token.length).toBeLessThanOrEqual(VNU_REFRESH_GRANT_MAX_LENGTH);
+    await expect(decryptVnuRefreshGrant(token, SECRET, NOW + 1)).resolves.toEqual(grant);
+
+    expect(() => boundaryGrant("P".repeat(largestPasswordLength + 1))).toThrow(expect.objectContaining({
+      code: "VNU_REFRESH_GRANT_TOO_LARGE",
+      status: 400,
+      details: undefined,
+    }));
+  });
+
+  it("measures producer feasibility in UTF-8 bytes without exposing Unicode credentials", () => {
+    const largestPasswordLength = largestAcceptedAsciiPasswordLength();
+    expect(() => boundaryGrant("P".repeat(largestPasswordLength))).not.toThrow();
+    const privateUnicode = "秘密".repeat(Math.ceil(largestPasswordLength / 2));
+    try {
+      boundaryGrant(privateUnicode);
+      throw new Error("Expected Unicode grant to exceed the encoded limit");
+    } catch (error) {
+      expect(error).toMatchObject({
+        code: "VNU_REFRESH_GRANT_TOO_LARGE",
+        message: "The VNU reconnect credentials are too large to store safely.",
+        status: 400,
+        details: undefined,
+      });
+      expect(String(error)).not.toContain(privateUnicode.slice(0, 16));
+    }
+  });
+
   it("round trips an exact purpose-bound eight-hour payload", async () => {
     const { grant } = await linkedArtifacts();
     const token = await encryptVnuRefreshGrant(grant, SECRET);

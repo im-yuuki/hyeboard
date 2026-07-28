@@ -261,6 +261,33 @@ describe("real Durable Object persistence matrix", () => {
     expect(await authority.revokeLinkedPairByAccess(principal, { ...pair, accessTokenId: "Z".repeat(22), accessExpiresAt: NOW + 2 })).toBe("mismatch");
   });
 
+  it("keeps next active while an exact old live grant proves logout after access tombstone cleanup", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(NOW - 1);
+    const principal = "d1".repeat(32);
+    const old = { ...OLD, accessExpiresAt: NOW };
+    const stub = env.VNU_REFRESH_CONTROL.getByName(principal);
+    await instrument(stub);
+    const authority = coordinator();
+    await authority.activatePair(principal, old);
+    await authority.beginRefresh(principal, old);
+    vi.setSystemTime(NOW);
+    await authority.completeRefresh(principal, { old, next: NEXT });
+    vi.setSystemTime(NOW + 1);
+    await runInDurableObject(stub, async (instance) => instance.alarm());
+    const cleaned = await snapshot(stub); await counters(stub, true);
+    expect(cleaned.bytes).not.toContain(old.accessTokenId);
+    expect(cleaned.bytes).toContain(old.grantId);
+    expect(await authority.revokeLinkedPairByAccess(principal, old)).toBe("revoked");
+    expect(await counters(stub, true)).toEqual({ get: 0, transaction: 1, put: 0, deleteState: 0, setAlarm: 0, deleteAlarm: 0 });
+    expect(await snapshot(stub)).toEqual(cleaned);
+    for (const wrong of [{ ...old, grantId: "Z".repeat(22) }, { ...old, grantExpiresAt: old.grantExpiresAt + 1 }]) {
+      expect(await authority.revokeLinkedPairByAccess(principal, wrong)).toBe("mismatch");
+      expect(await counters(stub, true)).toEqual({ get: 0, transaction: 1, put: 0, deleteState: 0, setAlarm: 0, deleteAlarm: 0 });
+      expect(await snapshot(stub)).toEqual(cleaned);
+    }
+    expect(await authority.checkAccess(principal, NEXT)).toEqual({ kind: "active" });
+  });
+
   it("unrelated live grants cannot retain an expired access tombstone", async () => {
     vi.useFakeTimers(); vi.setSystemTime(NOW + 1);
     const principal = "cd".repeat(32);
@@ -370,7 +397,7 @@ describe("entered-operation races", () => {
     expect(stored).toMatchObject({ active: OLD });
   });
 
-  it("logout-before-complete beats late completion; completed-first rejects old logout", async () => {
+  it("logout-before-complete beats late completion; completed-first accepts exact old logout idempotently", async () => {
     vi.useFakeTimers(); vi.setSystemTime(NOW);
     const firstPrincipal = "f".repeat(64);
     const first = env.VNU_REFRESH_CONTROL.getByName(firstPrincipal);
@@ -381,8 +408,36 @@ describe("entered-operation races", () => {
     const secondPrincipal = "1".repeat(64);
     await auth.activatePair(secondPrincipal, OLD); await auth.beginRefresh(secondPrincipal, OLD);
     expect(await auth.completeRefresh(secondPrincipal, { old: OLD, next: NEXT })).toBe("completed");
-    expect(await auth.revokeLinkedPairByAccess(secondPrincipal, OLD)).toBe("mismatch");
+    const second = env.VNU_REFRESH_CONTROL.getByName(secondPrincipal);
+    await instrument(second);
+    const before = await snapshot(second); await counters(second, true);
+    expect(await auth.revokeLinkedPairByAccess(secondPrincipal, OLD)).toBe("revoked");
+    expect(await counters(second)).toEqual({ get: 0, transaction: 1, put: 0, deleteState: 0, setAlarm: 0, deleteAlarm: 0 });
+    expect(await snapshot(second)).toEqual(before);
+    for (const wrong of [{ ...OLD, accessExpiresAt: OLD.accessExpiresAt + 1 }, { ...OLD, grantId: "Z".repeat(22) }]) {
+      await counters(second, true);
+      expect(await auth.revokeLinkedPairByAccess(secondPrincipal, wrong)).toBe("mismatch");
+      expect(await counters(second)).toEqual({ get: 0, transaction: 1, put: 0, deleteState: 0, setAlarm: 0, deleteAlarm: 0 });
+      expect(await snapshot(second)).toEqual(before);
+    }
     expect(await auth.checkAccess(secondPrincipal, NEXT)).toEqual({ kind: "active" });
+
+    const partialPrincipal = "12".repeat(32);
+    const partial = env.VNU_REFRESH_CONTROL.getByName(partialPrincipal);
+    await runInDurableObject(partial, async (_instance, context) => {
+      await context.storage.put(VNU_REFRESH_STATE_KEY, {
+        active: NEXT,
+        revokedAccess: { [OLD.accessTokenId]: OLD.accessExpiresAt },
+        revokedGrants: {},
+        window: { count: 1, resetAt: NOW + VNU_REFRESH_WINDOW_MS },
+      });
+      await context.storage.setAlarm(OLD.accessExpiresAt);
+    });
+    await instrument(partial);
+    const partialBefore = await snapshot(partial);
+    expect(await auth.revokeLinkedPairByAccess(partialPrincipal, OLD)).toBe("mismatch");
+    expect(await counters(partial)).toEqual({ get: 0, transaction: 1, put: 0, deleteState: 0, setAlarm: 0, deleteAlarm: 0 });
+    expect(await snapshot(partial)).toEqual(partialBefore);
     expect(first).toBeDefined();
   });
 
@@ -397,7 +452,7 @@ describe("entered-operation races", () => {
     const logout = auth.revokeLinkedPairByAccess(principal, OLD);
     await release();
     const [completeResult, logoutResult] = await Promise.all([completion, logout]);
-    expect([["completed", "mismatch"], ["revoked", "revoked"]]).toContainEqual([completeResult, logoutResult]);
+    expect([["completed", "revoked"], ["revoked", "revoked"]]).toContainEqual([completeResult, logoutResult]);
     const state = await runInDurableObject(stub, async (_instance, context) => context.storage.get(VNU_REFRESH_STATE_KEY));
     const serialized = JSON.stringify(state);
     expect(serialized.includes(OLD.accessTokenId) && serialized.includes(NEXT.grantId) && !serialized.includes(NEXT.accessTokenId)).toBe(false);

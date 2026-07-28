@@ -36,6 +36,8 @@ export type VnuRefreshGrantPayload = {
   expiresAt: string;
 };
 
+export const VNU_REFRESH_GRANT_MAX_LENGTH = 8_192;
+
 export type VnuRefreshAccessDescriptor = {
   version: 1;
   purpose: "vnu-refresh-access";
@@ -194,6 +196,10 @@ function invalidVnuRefreshGrant(): HyeboardError {
   return new HyeboardError("VNU_REFRESH_GRANT_INVALID", "The VNU reconnect grant is invalid or expired.", 401);
 }
 
+function oversizedVnuRefreshGrant(): HyeboardError {
+  return new HyeboardError("VNU_REFRESH_GRANT_TOO_LARGE", "The VNU reconnect credentials are too large to store safely.", 400);
+}
+
 function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -222,6 +228,13 @@ function isBase64Url128(value: unknown): value is string {
   if (typeof value !== "string" || !BASE64URL_128_PATTERN.test(value)) return false;
   const bytes = fromBase64Url(value);
   return bytes.byteLength === 16 && toBase64Url(bytes) === value;
+}
+
+function encodedVnuRefreshGrantLength(payload: VnuRefreshGrantPayload): number {
+  const plaintextBytes = textEncoder.encode(JSON.stringify(payload)).byteLength;
+  const encryptedBytes = plaintextBytes + 16;
+  const ivAndSeparatorLength = 17;
+  return ivAndSeparatorLength + Math.ceil((encryptedBytes * 4) / 3);
 }
 
 function encodeHex(bytes: Uint8Array): string {
@@ -258,6 +271,7 @@ function assertVnuRefreshGrantPayload(value: unknown): asserts value is VnuRefre
   const issuedAt = parseCanonicalIso(value.issuedAt);
   const expiresAt = parseCanonicalIso(value.expiresAt);
   if (issuedAt === null || expiresAt === null || expiresAt - issuedAt !== VNU_REFRESH_LIFETIME_MS) throw invalidVnuRefreshGrant();
+  if (encodedVnuRefreshGrantLength(value as VnuRefreshGrantPayload) > VNU_REFRESH_GRANT_MAX_LENGTH) throw oversizedVnuRefreshGrant();
 }
 
 export function assertVnuRefreshAccessDescriptor(value: unknown): asserts value is VnuRefreshAccessDescriptor {
@@ -403,7 +417,9 @@ export async function encryptVnuRefreshGrant(payload: VnuRefreshGrantPayload, se
     key,
     toArrayBuffer(encoded),
   );
-  return `${toBase64Url(iv)}.${toBase64Url(new Uint8Array(encrypted))}`;
+  const token = `${toBase64Url(iv)}.${toBase64Url(new Uint8Array(encrypted))}`;
+  if (token.length > VNU_REFRESH_GRANT_MAX_LENGTH) throw oversizedVnuRefreshGrant();
+  return token;
 }
 
 export async function decryptVnuRefreshGrant(token: string, secret: string, now = Date.now()): Promise<VnuRefreshGrantPayload> {

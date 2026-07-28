@@ -1,6 +1,7 @@
 import { HyeboardError } from "@hyeboard/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DaotaoClient } from "./daotao-client";
+import { createVnuAdapter } from "./adapter";
 import { standaloneSessionEndedNoticeHtml } from "./session-expiry-fixtures";
 
 const AUTHENTICATED_URL = "https://daotao.vnu.edu.vn/StdInfo/TabStdSelf.asp";
@@ -113,6 +114,49 @@ describe("DaotaoClient cancellation", () => {
   });
 
   afterEach(() => vi.unstubAllGlobals());
+
+  it("passes the signal to login and preserves its exact fetch cancellation reason", async () => {
+    const controller = new AbortController();
+    const reason = { cancelled: "login-fetch" };
+    fetchMock.mockImplementationOnce(async (_input, init) => {
+      expect(init?.signal).toBe(controller.signal);
+      controller.abort(reason);
+      throw new TypeError("PRIVATE_LOGIN_ABORT_PROSE");
+    });
+
+    await expect(new DaotaoClient().login("synthetic-user", "synthetic-password", controller.signal)).rejects.toBe(reason);
+  });
+
+  it("passes the signal through profile body consumption and preserves cancellation", async () => {
+    const controller = new AbortController();
+    const reason = { cancelled: "profile-body" };
+    const response = responseWithFinalUrl("");
+    vi.spyOn(response, "text").mockImplementation(async () => {
+      controller.abort(reason);
+      throw new TypeError("PRIVATE_PROFILE_BODY_ABORT_PROSE");
+    });
+    fetchMock.mockImplementationOnce(async (_input, init) => {
+      expect(init?.signal).toBe(controller.signal);
+      return response;
+    });
+
+    await expect(new DaotaoClient().getProfileHtml(controller.signal)).rejects.toBe(reason);
+  });
+
+  it("forwards the import signal through login and profile verification", async () => {
+    const controller = new AbortController();
+    const loginResponse = new Response("", { status: 302, headers: { "Set-Cookie": "SYNTHETIC_SESSION=VALUE; Path=/" } });
+    const profileResponse = responseWithFinalUrl(`<input name="StdCode" value="${SYNTHETIC_STUDENT_CODE}">`);
+    fetchMock
+      .mockImplementationOnce(async (_input, init) => { expect(init?.signal).toBe(controller.signal); return loginResponse; })
+      .mockImplementationOnce(async (_input, init) => { expect(init?.signal).toBe(controller.signal); return profileResponse; });
+
+    await expect(createVnuAdapter().importSession({
+      vnuUsername: "synthetic-user",
+      vnuPassword: "synthetic-password",
+      signal: controller.signal,
+    })).resolves.toMatchObject({ universityId: "vnu", studentCode: SYNTHETIC_STUDENT_CODE });
+  });
 
   it("passes a signal to the Brc1 transcript fetch", async () => {
     const controller = new AbortController();

@@ -1,11 +1,11 @@
 import { cors } from "@elysiajs/cors";
-import { createVnuRefreshAccessDescriptor, createVnuRefreshGrant, decryptSession, encryptSession, encryptVnuRefreshGrant, fail, getLogger, HyeboardError, isExpired, ok, parseBearerToken, type EncryptedSessionPayload, type VnuRefreshAccessDescriptor } from "@hyeboard/core";
+import { createVnuRefreshAccessDescriptor, createVnuRefreshGrant, decryptSession, decryptSessionForVnuLogout, decryptSessionForVnuRefresh, decryptVnuRefreshGrant, deriveVnuRefreshPrincipal, encryptSession, encryptVnuRefreshGrant, fail, getLogger, HyeboardError, isExpired, ok, parseBearerToken, rotateVnuRefreshGrant, VNU_REFRESH_GRANT_MAX_LENGTH, type EncryptedSessionPayload, type VnuRefreshAccessDescriptor, type VnuRefreshGrantPayload } from "@hyeboard/core";
 import { apiErrorDetailsSchema, type AuthResult } from "@hyeboard/schemas";
 import { DaotaoClient, getAdapter, isDaotaoSessionExpired, listUniversities, parseProfileHtml, parseTranscriptHeader, parseTranscriptHtml, type BrowserBinding, type BrowserConnection, type VnuTranscript } from "@hyeboard/university-adapters";
 import { Elysia, t } from "elysia";
 import { LocalCaptchaRelayCoordinator, captchaRelayCancelled, captchaRelayNotFound, type CaptchaRelayCoordinator, type PreparedCaptchaRelay } from "./captcha-relay";
 import { probeBudgetUnavailable, type VnuProbeBudgetCoordinator } from "./vnu-probe-budget";
-import { vnuRefreshUnavailable, type VnuRefreshControlCoordinator } from "./vnu-refresh-control";
+import { vnuRefreshUnavailable, type BeginRefreshResult, type LinkedPair, type VnuRefreshControlCoordinator } from "./vnu-refresh-control";
 import { resolveVnuStudentId, VNU_STUDENT_ID_RESOLVER_MAX_PROBES } from "./vnu-student-id-resolver";
 import { normalizeSelfHostedInteger, parseVnuRuntimeConfig, type EffectiveVnuRuntimeConfig } from "./vnu-runtime-config";
 
@@ -235,6 +235,94 @@ function descriptorPair(descriptor: VnuRefreshAccessDescriptor) {
   };
 }
 
+function vnuRefreshIdentityMismatch(): HyeboardError {
+  return new HyeboardError("VNU_REFRESH_IDENTITY_MISMATCH", "The VNU reconnect identity did not match the signed-in account.", 409);
+}
+
+function ensureVnuIdentityMatch(session: EncryptedSessionPayload, grant: VnuRefreshGrantPayload): void {
+  if (session.universityId !== "vnu" || !session.studentCode || session.studentCode !== grant.expectedStudentCode) throw vnuRefreshIdentityMismatch();
+}
+
+function beginResultError(result: Exclude<BeginRefreshResult, { kind: "accepted" }>): never {
+  if (result.kind === "revoked") throw new HyeboardError("VNU_REFRESH_GRANT_REVOKED", "The VNU reconnect grant has been revoked.", 401);
+  if (result.kind === "in-progress") throw new HyeboardError("VNU_REFRESH_UNAVAILABLE", "VNU reconnect is already in progress. Try again shortly.", 503, { retryAfterSeconds: result.retryAfterSeconds });
+  if (result.kind === "rate-limited") throw new HyeboardError("VNU_REFRESH_RATE_LIMITED", "Too many VNU reconnect attempts. Wait and try again.", 429, {
+    retryAfterSeconds: result.retryAfterSeconds,
+    limit: result.limit,
+    windowSeconds: result.windowSeconds,
+  });
+  throw new Error("Accepted refresh result cannot be converted to an error");
+}
+
+function isTerminalVnuRefreshFailure(error: unknown): boolean {
+  return error instanceof HyeboardError && (error.code === "INVALID_VNU_CREDENTIAL" || error.code === "VNU_REFRESH_IDENTITY_MISMATCH");
+}
+
+function approvedVnuRefreshDetails(error: HyeboardError) {
+  const parsed = apiErrorDetailsSchema.safeParse(error.details);
+  return parsed.success ? parsed.data : undefined;
+}
+
+function publicVnuRefreshError(error: unknown): HyeboardError {
+  if (!(error instanceof HyeboardError)) return new HyeboardError("VNU_REQUEST_FAILED", "The VNU reconnect request failed. Try again.", 502);
+  if (error.code === "INVALID_VNU_CREDENTIAL") return new HyeboardError(error.code, "The VNU username or password is no longer valid.", 401);
+  if (error.code === "VNU_REFRESH_IDENTITY_MISMATCH") return vnuRefreshIdentityMismatch();
+  if (error.code === "VNU_RATE_LIMITED") return new HyeboardError(error.code, "VNU is rate limiting requests. Wait and try again.", 429, approvedVnuRefreshDetails(error));
+  if (error.code === "VNU_UPSTREAM_UNAVAILABLE") return new HyeboardError(error.code, "The VNU portal is temporarily unavailable. Try again.", 502, approvedVnuRefreshDetails(error));
+  if (error.code === "VNU_REQUEST_FAILED") return new HyeboardError(error.code, "The VNU reconnect request failed. Try again.", 502, approvedVnuRefreshDetails(error));
+  if (error.code === "VNU_REFRESH_UNAVAILABLE") return vnuRefreshUnavailable();
+  if (error.code === "VNU_REFRESH_GRANT_REVOKED") return new HyeboardError(error.code, "The VNU reconnect grant has been revoked.", 401);
+  if (error.code === "VNU_REFRESH_RATE_LIMITED") return new HyeboardError(error.code, "Too many VNU reconnect attempts. Wait and try again.", 429, approvedVnuRefreshDetails(error));
+  return new HyeboardError("VNU_REQUEST_FAILED", "The VNU reconnect request failed. Try again.", 502);
+}
+
+async function linkedRefreshInputs(session: EncryptedSessionPayload, grant: VnuRefreshGrantPayload, secret: string): Promise<{
+  descriptor: VnuRefreshAccessDescriptor;
+  oldPair: LinkedPair;
+}> {
+  const descriptor = session.vnuRefresh!;
+  const principalKey = await deriveVnuRefreshPrincipal(grant.username, secret);
+  if (principalKey !== descriptor.principalKey || grant.grantId !== descriptor.grantId || grant.expiresAt !== descriptor.grantExpiresAt) throw vnuRefreshIdentityMismatch();
+  return { descriptor, oldPair: descriptorPair(descriptor) };
+}
+
+function decodeCanonicalBase64Url(value: string): Uint8Array {
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) throw new Error("Invalid access token encoding");
+  const base64 = value.replaceAll("-", "+").replaceAll("_", "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
+  const bytes = Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
+  const canonical = btoa(String.fromCharCode(...bytes)).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+  if (canonical !== value) throw new Error("Invalid access token encoding");
+  return bytes;
+}
+
+function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+async function decryptAuthenticatedLegacyVnuSession(token: string, secret: string): Promise<EncryptedSessionPayload> {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 2 || !parts[0] || !parts[1]) throw new Error("Invalid access token");
+    const iv = decodeCanonicalBase64Url(parts[0]);
+    const encrypted = decodeCanonicalBase64Url(parts[1]);
+    if (iv.byteLength !== 12 || encrypted.byteLength < 17) throw new Error("Invalid access token");
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret));
+    const key = await crypto.subtle.importKey("raw", digest, "AES-GCM", false, ["decrypt"]);
+    const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv: exactArrayBuffer(iv) }, key, exactArrayBuffer(encrypted));
+    const value: unknown = JSON.parse(new TextDecoder().decode(decrypted));
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid legacy session");
+    const payload = value as Record<string, unknown>;
+    if (Object.prototype.hasOwnProperty.call(payload, "vnuRefresh")) throw new Error("Descriptor-bearing session is not legacy");
+    if (payload.version !== 1 || payload.universityId !== "vnu" || typeof payload.expiresAt !== "string" || new Date(payload.expiresAt).toISOString() !== payload.expiresAt) throw new Error("Invalid legacy session");
+    if (!payload.vnu || typeof payload.vnu !== "object" || Array.isArray(payload.vnu)) throw new Error("Invalid legacy session");
+    const credential = payload.vnu as Record<string, unknown>;
+    if (credential.kind !== "cookie" || typeof credential.value !== "string" || credential.value.length === 0) throw new Error("Invalid legacy session");
+    return payload as EncryptedSessionPayload;
+  } catch {
+    throw new HyeboardError("INVALID_SESSION", "Invalid or malformed session token", 401);
+  }
+}
+
 async function resolveOrdinaryAccessToken(token: string): Promise<EncryptedSessionPayload> {
   const session = await decryptSession(token, getSessionSecret());
   if (session.universityId === "vnu" && !session.vnu?.value) throw missingVnuCredential();
@@ -277,7 +365,8 @@ function routeError(error: unknown, requestId?: string, requestUrl?: string) {
   const headers = new Headers({ "Content-Type": "application/json" });
   const requestPath = requestUrl ? new URL(requestUrl).pathname : undefined;
   const isVnuRoute = requestPath?.startsWith("/api/vnu/") ?? false;
-  if (requestPath?.startsWith("/api/vnu/cross-lookup/")) headers.set("Cache-Control", "no-store");
+  const isVnuAuthMutation = requestPath === "/api/vnu/auth/refresh" || requestPath === "/api/vnu/auth/logout";
+  if (requestPath?.startsWith("/api/vnu/cross-lookup/") || isVnuAuthMutation) headers.set("Cache-Control", "no-store");
   if (error instanceof HyeboardError) {
     const level = error.status >= 500 ? "error" : "warn";
     if (isVnuRoute) log[level]({ operation: "route", code: error.code, status: error.status }, "VNU request failed");
@@ -294,7 +383,7 @@ function routeError(error: unknown, requestId?: string, requestUrl?: string) {
       ? (error as { status: number }).status
       : undefined;
     const trustedFrameworkError = candidateCode !== undefined && trustedFrameworkErrors.get(candidateCode) === candidateStatus;
-    const status = trustedFrameworkError ? candidateStatus! : 500;
+    const status = trustedFrameworkError ? (isVnuAuthMutation && candidateCode === "VALIDATION" ? 400 : candidateStatus!) : 500;
     const code = trustedFrameworkError ? candidateCode! : "INTERNAL_ERROR";
     const level = status >= 500 ? "error" : "warn";
     log[level]({ operation: "route", code, status }, "VNU request failed");
@@ -332,6 +421,66 @@ const importSessionBody = t.Object({
   uetGoogleEmail: t.Optional(t.String()),
   uetGooglePassword: t.Optional(t.String()),
 });
+
+type VnuRefreshBody = { refreshGrant: string };
+type VnuLogoutBody = { refreshGrant?: string };
+
+const VNU_REFRESH_GRANT_JSON_OVERHEAD_BYTES = new TextEncoder().encode('{"refreshGrant":""}').byteLength;
+const VNU_AUTH_BODY_WHITESPACE_ALLOWANCE_BYTES = 32;
+// Canonical grant ceiling plus exact JSON syntax and small whitespace allowance.
+// The reader stops before retaining any byte beyond this limit, including chunks.
+const VNU_AUTH_BODY_MAX_BYTES = VNU_REFRESH_GRANT_MAX_LENGTH
+  + VNU_REFRESH_GRANT_JSON_OVERHEAD_BYTES
+  + VNU_AUTH_BODY_WHITESPACE_ALLOWANCE_BYTES;
+
+async function parseStrictVnuAuthBody(request: Request, kind: "refresh" | "logout"): Promise<VnuRefreshBody | VnuLogoutBody> {
+  const declaredLength = Number(request.headers.get("Content-Length"));
+  if (Number.isFinite(declaredLength) && declaredLength > VNU_AUTH_BODY_MAX_BYTES) {
+    throw new HyeboardError("PAYLOAD_TOO_LARGE", "The request body is too large.", 413);
+  }
+  if (!request.body) throw new HyeboardError("VALIDATION", "The request body is invalid.", 400);
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let byteLength = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (byteLength + value.byteLength > VNU_AUTH_BODY_MAX_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw new HyeboardError("PAYLOAD_TOO_LARGE", "The request body is too large.", 413);
+      }
+      chunks.push(value);
+      byteLength += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  let value: unknown;
+  try {
+    const encoded = new Uint8Array(byteLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      encoded.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(encoded));
+  } catch (error) {
+    if (error instanceof HyeboardError) throw error;
+    throw new HyeboardError("VALIDATION", "The request body is invalid.", 400);
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new HyeboardError("VALIDATION", "The request body is invalid.", 400);
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (keys.some((key) => key !== "refreshGrant")) throw new HyeboardError("VALIDATION", "The request body is invalid.", 400);
+  if (record.refreshGrant !== undefined && (typeof record.refreshGrant !== "string" || record.refreshGrant.length < 1 || record.refreshGrant.length > VNU_REFRESH_GRANT_MAX_LENGTH)) {
+    throw new HyeboardError("VALIDATION", "The request body is invalid.", 400);
+  }
+  if (kind === "refresh" && typeof record.refreshGrant !== "string") throw new HyeboardError("VALIDATION", "The request body is invalid.", 400);
+  return record as VnuRefreshBody | VnuLogoutBody;
+}
 
 const termCodeQuery = t.Object({ termCode: t.Optional(t.String()) });
 
@@ -945,7 +1094,8 @@ export function createApp(adapter: any) {
       const req = request as unknown as { _hyebReqId?: string; _hyebStart?: number };
       req._hyebReqId = requestId();
       req._hyebStart = Date.now();
-      if (new URL(request.url).pathname.startsWith("/api/vnu/cross-lookup/")) set.headers["Cache-Control"] = "no-store";
+      const path = new URL(request.url).pathname;
+      if (path.startsWith("/api/vnu/cross-lookup/") || path === "/api/vnu/auth/refresh" || path === "/api/vnu/auth/logout") set.headers["Cache-Control"] = "no-store";
       // Set HYEB_LOG_LEVEL=debug (Node/Bun .env, or a Cloudflare secret/var)
       // to see one line per incoming request here.
       getLogger().debug({ reqId: req._hyebReqId, method: request.method, path: requestLogPath(request.url) }, "request received");
@@ -1100,6 +1250,142 @@ export function createApp(adapter: any) {
         answer: t.String({ minLength: 1, maxLength: 64 }),
       }),
     })
+    .post("/api/vnu/auth/refresh", async ({ headers, request }) => {
+      const token = parseBearerToken(new Headers(headers as Record<string, string>).get("Authorization"));
+      if (!token) throw new HyeboardError("MISSING_SESSION", "Missing Authorization bearer token", 401);
+
+      const secret = getSessionSecret();
+      let session: EncryptedSessionPayload;
+      try {
+        session = await decryptSessionForVnuRefresh(token, secret);
+      } catch (error) {
+        try {
+          await decryptAuthenticatedLegacyVnuSession(token, secret);
+        } catch {
+          throw error;
+        }
+        throw new HyeboardError("VNU_REFRESH_GRANT_INVALID", "The VNU reconnect grant is invalid or expired.", 401);
+      }
+      const body = await parseStrictVnuAuthBody(request, "refresh") as VnuRefreshBody;
+      const grant = await decryptVnuRefreshGrant(body.refreshGrant, secret);
+      const { descriptor, oldPair } = await linkedRefreshInputs(session, grant, secret);
+      const coordinator = requireVnuRefreshControlCoordinator();
+
+      if (session.universityId !== "vnu" || !session.studentCode || session.studentCode !== grant.expectedStudentCode) {
+        try {
+          await coordinator.revokeExactLinkedPair(descriptor.principalKey, oldPair);
+        } catch {
+          throw vnuRefreshUnavailable();
+        }
+        throw vnuRefreshIdentityMismatch();
+      }
+
+      let beginResult: BeginRefreshResult;
+      try {
+        beginResult = await coordinator.beginRefresh(descriptor.principalKey, oldPair);
+      } catch {
+        throw vnuRefreshUnavailable();
+      }
+      if (beginResult.kind !== "accepted") beginResultError(beginResult);
+
+      let completionSettled = false;
+      try {
+        const imported = await getAdapter("vnu").importSession({ vnuUsername: grant.username, vnuPassword: grant.password, signal: request.signal });
+        if (imported.universityId !== "vnu" || imported.studentCode !== grant.expectedStudentCode) throw vnuRefreshIdentityMismatch();
+        const refreshedSession: EncryptedSessionPayload = {
+          ...imported.session,
+          studentCode: imported.studentCode,
+        };
+        ensureVnuIdentityMatch(refreshedSession, grant);
+
+        const rotatedGrant = rotateVnuRefreshGrant(grant);
+        const nextDescriptor = await createVnuRefreshAccessDescriptor({
+          username: grant.username,
+          grantId: rotatedGrant.grantId,
+          accessExpiresAt: refreshedSession.expiresAt,
+          grantExpiresAt: rotatedGrant.expiresAt,
+          secret,
+        });
+        const nextPair = descriptorPair(nextDescriptor);
+        const nextPayload = { ...refreshedSession, vnuRefresh: nextDescriptor };
+        const [nextToken, nextGrant] = await Promise.all([
+          encryptSession(nextPayload, secret),
+          encryptVnuRefreshGrant(rotatedGrant, secret),
+        ]);
+
+        if (request.signal.aborted) throw vnuRefreshUnavailable();
+        let completion: "completed" | "revoked";
+        try {
+          completion = await coordinator.completeRefresh(descriptor.principalKey, { old: oldPair, next: nextPair });
+        } catch {
+          throw vnuRefreshUnavailable();
+        }
+        completionSettled = true;
+        if (completion === "revoked") throw new HyeboardError("VNU_REFRESH_GRANT_REVOKED", "The VNU reconnect grant has been revoked.", 401);
+
+        return ok({
+          token: nextToken,
+          refreshGrant: nextGrant,
+          session: {
+            universityId: refreshedSession.universityId,
+            studentCode: refreshedSession.studentCode,
+            expiresAt: refreshedSession.expiresAt,
+            authenticated: true,
+          },
+        });
+      } catch (error) {
+        if (!completionSettled) {
+          try {
+            await coordinator.abortRefresh(descriptor.principalKey, { pair: oldPair, terminal: isTerminalVnuRefreshFailure(error) });
+          } catch {
+            throw vnuRefreshUnavailable();
+          }
+        }
+        throw publicVnuRefreshError(error);
+      }
+    })
+    .post("/api/vnu/auth/logout", async ({ headers, request }) => {
+      const token = parseBearerToken(new Headers(headers as Record<string, string>).get("Authorization"));
+      if (!token) return ok({ authenticated: false });
+      const secret = getSessionSecret();
+
+      let session: EncryptedSessionPayload | undefined;
+      let legacySession: EncryptedSessionPayload | undefined;
+      try {
+        session = await decryptSessionForVnuLogout(token, secret);
+      } catch (error) {
+        try {
+          legacySession = await decryptAuthenticatedLegacyVnuSession(token, secret);
+        } catch {
+          throw error;
+        }
+      }
+      const logoutBody = await parseStrictVnuAuthBody(request, "logout") as VnuLogoutBody;
+      if (legacySession) {
+        await revokeToken(token, legacySession.expiresAt);
+        return ok({ authenticated: false });
+      }
+
+      const descriptor = session!.vnuRefresh!;
+      const pair = descriptorPair(descriptor);
+      if (logoutBody.refreshGrant !== undefined) {
+        const grant = await decryptVnuRefreshGrant(logoutBody.refreshGrant, secret);
+        await linkedRefreshInputs(session!, grant, secret);
+        ensureVnuIdentityMatch(session!, grant);
+      }
+
+      let result: "revoked" | "mismatch" | "expired";
+      try {
+        result = await requireVnuRefreshControlCoordinator().revokeLinkedPairByAccess(descriptor.principalKey, pair);
+      } catch {
+        throw vnuRefreshUnavailable();
+      }
+      if (result === "mismatch") throw new HyeboardError("VNU_REFRESH_GRANT_REVOKED", "The VNU reconnect grant has been revoked.", 401);
+      if (result === "expired" && (pair.accessExpiresAt > Date.now() || pair.grantExpiresAt > Date.now())) {
+        throw new HyeboardError("VNU_REFRESH_GRANT_REVOKED", "The VNU reconnect grant has been revoked.", 401);
+      }
+      return ok({ authenticated: false });
+    })
     .post("/api/:universityId/auth/logout", async ({ headers }) => {
       const h = headers instanceof Headers ? headers : new Headers(headers as Record<string, string>);
       const token = parseBearerToken(h.get("Authorization"));
@@ -1109,24 +1395,8 @@ export function createApp(adapter: any) {
       try {
         session = await decryptSession(token, getSessionSecret());
       } catch {
-        // Already invalid/expired token — nothing to revoke. Expired
-        // descriptor handling belongs to the dedicated Task4 logout contract.
+        // Already invalid/expired token — nothing to revoke.
         return ok({ authenticated: false });
-      }
-
-      if (session.vnuRefresh) {
-        const descriptor = session.vnuRefresh;
-        let result: "revoked" | "mismatch" | "expired";
-        try {
-          result = await requireVnuRefreshControlCoordinator().revokeLinkedPairByAccess(
-            descriptor.principalKey,
-            descriptorPair(descriptor),
-          );
-        } catch (error) {
-          if (error instanceof HyeboardError && error.code === "VNU_REFRESH_UNAVAILABLE") throw error;
-          throw vnuRefreshUnavailable();
-        }
-        if (result !== "revoked") throw new HyeboardError("SESSION_EXPIRED", "Session expired", 401);
       }
 
       await revokeToken(token, session.expiresAt);

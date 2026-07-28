@@ -53,17 +53,19 @@ export class DaotaoClient {
   // Cookie header string from Set-Cookie. Uses redirect: "manual" because the
   // login response is a redirect, and Set-Cookie headers from an
   // intermediate redirect hop aren't reliably exposed once fetch follows it.
-  async login(username: string, password: string): Promise<string> {
+  async login(username: string, password: string, signal?: AbortSignal): Promise<string> {
     const body = new URLSearchParams({ txtLoginId: username, txtPassword: password, chkSubmit: "ok" });
     let response: Response;
     try {
       response = await fetch(`${BASE}/dkmh/login.asp`, {
         method: "POST",
         redirect: "manual",
+        signal,
         headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": BROWSER_USER_AGENT },
         body: body.toString(),
       });
     } catch {
+      if (signal?.aborted) throw signal.reason ?? new DOMException("This operation was aborted", "AbortError");
       throw new HyeboardError("VNU_UPSTREAM_UNAVAILABLE", "Could not reach daotao.vnu.edu.vn. The portal may be down or your network may be blocking it.", 502);
     }
     if (response.status === 429) throw new HyeboardError("VNU_RATE_LIMITED", "daotao.vnu.edu.vn is rate-limiting login attempts. Wait a few minutes before trying again.", 429);
@@ -76,7 +78,7 @@ export class DaotaoClient {
     return setCookies.map((entry) => entry.split(";")[0]).join("; ");
   }
 
-  getProfileHtml() { return this.fetchPage("/StdInfo/TabStdSelf.asp"); }
+  getProfileHtml(signal?: AbortSignal) { return this.fetchPage("/StdInfo/TabStdSelf.asp", signal); }
   getGradesHtml() { return this.fetchPage("/ListPoint/listpoint_Brc1.asp"); }
   getStudyProgressHtml() { return this.fetchPage("/StdInfo/TabStdStudy.asp"); }
   getExamBaseHtml() { return this.fetchPage("/StdExamination/StdExamination.asp?selViewType=StdExam"); }

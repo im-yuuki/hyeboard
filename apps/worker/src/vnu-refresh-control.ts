@@ -153,13 +153,16 @@ export function applyRevokeLinkedPairByAccess(stored: VnuRefreshControlState | u
   assertAccessDescriptorRef(pair);
   if (pair.accessExpiresAt <= now && pair.grantExpiresAt <= now) return unchanged(stored, now, { kind: "expired" });
   const state = cleanVnuRefreshState(stored, now);
-  if (state.active && !samePair(state.active, pair)) return unchanged(stored, now, { kind: "mismatch" });
   if (state.revokedAccess[pair.accessTokenId] === pair.accessExpiresAt && state.revokedGrants[pair.grantId] === pair.grantExpiresAt) return unchanged(stored, now, { kind: "revoked" });
+  // After the access tombstone expires, its exact ID can no longer be
+  // distinguished. A still-live exact grant proves only idempotent no-op
+  // logout, including while a different rotated pair is active.
+  if (pair.accessExpiresAt <= now && state.revokedGrants[pair.grantId] === pair.grantExpiresAt) return unchanged(stored, now, { kind: "revoked" });
+  if (state.active && !samePair(state.active, pair)) return unchanged(stored, now, { kind: "mismatch" });
   // Once the access tombstone reaches its own expiry, the state intentionally
   // retains no access-to-grant link. A still-live exact grant can therefore
   // prove only idempotent no-mutation success for an already-expired access;
   // any live unmatched access remains a mismatch.
-  if (!state.active && pair.accessExpiresAt <= now && state.revokedGrants[pair.grantId] === pair.grantExpiresAt) return unchanged(stored, now, { kind: "revoked" });
   if (!samePair(state.active, pair)) return unchanged(stored, now, { kind: "mismatch" });
   return changed(stored, revokeExact(state, pair), { kind: "revoked" });
 }

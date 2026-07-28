@@ -209,11 +209,34 @@ describe("VNU refresh transitions", () => {
     expect(applyRevokeLinkedPairByAccess(cleaned, expired, NOW)).toEqual({ state: cleaned, result: { kind: "expired" }, changed: false });
   });
 
-  it("old rotated descriptor mismatches while next remains active", () => {
+  it("accepts only exact old rotation tombstones idempotently while next remains active", () => {
     const leased = applyBeginRefresh(applyActivatePair(undefined, OLD, NOW).state, OLD, NOW).state;
     const rotated = applyCompleteRefresh(leased, { old: OLD, next: NEXT }, NOW + 1).state;
-    expect(applyRevokeLinkedPairByAccess(rotated, OLD, NOW + 2)).toEqual({ state: rotated, result: { kind: "mismatch" }, changed: false });
+    expect(applyRevokeLinkedPairByAccess(rotated, OLD, NOW + 2)).toEqual({ state: rotated, result: { kind: "revoked" }, changed: false });
+    for (const wrong of [
+      { ...OLD, accessExpiresAt: OLD.accessExpiresAt + 1 },
+      { ...OLD, grantExpiresAt: OLD.grantExpiresAt + 1 },
+      { ...OLD, accessTokenId: "Z".repeat(22) },
+      { ...OLD, grantId: "Z".repeat(22) },
+    ]) expect(applyRevokeLinkedPairByAccess(rotated, wrong, NOW + 2)).toEqual({ state: rotated, result: { kind: "mismatch" }, changed: false });
+    const oneTombstone = { ...rotated, revokedGrants: {} };
+    expect(applyRevokeLinkedPairByAccess(oneTombstone, OLD, NOW + 2)).toEqual({ state: oneTombstone, result: { kind: "mismatch" }, changed: false });
     expect(applyCheckAccess(rotated, NEXT, NOW + 2).result).toEqual({ kind: "active" });
+  });
+
+  it("uses an exact live old grant after its access tombstone is cleaned while next stays active", () => {
+    const old = { ...OLD, accessExpiresAt: NOW };
+    const leased = applyBeginRefresh(applyActivatePair(undefined, old, NOW - 1).state, old, NOW - 1).state;
+    const rotated = applyCompleteRefresh(leased, { old, next: NEXT }, NOW).state;
+    const cleaned = cleanVnuRefreshState(rotated, NOW + 1);
+    expect(cleaned.revokedAccess).toEqual({});
+    expect(cleaned.revokedGrants).toEqual({ [old.grantId]: old.grantExpiresAt });
+    expect(applyRevokeLinkedPairByAccess(cleaned, old, NOW + 1)).toEqual({ state: cleaned, result: { kind: "revoked" }, changed: false });
+    for (const wrong of [{ ...old, grantId: "Z".repeat(22) }, { ...old, grantExpiresAt: old.grantExpiresAt + 1 }]) {
+      expect(applyRevokeLinkedPairByAccess(cleaned, wrong, NOW + 1)).toEqual({ state: cleaned, result: { kind: "mismatch" }, changed: false });
+    }
+    expect(applyRevokeLinkedPairByAccess(cleaned, { ...old, accessTokenId: "Z".repeat(22), accessExpiresAt: NOW + 2 }, NOW + 1)).toEqual({ state: cleaned, result: { kind: "mismatch" }, changed: false });
+    expect(applyCheckAccess(cleaned, NEXT, NOW + 1).result).toEqual({ kind: "active" });
   });
 
   it("exact linked revoke and grantless revoke share exact boundaries", () => {

@@ -67,7 +67,7 @@ export function createVnuAdapter(): UniversityAdapter {
       if (!normalizedUsername || !input.vnuPassword) {
         throw new HyeboardError("MISSING_UPSTREAM_CREDENTIAL", "Provide your university portal username and password.", 400);
       }
-      const cookie = await new DaotaoClient().login(normalizedUsername, input.vnuPassword);
+      const cookie = await new DaotaoClient().login(normalizedUsername, input.vnuPassword, input.signal);
       const expiresAt = addHours(8);
       const session: EncryptedSessionPayload = {
         version: 1,
@@ -80,8 +80,9 @@ export function createVnuAdapter(): UniversityAdapter {
       // an HTTP error, so this is the only reliable check.
       let profile;
       try {
-        profile = parseProfileHtml(await new DaotaoClient(session).getProfileHtml());
+        profile = parseProfileHtml(await new DaotaoClient(session).getProfileHtml(input.signal));
       } catch (error) {
+        if (input.signal?.aborted) throw input.signal.reason ?? new DOMException("This operation was aborted", "AbortError");
         if (error instanceof HyeboardError && ["VNU_RATE_LIMITED", "VNU_UPSTREAM_UNAVAILABLE", "VNU_REQUEST_FAILED"].includes(error.code)) throw error;
         throw new HyeboardError("INVALID_VNU_CREDENTIAL", "daotao.vnu.edu.vn rejected this username or password, or the returned session expired immediately.", 401);
       }

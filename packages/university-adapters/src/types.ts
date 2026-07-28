@@ -26,6 +26,7 @@ export type AdapterRequest = {
 };
 
 export type LoginImportInput = {
+  signal?: AbortSignal;
   studenthubGoogleCredential?: string;
   studenthubToken?: string;
   studenthubCookie?: string;
