@@ -123,14 +123,33 @@ Live re-probing (authenticated session) CORRECTED earlier notes on this surface:
 - `detailPoint.asp?StdID=` cross-student behavior remains as previously verified (unchanged; still
   not exposed by Hyeboard).
 
-### Resolver runtime status (StdID <-> student code)
+### Projection/local-window model (StdID <-> student code)
 
-- Cross-lookup runtime policy parses code-lookup concurrency and the bulk-target maximum from
-  deployment configuration. Concurrency is not yet consumed by route execution. When
-  `crossLookup` is available, capability metadata publishes the configured bulk maximum.
-- The legacy student-code resolver remains temporarily internal while its replacement is integrated.
-  Current public documentation therefore does not promise a search span, scheduling model, or
-  request-budget semantics.
+- Live evidence shows that student codes and internal IDs can remain near-parallel only inside a
+  short cohort-local neighborhood. The Worker therefore projects from the authenticated caller's
+  own pair, probes the projection, then probes only the closed projection ±16 window. Success
+  requires exact equality with the requested eight-digit code; headerless, malformed, and
+  nonmatching responses are misses.
+- The complete candidate set contains at most 33 IDs. Projection-local probes use bounded
+  deterministic concurrency, stop after the earliest-priority exact winner, and abort started
+  siblings after a winner, caller cancellation, or fatal upstream failure. No wide-span
+  monotonicity, cohort slope, approximation, or nearest-result assumption remains.
+- Wide-span qualitative probes disproved the former assumptions: cohort boundaries introduce
+  large prefix jumps, and even within a cohort the local slope changes sign outside the immediate
+  neighborhood. Bisection and long linear correction therefore cannot converge reliably. This
+  evidence supports deleting wide operation rather than retaining a deployment gate.
+- Every route or bulk chunk reserves its conservative allowance atomically through the per-session
+  Durable Object before Brc1 work. Direct ID-to-code and ID-to-transcript operations reserve 1 unit
+  per target, code-to-ID reserves 33, and code-to-transcript reserves 34. Candidate requests spend
+  only the local reservation; reservations are non-refundable.
+- `GET /api/vnu/cross-lookup/transcript` accepts exactly one target plus explicit opt-in. Code mode
+  resolves inside the bounded local window, then performs one separate final transcript fetch.
+  Wire responses contain parsed identity, term rows, and totals only; raw HTML and portal notice
+  prose never leave the Worker.
+- `POST /api/vnu/cross-lookup/bulk` preserves ordered sequential items and fixed request limits of
+  three code targets or five direct-ID/transcript targets. Ordinary not-found/not-converged
+  outcomes remain item errors. Authentication, session, rate-limit, upstream, transport,
+  cancellation, allowance, and unknown failures stop the chunk.
 
 ### Wide-span probe evidence (qualitative)
 
@@ -140,9 +159,9 @@ No identifiers, codes, or per-pair deltas are recorded here; only response-shape
   code-to-ID slope exists.
 - Within a cohort, observed drift can change direction outside the immediate projection
   neighborhood.
-- Consequence: wide bisection, long linear correction, and other far-search assumptions are
-  rejected. Current runtime policy does not treat wide-span monotonicity as valid.
-- Reverse directions from a known internal ID remain direct operations and do not depend on
+- Consequence: wide bisection and long linear correction assumptions are disproven. Only exact
+  bounded local verification is supported.
+- Reverse directions from a known internal ID remain one-fetch operations and do not depend on
   monotonicity.
 
 ## Raw-proxy hardening (worker-side)

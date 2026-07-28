@@ -60,7 +60,11 @@ cp .env.example .env   # fill in HYEB_SESSION_SECRET
 node dist/index.js      # or: bun run dist/index.js
 ```
 
-Non-secret runtime configuration lives in `dist/config.json`; environment variables override matching file values. VNU resolver settings use `vnu.code_lookup_concurrency` and `vnu.cross_lookup_bulk_max_targets` in JSON, or `VNU_CODE_LOOKUP_CONCURRENCY` and `VNU_CROSS_LOOKUP_BULK_MAX_TARGETS` in the environment. Missing values default to 16 and 50. Both settings are parsed as runtime policy; concurrency is not yet applied by cross-lookup routes. When `crossLookup` is available, its optional metadata publishes the configured bulk maximum.
+Non-secret runtime configuration lives in `dist/config.json`; environment variables override matching file values. VNU resolver settings use `vnu.code_lookup_concurrency` and `vnu.cross_lookup_bulk_max_targets` in JSON, or `VNU_CODE_LOOKUP_CONCURRENCY` and `VNU_CROSS_LOOKUP_BULK_MAX_TARGETS` in the environment. Canonical non-negative base-10 safe integers are accepted; concurrency must be positive. Missing values default to 16 and 50. Malformed concurrency falls back to 1, while malformed bulk configuration disables bulk with 0. There is no product ceiling below JavaScript's safe-integer bound.
+
+VNU cross lookup requires the Cloudflare `VNU_PROBE_BUDGET` Durable Object. Self-hosted Node/Bun deployments fail cross lookup closed and omit its runtime limit metadata. The browser hides bulk when metadata is missing or zero, enforces the published whole-run maximum, and still sends sequential chunks of three code targets or five direct-ID/transcript targets. The Worker atomically reserves 1 unit for direct lookups, 33 for code-to-ID, and 34 for code-to-transcript before Brc1 work. Reservations are per session, authoritative, and non-refundable.
+
+Exports are explicit browser-only JSON or CSV downloads built from sanitized result models. They do not refetch, persist, or send result content to the server. Derived term GPA/CPA values exclude missing grades and remain labeled separately from portal-reported cumulative values.
 
 ## Security
 

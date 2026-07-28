@@ -90,11 +90,128 @@ async function openMockedLookup(page: import("@playwright/test").Page, bulkMaxim
   return requestCounts;
 }
 
-async function downloadJsonExport(scope: import("@playwright/test").Locator): Promise<Record<string, unknown>> {
-  await scope.getByRole("button", { name: "Export" }).click();
-  const downloadPromise = scope.page().waitForEvent("download");
-  await scope.page().getByRole("menuitem", { name: "Download JSON" }).click();
-  return JSON.parse(await downloadText(await downloadPromise)) as Record<string, unknown>;
+function trackApiRequestCounts(page: import("@playwright/test").Page) {
+  const counts = new Map<string, number>();
+  page.on("request", (request) => {
+    const path = new URL(request.url()).pathname;
+    if (path.startsWith("/api/")) counts.set(path, (counts.get(path) ?? 0) + 1);
+  });
+  return (path: string) => counts.get(path) ?? 0;
+}
+
+function parseDownloadedRfc4180Csv(input: string): string[][] {
+  expect(input.charCodeAt(0)).toBe(0xfeff);
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let quoted = false;
+  let index = 1;
+
+  while (index < input.length) {
+    const character = input[index]!;
+    if (quoted) {
+      if (character === '"' && input[index + 1] === '"') {
+        field += '"';
+        index += 2;
+        continue;
+      }
+      if (character === '"') {
+        quoted = false;
+        index += 1;
+        continue;
+      }
+      field += character;
+      index += 1;
+      continue;
+    }
+    if (character === '"') {
+      expect(field).toBe("");
+      quoted = true;
+      index += 1;
+      continue;
+    }
+    if (character === ",") {
+      row.push(field);
+      field = "";
+      index += 1;
+      continue;
+    }
+    if (character === "\r") {
+      expect(input[index + 1]).toBe("\n");
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+      index += 2;
+      continue;
+    }
+    expect(character).not.toBe("\n");
+    field += character;
+    index += 1;
+  }
+
+  expect(quoted).toBe(false);
+  expect(row).toEqual([]);
+  expect(field).toBe("");
+  return rows;
+}
+
+type DownloadedExport = {
+  surface: string;
+  reported?: { cumulativeGpa4?: number };
+  derivedTerms?: Array<{
+    termCode: string;
+    termGpa4?: number;
+    derivedCpa4?: number;
+    courses: Array<{ courseName: string; [key: string]: unknown }>;
+    [key: string]: unknown;
+  }>;
+  run?: { status: string; mode: string; processedCount: number; totalCount: number };
+  results?: Array<Record<string, unknown>>;
+};
+
+async function expectExportFormats(
+  page: import("@playwright/test").Page,
+  surface: string,
+  relevantRequestCount: () => number,
+): Promise<DownloadedExport> {
+  const exportRoot = page.locator(`[data-export-surface="${surface}"]`).first();
+  const trigger = exportRoot.getByRole("button", { name: "Export" });
+  const requestsBeforeExport = relevantRequestCount();
+
+  await trigger.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("menuitem", { name: "Download JSON" })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(trigger).toBeFocused();
+
+  const jsonPromise = page.waitForEvent("download");
+  await trigger.click();
+  await page.getByRole("menuitem", { name: "Download JSON" }).click();
+  const jsonDownload = await jsonPromise;
+  expect(jsonDownload.suggestedFilename()).toMatch(new RegExp(`^hyeboard-${surface}-\\d{4}-\\d{2}-\\d{2}\\.json$`));
+  const jsonModel = JSON.parse(await downloadText(jsonDownload)) as DownloadedExport;
+  expect(jsonModel.surface).toBe(surface);
+  expect(jsonModel.derivedTerms?.length ?? jsonModel.results?.length ?? 0).toBeGreaterThan(0);
+  expect(relevantRequestCount()).toBe(requestsBeforeExport);
+  await expect(trigger).toBeFocused();
+
+  const csvPromise = page.waitForEvent("download");
+  await trigger.click();
+  await page.getByRole("menuitem", { name: "Download CSV" }).click();
+  const csvDownload = await csvPromise;
+  expect(csvDownload.suggestedFilename()).toMatch(new RegExp(`^hyeboard-${surface}-\\d{4}-\\d{2}-\\d{2}\\.csv$`));
+  const csvRows = parseDownloadedRfc4180Csv(await downloadText(csvDownload));
+  const csvHeader = csvRows[0]!;
+  expect(csvHeader.slice(0, 3)).toEqual(["record_type", "surface", "run_status"]);
+  const surfaceColumn = csvHeader.indexOf("surface");
+  expect(surfaceColumn).toBeGreaterThanOrEqual(0);
+  const csvRecords = csvRows.slice(1);
+  expect(csvRecords.length).toBeGreaterThan(0);
+  expect(csvRecords.every((record) => record[surfaceColumn] === surface)).toBe(true);
+  expect(relevantRequestCount()).toBe(requestsBeforeExport);
+  await expect(trigger).toBeFocused();
+  return jsonModel;
 }
 
 type SyntheticBulkMode = "stdid-to-code" | "code-to-stdid" | "stdid-to-transcript";
@@ -442,6 +559,7 @@ test("lookup groups use progressive modes, accessible labels, and responsive tou
   await expect(page.getByLabel("Class number (optional)")).toBeVisible();
   await expect(page.getByRole("group", { name: "Class lookup direction" })).toBeVisible();
   await expect(page.getByRole("group", { name: "Student record tool" })).toBeVisible();
+  await expect(page.locator("[data-export-surface]")).toHaveCount(0);
 
   await page.getByRole("button", { name: "Class ID to course" }).click();
   await expect(page.getByLabel("Internal class ID")).toBeVisible();
@@ -486,7 +604,8 @@ test("bulk enforces configured deduplicated maximum and dynamic copy", async ({ 
   await expect(bulk.getByRole("button", { name: "Run bulk lookup" })).toBeDisabled();
 });
 
-test("bulk keeps complete JSON exports ordered for all modes and fixed chunks", async ({ page }) => {
+test("bulk keeps complete exports ordered for all modes and fixed chunks", async ({ page }) => {
+  const apiRequestCount = trackApiRequestCounts(page);
   const chunks: Record<SyntheticBulkMode, string[][]> = { "stdid-to-code": [], "code-to-stdid": [], "stdid-to-transcript": [] };
   await page.route("**/api/vnu/cross-lookup/bulk", async (route) => {
     const mode = (route.request().postDataJSON() as { mode: SyntheticBulkMode }).mode;
@@ -506,7 +625,7 @@ test("bulk keeps complete JSON exports ordered for all modes and fixed chunks", 
     await bulk.getByLabel("Targets, one per line").fill(testCase.targets.join("\n"));
     await bulk.getByRole("button", { name: "Run bulk lookup" }).click();
     await expect(bulk.getByText(`${testCase.targets.length} completed`)).toBeVisible();
-    const document = await downloadJsonExport(bulk);
+    const document = await expectExportFormats(page, testCase.surface, () => apiRequestCount("/api/vnu/cross-lookup/bulk"));
     expect(document.surface).toBe(testCase.surface);
     expect(document.run).toEqual({ status: "complete", mode: testCase.mode, processedCount: testCase.targets.length, totalCount: testCase.targets.length });
     const results = document.results as Array<{ target: string; status: string; result: Record<string, unknown> }>;
@@ -521,6 +640,7 @@ test("bulk keeps complete JSON exports ordered for all modes and fixed chunks", 
 });
 
 test("bulk exports prior five results after later 429 and while retrying", async ({ page }) => {
+  const apiRequestCount = trackApiRequestCounts(page);
   let call = 0;
   await page.route("**/api/vnu/cross-lookup/bulk", async (route) => {
     call += 1;
@@ -537,7 +657,7 @@ test("bulk exports prior five results after later 429 and while retrying", async
   await bulk.getByLabel("Targets, one per line").fill(targets.join("\n"));
   await bulk.getByRole("button", { name: "Run bulk lookup" }).click();
   await expect(bulk.getByRole("button", { name: "Retry remaining" })).toBeVisible();
-  const partial = await downloadJsonExport(bulk);
+  const partial = await expectExportFormats(page, "bulk-id-to-code", () => apiRequestCount("/api/vnu/cross-lookup/bulk"));
   expect(partial.run).toEqual({ status: "partial", mode: "stdid-to-code", processedCount: 5, totalCount: 6 });
   expect((partial.results as Array<{ target: string }>).map((item) => item.target)).toEqual(targets.slice(0, 5));
 
@@ -547,6 +667,7 @@ test("bulk exports prior five results after later 429 and while retrying", async
 });
 
 test("bulk keeps prior export during and after cancellation of second chunk", async ({ page }) => {
+  const apiRequestCount = trackApiRequestCounts(page);
   let call = 0;
   await page.route("**/api/vnu/cross-lookup/bulk", async (route) => {
     call += 1;
@@ -563,7 +684,7 @@ test("bulk keeps prior export during and after cancellation of second chunk", as
   await bulk.getByRole("button", { name: "Cancel" }).click();
   await expect(bulk.getByRole("button", { name: "Retry remaining" })).toBeVisible();
   await expect(bulk.getByRole("button", { name: "Export" })).toBeVisible();
-  const partial = await downloadJsonExport(bulk);
+  const partial = await expectExportFormats(page, "bulk-id-to-code", () => apiRequestCount("/api/vnu/cross-lookup/bulk"));
   expect(partial.run).toEqual({ status: "partial", mode: "stdid-to-code", processedCount: 5, totalCount: 6 });
 });
 
@@ -680,6 +801,7 @@ test("bulk bounds rendered rows and pages through every result", async ({ page }
 });
 
 test("bulk rejects malformed success without exporting unsafe result fields", async ({ page }) => {
+  const apiRequestCount = trackApiRequestCounts(page);
   let call = 0;
   await page.route("**/api/vnu/cross-lookup/bulk", async (route) => {
     call += 1;
@@ -700,41 +822,36 @@ test("bulk rejects malformed success without exporting unsafe result fields", as
   await bulk.getByLabel("Targets, one per line").fill(targets.join("\n"));
   await bulk.getByRole("button", { name: "Run bulk lookup" }).click();
   await expect(bulk.getByText("The lookup returned an invalid result. Retry the remaining targets.")).toBeVisible();
-  const partial = await downloadJsonExport(bulk);
+  const partial = await expectExportFormats(page, "bulk-id-to-code", () => apiRequestCount("/api/vnu/cross-lookup/bulk"));
   expect(partial.run).toEqual({ status: "partial", mode: "stdid-to-code", processedCount: 5, totalCount: 6 });
   expect(JSON.stringify(partial)).not.toContain("unsafe");
 });
 
-test("lookup successful single results export JSON without refetch and clear stale actions", async ({ page }) => {
-  const requests = await openMockedLookup(page);
+test("lookup successful single results export both formats without refetch and clear stale actions", async ({ page }) => {
+  const apiRequestCount = trackApiRequestCounts(page);
+  await openMockedLookup(page);
 
   await page.getByLabel("Course code").fill("SYN9900");
   await page.getByLabel("Term").click();
   await page.getByRole("option", { name: "Semester 2, 2025–2026 (supplementary)" }).click();
   const forwardRow = page.getByTestId("lookup-results").locator(".list-row").filter({ hasText: "Synthetic Export Systems" });
   await expect(forwardRow).toBeVisible();
-  const forwardRequests = requests.exams;
-  expect(await downloadJsonExport(forwardRow)).toMatchObject({ surface: "class-forward", universityId: "mock" });
-  expect(requests.exams).toBe(forwardRequests);
+  expect(await expectExportFormats(page, "class-forward", () => apiRequestCount("/api/vnu/raw/exams"))).toMatchObject({ surface: "class-forward", universityId: "mock" });
 
   await page.getByRole("button", { name: "Class ID to course" }).click();
   const reverseSection = page.getByTestId("reverse-class-lookup");
   await reverseSection.getByLabel("Term").click();
   await page.getByRole("option", { name: "Semester 2, 2025–2026 (supplementary)" }).click();
   await reverseSection.getByLabel("Internal class ID").fill(SYNTHETIC_CLASS_ID);
-  const reverseRequests = requests.exams;
-  expect(await downloadJsonExport(reverseSection)).toMatchObject({ surface: "class-reverse", universityId: "mock" });
-  expect(requests.exams).toBe(reverseRequests);
+  expect(await expectExportFormats(page, "class-reverse", () => apiRequestCount("/api/vnu/raw/exams"))).toMatchObject({ surface: "class-reverse", universityId: "mock" });
 
   const codeSection = page.getByTestId("cross-student-code");
   const codeInput = codeSection.getByLabel("Target internal student ID");
   await codeInput.fill(SYNTHETIC_TARGET_INTERNAL_ID);
   await codeSection.getByRole("button", { name: "Look up" }).click();
   await expect(codeSection.getByText(SYNTHETIC_TARGET_STUDENT_CODE)).toBeVisible();
-  const codeRequests = requests.studentCode;
-  const codeDocument = await downloadJsonExport(codeSection);
+  const codeDocument = await expectExportFormats(page, "student-id-to-code", () => apiRequestCount("/api/vnu/cross-lookup/student-code"));
   expect(codeDocument).toMatchObject({ surface: "student-id-to-code", query: { mode: "stdId", value: SYNTHETIC_TARGET_INTERNAL_ID } });
-  expect(requests.studentCode).toBe(codeRequests);
   await codeInput.fill(SYNTHETIC_ERROR_INTERNAL_ID);
   await expect(codeSection.getByRole("button", { name: "Export" })).toHaveCount(0);
 
@@ -744,10 +861,8 @@ test("lookup successful single results export JSON without refetch and clear sta
   await idInput.fill(SYNTHETIC_TARGET_STUDENT_CODE);
   await idSection.getByRole("button", { name: "Look up" }).click();
   await expect(idSection.getByText(SYNTHETIC_TARGET_INTERNAL_ID)).toBeVisible();
-  const idRequests = requests.studentId;
-  const idDocument = await downloadJsonExport(idSection);
+  const idDocument = await expectExportFormats(page, "student-code-to-id", () => apiRequestCount("/api/vnu/cross-lookup/student-id"));
   expect(idDocument).toMatchObject({ surface: "student-code-to-id", results: [{ resolver: { resolvedStudentCode: SYNTHETIC_TARGET_STUDENT_CODE, resolvedInternalStudentId: SYNTHETIC_TARGET_INTERNAL_ID, probes: 2 } }] });
-  expect(requests.studentId).toBe(idRequests);
   await idInput.fill(SYNTHETIC_ERROR_STUDENT_CODE);
   await expect(idSection.getByRole("button", { name: "Export" })).toHaveCount(0);
 
@@ -764,8 +879,7 @@ test("lookup successful single results export JSON without refetch and clear sta
   await expect(derivedHeader.getByText("CPA", { exact: true }).locator("..")).toContainText("3.50");
   await expect(derivedHeader.getByText("Included credits").locator("..")).toContainText("3 / 5 listed");
   await expect(transcriptSection.getByRole("button", { name: "Export" })).toHaveCount(1);
-  const transcriptRequests = requests.transcript;
-  const transcriptDocument = await downloadJsonExport(transcriptSection);
+  const transcriptDocument = await expectExportFormats(page, "cross-transcript", () => apiRequestCount("/api/vnu/cross-lookup/transcript"));
   expect(transcriptDocument).toMatchObject({
     surface: "cross-transcript",
     query: { mode: "stdId", value: SYNTHETIC_TARGET_INTERNAL_ID },
@@ -774,7 +888,6 @@ test("lookup successful single results export JSON without refetch and clear sta
   const transcriptTerms = transcriptDocument.derivedTerms as Array<Record<string, unknown>>;
   expect(transcriptTerms.map((term) => term.termCode)).toEqual(["252", "251"]);
   expect(transcriptTerms[0]).toMatchObject({ termCode: "252", estimateKind: "derived", listedCredits: 5, includedCredits: 3 });
-  expect(requests.transcript).toBe(transcriptRequests);
   await transcriptInput.fill(SYNTHETIC_ERROR_INTERNAL_ID);
   await expect(transcriptSection.getByRole("button", { name: "Export" })).toHaveCount(0);
   await expectNoPageOverflow(page);
@@ -876,6 +989,7 @@ test("grades default to the newest term, merge summer into term two, and expand 
 });
 
 test("grades render derived term GPA and CPA and export current page and term state", async ({ page }) => {
+  const apiRequestCount = trackApiRequestCounts(page);
   await loginDemo(page);
   await page.goto("/grades");
 
@@ -895,13 +1009,7 @@ test("grades render derived term GPA and CPA and export current page and term st
   await expect(newestTerm.locator("tbody > tr").nth(0)).toContainText("Web Application Development");
   await expect(newestTerm.locator("tbody > tr").nth(2)).toContainText("Linear Algebra");
 
-  const pageExport = page.getByTestId("grades-page-export");
-  await pageExport.getByRole("button", { name: "Export" }).click();
-  const pageDownloadPromise = page.waitForEvent("download");
-  await page.getByRole("menuitem", { name: "Download JSON" }).click();
-  const pageDownload = await pageDownloadPromise;
-  expect(pageDownload.suggestedFilename()).toMatch(/^hyeboard-grades-page-\d{4}-\d{2}-\d{2}\.json$/);
-  const pageDocument = JSON.parse(await downloadText(pageDownload));
+  const pageDocument = await expectExportFormats(page, "grades-page", () => apiRequestCount("/api/mock/grades"));
   expect(pageDocument).toMatchObject({
     surface: "grades-page",
     universityId: "mock",
@@ -910,37 +1018,24 @@ test("grades render derived term GPA and CPA and export current page and term st
     derivedTerms: [{ termCode: "20251", estimateKind: "derived" }],
   });
   expect(pageDocument.derivedTerms).toHaveLength(1);
-  expect(pageDocument.derivedTerms[0].termGpa4).toBeCloseTo(3.45);
-  expect(pageDocument.derivedTerms[0].derivedCpa4).toBeCloseTo(3.43, 2);
-  expect(pageDocument.derivedTerms[0].courses.map((course: { courseName: string }) => course.courseName)).toEqual(["Web Application Development", "Linear Algebra"]);
-  expect(Object.keys(pageDocument.derivedTerms[0].courses[0])).toEqual(["courseCode", "courseName", "credits", "point10", "letter", "point4"]);
+  expect(pageDocument.derivedTerms?.[0]?.termGpa4).toBeCloseTo(3.45);
+  expect(pageDocument.derivedTerms?.[0]?.derivedCpa4).toBeCloseTo(3.43, 2);
+  expect(pageDocument.derivedTerms?.[0]?.courses.map((course) => course.courseName)).toEqual(["Web Application Development", "Linear Algebra"]);
+  expect(Object.keys(pageDocument.derivedTerms?.[0]?.courses[0] ?? {})).toEqual(["courseCode", "courseName", "credits", "point10", "letter", "point4"]);
 
-  await newestTermHeader.getByRole("button", { name: "Export" }).click();
-  const termDownloadPromise = page.waitForEvent("download");
-  await page.getByRole("menuitem", { name: "Download CSV" }).click();
-  const termDownload = await termDownloadPromise;
-  expect(termDownload.suggestedFilename()).toMatch(/^hyeboard-grades-term-\d{4}-\d{2}-\d{2}\.csv$/);
-  const termCsv = await downloadText(termDownload);
-  expect(termCsv.startsWith("\ufeffrecord_type,surface,")).toBe(true);
-  expect(termCsv).toContain(",grades-term,");
-  expect(termCsv).toContain("Demo Student");
-  expect(termCsv).toContain(",3.48,");
-  expect(termCsv).toContain("'20251");
-  expect(termCsv.indexOf("Web Application Development")).toBeLessThan(termCsv.indexOf("Linear Algebra"));
-  expect(termCsv.endsWith("\r\n")).toBe(true);
-  expect(termCsv.replaceAll("\r\n", "")).not.toContain("\n");
+  const termDocument = await expectExportFormats(page, "grades-term", () => apiRequestCount("/api/mock/grades"));
+  expect(termDocument.derivedTerms).toHaveLength(1);
+  expect(termDocument.derivedTerms?.[0]?.courses).toEqual(pageDocument.derivedTerms?.[0]?.courses);
 
   await page.getByRole("combobox", { name: "Term" }).click();
   await page.getByRole("option", { name: "All terms" }).click();
   await expect(page.getByTestId("academic-term-header")).toHaveCount(2);
-  await pageExport.getByRole("button", { name: "Export" }).click();
-  const allTermsDownloadPromise = page.waitForEvent("download");
-  await page.getByRole("menuitem", { name: "Download JSON" }).click();
-  const allTermsDocument = JSON.parse(await downloadText(await allTermsDownloadPromise));
-  expect(allTermsDocument.derivedTerms.map((term: { termCode: string }) => term.termCode)).toEqual(["20251", "20242"]);
+  const allTermsDocument = await expectExportFormats(page, "grades-page", () => apiRequestCount("/api/mock/grades"));
+  expect(allTermsDocument.derivedTerms?.map((term) => term.termCode)).toEqual(["20251", "20242"]);
 });
 
 test("grades keep missing and reserved term identities collision-safe", async ({ page }) => {
+  const apiRequestCount = trackApiRequestCounts(page);
   await loginDemo(page);
   await page.route("**/api/mock/grades", async (route) => {
     await route.fulfill({
@@ -975,22 +1070,18 @@ test("grades keep missing and reserved term identities collision-safe", async ({
   await expect(page.getByText("Missing term")).toBeVisible();
   await expect(page.getByText("Blank term")).toBeVisible();
 
-  const pageExport = page.getByTestId("grades-page-export");
-  await pageExport.getByRole("button", { name: "Export" }).click();
-  const downloadPromise = page.waitForEvent("download");
-  await page.getByRole("menuitem", { name: "Download JSON" }).click();
-  const document = JSON.parse(await downloadText(await downloadPromise));
-  const termIdentities = document.derivedTerms.map((term: { termCode: string; termLabel: string }) => [term.termCode, term.termLabel]);
+  const document = await expectExportFormats(page, "grades-page", () => apiRequestCount("/api/mock/grades"));
+  const termIdentities = document.derivedTerms?.map((term) => [term.termCode, term.termLabel]);
   expect(termIdentities).toEqual(expect.arrayContaining([
     ["unknown", "Unknown term"],
     ["unknown", "unknown"],
     ["all", "all"],
     ["~hyeboard:known:reserved", "~hyeboard:known:reserved"],
   ]));
-  const numericTerm = document.derivedTerms.find((term: { termCode: string }) => term.termCode === "251");
-  const spacedTerm = document.derivedTerms.find((term: { termCode: string }) => term.termCode === " 251 ");
-  expect(numericTerm.courses.map((course: { courseName: string }) => course.courseName)).toEqual(["Numeric term"]);
-  expect(spacedTerm.courses.map((course: { courseName: string }) => course.courseName)).toEqual(["Spaced numeric term"]);
+  const numericTerm = document.derivedTerms?.find((term) => term.termCode === "251");
+  const spacedTerm = document.derivedTerms?.find((term) => term.termCode === " 251 ");
+  expect(numericTerm?.courses.map((course) => course.courseName)).toEqual(["Numeric term"]);
+  expect(spacedTerm?.courses.map((course) => course.courseName)).toEqual(["Spaced numeric term"]);
 });
 
 test("grades exports wait for dashboard metadata without blocking grades", async ({ page }) => {
@@ -1013,6 +1104,85 @@ test("grades exports wait for dashboard metadata without blocking grades", async
 
   releaseDashboard();
   await expect(page.getByRole("button", { name: "Export" })).toHaveCount(2);
+});
+
+test("export menu reports local failures, remains responsive, and localizes without losing results", async ({ page }) => {
+  await loginDemo(page);
+  await page.goto("/grades");
+  const resultText = page.getByText("Web Application Development");
+  await expect(resultText).toBeVisible();
+
+  await page.goto("/settings");
+  await page.getByRole("button", { name: "Toggle light and dark mode" }).click();
+  await page.goto("/grades");
+  await expect(page.locator("html")).toHaveAttribute("data-mode", "dark");
+
+  const exportRoot = page.locator('[data-export-surface="grades-page"]');
+  const themedTrigger = exportRoot.getByRole("button", { name: "Export" });
+  await themedTrigger.focus();
+  await page.keyboard.press("Space");
+  await expect(page.getByRole("menuitem", { name: "Download JSON" })).toBeVisible();
+  await page.keyboard.press("ArrowDown");
+  await expect(page.getByRole("menuitem", { name: "Download CSV" })).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(themedTrigger).toBeFocused();
+
+  await page.evaluate(() => { document.documentElement.dataset.theme = "uet"; });
+  await themedTrigger.click();
+  const uetMenuBackground = await page.getByRole("menu").evaluate((element) => getComputedStyle(element).backgroundColor);
+  expect(uetMenuBackground).not.toBe("rgba(0, 0, 0, 0)");
+  await page.keyboard.press("Escape");
+
+  await page.evaluate(() => {
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: () => { throw new Error("synthetic download failure"); },
+    });
+  });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await themedTrigger.click();
+    await page.getByRole("menuitem", { name: "Download JSON" }).click();
+    await expect(exportRoot.getByRole("status"))
+      .toContainText("The export could not be downloaded. Your result is unchanged; try again.");
+    await expect(exportRoot.getByRole("status")).toHaveAttribute("aria-live", "polite");
+    await expect(resultText).toBeVisible();
+  }
+
+  await page.goto("/settings");
+  await page.getByRole("combobox", { name: "Language" }).click();
+  await page.getByRole("option", { name: "Tiếng Việt" }).click();
+  await page.goto("/grades");
+  await page.evaluate(() => {
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: () => { throw new Error("synthetic download failure"); },
+    });
+  });
+  const localizedRoot = page.locator('[data-export-surface="grades-page"]');
+  const localizedTrigger = localizedRoot.getByRole("button", { name: "Xuất dữ liệu" });
+  await localizedTrigger.click();
+  const localizedJson = page.getByRole("menuitem", { name: "Tải JSON" });
+  const localizedCsv = page.getByRole("menuitem", { name: "Tải CSV" });
+  await expect(localizedJson).toBeVisible();
+  for (const menuItem of [localizedJson, localizedCsv]) {
+    const menuItemBox = await menuItem.boundingBox();
+    expect(menuItemBox).not.toBeNull();
+    expect(menuItemBox!.height).toBeGreaterThanOrEqual(43.9);
+  }
+  await localizedJson.click();
+  await expect(localizedRoot.getByRole("status"))
+    .toContainText("Không thể tải dữ liệu xuất. Kết quả vẫn được giữ nguyên; hãy thử lại.");
+  await expect(localizedRoot.getByRole("status")).toHaveAttribute("aria-live", "polite");
+  await expect(page.getByText("Web Application Development")).toBeVisible();
+  await expect(localizedTrigger).toBeFocused();
+
+  for (const viewport of [{ width: 390, height: 844 }, { width: 768, height: 1024 }, { width: 1440, height: 900 }]) {
+    await page.setViewportSize(viewport);
+    await expectNoPageOverflow(page);
+    const triggerBox = await localizedTrigger.boundingBox();
+    expect(triggerBox).not.toBeNull();
+    expect(triggerBox!.height).toBeGreaterThanOrEqual(43.9);
+  }
 });
 
 test("timetable renders a responsive grid on desktop", async ({ page }) => {

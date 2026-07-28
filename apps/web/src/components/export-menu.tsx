@@ -27,7 +27,7 @@ export function ExportMenu({ model, className }: { model: ExportDocument; classN
   };
 
   return (
-    <div className={cn("min-w-0", className)}>
+    <div className={cn("min-w-0", className)} data-export-surface={model.surface}>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button type="button" variant="outline" size="sm" className="min-h-11 gap-2">
