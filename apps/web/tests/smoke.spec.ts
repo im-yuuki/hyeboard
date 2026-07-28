@@ -212,6 +212,7 @@ type DownloadedTerm = {
 type DownloadedResult = {
   target?: string;
   status?: string;
+  errorCode?: string;
   identity?: DownloadedIdentity;
   classResult?: { classCode: string; classNumber?: string; classId: string; courseName?: string };
   resolver?: { resolvedStudentCode: string; resolvedInternalStudentId: string; probes: number };
@@ -242,15 +243,11 @@ function csvValue(value: string | number | undefined): string {
   return value === undefined ? "" : String(value);
 }
 
-function expectCsvRecordsInOrder(records: CsvRecord[], expectations: CsvExpectation[]): void {
-  let nextRecordIndex = 0;
-  for (const expectedRecord of expectations) {
-    const relativeIndex = records.slice(nextRecordIndex).findIndex((record) => (
-      Object.entries(expectedRecord).every(([field, value]) => record[field] === value)
-    ));
-    expect(relativeIndex, `Missing ordered CSV record ${JSON.stringify(expectedRecord)}`).toBeGreaterThanOrEqual(0);
-    nextRecordIndex += relativeIndex + 1;
-  }
+function expectExactCsvRecords(records: CsvRecord[], expectations: CsvExpectation[]): void {
+  expect(records, "CSV emitted an unexpected number of records").toHaveLength(expectations.length);
+  expectations.forEach((expectedRecord, index) => {
+    expect(records[index], `Unexpected CSV record at index ${index}`).toMatchObject(expectedRecord);
+  });
 }
 
 function expectAcademicCsvMatchesJson(model: DownloadedExport, records: CsvRecord[]): void {
@@ -292,14 +289,14 @@ function expectAcademicCsvMatchesJson(model: DownloadedExport, records: CsvRecor
       });
     }
   }
-  expectCsvRecordsInOrder(records, expectedRecords);
+  expectExactCsvRecords(records, expectedRecords);
 }
 
 function expectClassCsvMatchesJson(model: DownloadedExport, records: CsvRecord[]): void {
   const classResult = model.results?.[0]?.classResult;
   expect(model.query).toBeDefined();
   expect(classResult).toBeDefined();
-  expectCsvRecordsInOrder(records, [
+  expectExactCsvRecords(records, [
     { record_type: "query", query_mode: model.query!.mode, query_value: csvIdentifier(model.query!.value) },
     {
       record_type: "result",
@@ -328,7 +325,7 @@ function expectResolverCsvMatchesJson(model: DownloadedExport, records: CsvRecor
         internal_student_id: result?.identity?.internalStudentId ? csvIdentifier(result.identity.internalStudentId) : "",
         student_name: result?.identity?.studentName ?? "",
       };
-  expectCsvRecordsInOrder(records, [
+  expectExactCsvRecords(records, [
     { record_type: "query", query_mode: model.query!.mode, query_value: csvIdentifier(model.query!.value) },
     resultExpectation,
   ]);
@@ -340,34 +337,73 @@ function expectBulkCsvMatchesJson(model: DownloadedExport, records: CsvRecord[])
   expect(run).toBeDefined();
   expect(results).toHaveLength(run!.processedCount);
 
-  const firstRowsByItem = results.map((_, index) => records.find((record) => record.item_index === String(index + 1)));
-  expect(firstRowsByItem.every(Boolean)).toBe(true);
-  expect(firstRowsByItem.map((record) => record!.target)).toEqual(results.map((item) => csvIdentifier(item.target!)));
-  expect(new Set(records.filter((record) => record.item_index).map((record) => record.item_index)).size).toBe(run!.processedCount);
+  const expectedRecords = results.flatMap((item, index): CsvExpectation[] => {
+    const base = (recordType: string): CsvExpectation => ({
+      item_index: String(index + 1),
+      record_type: recordType,
+      run_status: run!.status,
+      status: item.status!,
+      target: csvIdentifier(item.target!),
+    });
+    if (item.status === "error") return [{ ...base("item"), error_code: item.errorCode! }];
 
-  results.forEach((item, index) => {
-    const itemRows = records.filter((record) => record.item_index === String(index + 1));
-    expect(itemRows.length).toBeGreaterThan(0);
-    expect(itemRows.every((record) => record.run_status === run!.status && record.status === item.status)).toBe(true);
-    expect(itemRows.every((record) => record.target === csvIdentifier(item.target!))).toBe(true);
     const result = item.result;
+    expect(result).toBeDefined();
+    const itemRecords: CsvExpectation[] = [];
     if (result?.identity) {
-      expect(itemRows.some((record) => record.student_code === csvIdentifier(result.identity!.studentCode!))).toBe(true);
+      itemRecords.push({
+        ...base(result.derivedTerms !== undefined || result.reported !== undefined ? "identity" : "result"),
+        student_code: result.identity.studentCode ? csvIdentifier(result.identity.studentCode) : "",
+        internal_student_id: result.identity.internalStudentId ? csvIdentifier(result.identity.internalStudentId) : "",
+        student_name: result.identity.studentName ?? "",
+        managing_class: result.identity.managingClass ? csvIdentifier(result.identity.managingClass) : "",
+      });
+    }
+    if (result?.classResult) {
+      itemRecords.push({
+        ...base("result"),
+        class_code: csvIdentifier(result.classResult.classCode),
+        class_number: result.classResult.classNumber ? csvIdentifier(result.classResult.classNumber) : "",
+        class_id: csvIdentifier(result.classResult.classId),
+        course_name: result.classResult.courseName ?? "",
+      });
     }
     if (result?.resolver) {
-      expect(itemRows.some((record) => (
-        record.resolved_student_code === csvIdentifier(result.resolver!.resolvedStudentCode)
-        && record.resolved_internal_student_id === csvIdentifier(result.resolver!.resolvedInternalStudentId)
-      ))).toBe(true);
+      itemRecords.push({
+        ...base("result"),
+        resolved_student_code: csvIdentifier(result.resolver.resolvedStudentCode),
+        resolved_internal_student_id: csvIdentifier(result.resolver.resolvedInternalStudentId),
+        probes: String(result.resolver.probes),
+      });
     }
-    if (result?.derivedTerms?.[0]) {
-      const term = result.derivedTerms[0];
-      expectCsvRecordsInOrder(itemRows, [
-        { record_type: "term_summary", term_code: csvIdentifier(term.termCode), term_gpa4: csvValue(term.termGpa4), derived_cpa4: csvValue(term.derivedCpa4) },
-        { record_type: "course", term_code: csvIdentifier(term.termCode), course_code: csvIdentifier(term.courses[0]!.courseCode), course_name: term.courses[0]!.courseName },
-      ]);
+    if (result?.reported) {
+      itemRecords.push({ ...base("reported_summary"), reported_cumulative_gpa4: csvValue(result.reported.cumulativeGpa4) });
     }
+    for (const term of result?.derivedTerms ?? []) {
+      itemRecords.push({
+        ...base("term_summary"),
+        term_code: csvIdentifier(term.termCode),
+        listed_credits: csvValue(term.listedCredits),
+        included_credits: csvValue(term.includedCredits),
+        term_gpa4: csvValue(term.termGpa4),
+        derived_cpa4: csvValue(term.derivedCpa4),
+      });
+      for (const course of term.courses) {
+        itemRecords.push({
+          ...base("course"),
+          term_code: csvIdentifier(term.termCode),
+          course_code: csvIdentifier(course.courseCode),
+          course_name: course.courseName,
+          credits: csvValue(course.credits),
+          point10: csvValue(course.point10),
+          letter: csvValue(course.letter),
+          point4: csvValue(course.point4),
+        });
+      }
+    }
+    return itemRecords;
   });
+  expectExactCsvRecords(records, expectedRecords);
 }
 
 type ExportFormatExpectations = {
@@ -516,6 +552,28 @@ test("downloaded CSV parser rejects characters after a closing quote", () => {
 test("downloaded CSV parser preserves quoted controls and doubled quotes", () => {
   expect(parseDownloadedRfc4180Csv('\ufeff"LF\nCR\rCRLF\r\nQuote ""ok""",tail\r\n"EOF"'))
     .toEqual([["LF\nCR\rCRLF\r\nQuote \"ok\"", "tail"], ["EOF"]]);
+});
+
+test("CSV record assertions reject injected rows", () => {
+  const expected = [{ record_type: "query" }, { record_type: "result" }];
+  const withInjectedRow = [{ record_type: "query" }, { record_type: "injected" }, { record_type: "result" }];
+  expect(() => expectExactCsvRecords(withInjectedRow, expected)).toThrow();
+});
+
+test("CSV record assertions reject reordered bulk item groups", () => {
+  const model: DownloadedExport = {
+    surface: "bulk-id-to-code",
+    run: { status: "complete", mode: "stdid-to-code", processedCount: 2, totalCount: 2 },
+    results: [
+      { target: "99000000001", status: "ok", result: { identity: { studentCode: "99000001" } } },
+      { target: "99000000002", status: "ok", result: { identity: { studentCode: "99000002" } } },
+    ],
+  };
+  const reorderedRecords = [
+    { item_index: "2", record_type: "result", run_status: "complete", status: "ok", target: "'99000000002", student_code: "'99000002" },
+    { item_index: "1", record_type: "result", run_status: "complete", status: "ok", target: "'99000000001", student_code: "'99000001" },
+  ];
+  expect(() => expectBulkCsvMatchesJson(model, reorderedRecords)).toThrow();
 });
 
 test("dashboard redirects to login without a session", async ({ page }) => {
