@@ -1,13 +1,14 @@
 # Hyeboard Architecture
 
-Hyeboard is split into a client-heavy dashboard and a small Cloudflare Worker BFF.
+Hyeboard uses one Cloudflare Worker deployment containing the client-heavy dashboard and its API/BFF.
 
 ```txt
-Cloudflare Pages web app
-  -> Hyeboard Worker API
-  -> university adapter registry
-  -> UET adapter
-  -> StudentHub + Canvas upstream APIs
+Cloudflare Worker
+  ├─ static React assets (apps/web/dist)
+  └─ /api/* BFF
+       -> university adapter registry
+       -> UET adapter
+       -> StudentHub + Canvas upstream APIs
 ```
 
 The frontend never calls university upstream systems directly. University-specific behavior lives in adapters.
@@ -19,7 +20,7 @@ The frontend never calls university upstream systems directly. University-specif
 
 ## Session Model
 
-Separate web/API origins make third-party cookies fragile. Hyeboard therefore uses an encrypted Bearer token:
+University upstream origins make browser-managed third-party cookies fragile. Hyeboard therefore uses an encrypted Bearer token:
 
 1. API receives or discovers upstream credentials.
 2. API encrypts them with AES-GCM using `HYEB_SESSION_SECRET`.
@@ -27,3 +28,15 @@ Separate web/API origins make third-party cookies fragile. Hyeboard therefore us
 4. API decrypts per request and replays credentials upstream.
 
 No upstream cookies, tokens, SAML payloads, or personal data are logged.
+
+## Academic Summaries and Exports
+
+`apps/web/src/lib/term-academic-summary.ts` is the single pure definition of listed credits, included credits, derived term GPA, and running CPA. Grades and cross-transcript views normalize their rows into it. Portal-reported cumulative values stay separate; derived values never claim university authority.
+
+`apps/web/src/lib/data-export.ts` builds versioned allowlisted documents from already-sanitized browser state. JSON preserves structure and calculator precision. CSV uses fixed machine columns, UTF-8 BOM, CRLF, deterministic order, formula defense, and text-safe identifiers. Downloads use temporary object URLs and always revoke them. No export path contacts an API or writes browser/server persistence.
+
+## VNU Cross-Lookup Boundary
+
+The code-to-ID resolver probes only the arithmetic projection and its closed ±16 neighborhood. It verifies exact eight-digit header equality, uses bounded projection-local concurrency, and cancels siblings after a deterministic winner or fatal failure. It never performs a wide/cohort search or returns an approximation.
+
+Every route or accepted bulk chunk reserves its conservative Brc1 allowance once through the per-session Durable Object before upstream work. Candidate probes consume only that local allowance. Direct routes reserve 1 unit, code-to-ID reserves 33, and code-to-transcript reserves 34. Browser bulk runs use optional `/api/universities` limit metadata, but fixed Worker chunk validation and Durable Object enforcement remain the security boundary.

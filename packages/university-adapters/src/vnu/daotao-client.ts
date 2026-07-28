@@ -17,21 +17,32 @@ export class DaotaoClient {
     return this.session?.vnu?.value;
   }
 
-  private async fetchPage(path: string): Promise<string> {
+  private async fetchPage(path: string, signal?: AbortSignal): Promise<string> {
     const cookie = this.cookie();
     let response: Response;
     try {
       response = await fetch(`${BASE}${path}`, {
         redirect: "follow",
+        signal,
         headers: { "User-Agent": BROWSER_USER_AGENT, ...(cookie ? { Cookie: cookie } : {}) },
       });
     } catch {
+      if (signal?.aborted) throw signal.reason ?? new DOMException("This operation was aborted", "AbortError");
       throw new HyeboardError("VNU_UPSTREAM_UNAVAILABLE", "Could not reach daotao.vnu.edu.vn. The portal may be down or your network may be blocking it.", 502);
     }
     if (response.status === 429) throw new HyeboardError("VNU_RATE_LIMITED", "daotao.vnu.edu.vn is rate-limiting requests. Wait a few minutes and try again.", 429);
     if (response.status >= 500) throw new HyeboardError("VNU_UPSTREAM_UNAVAILABLE", `daotao.vnu.edu.vn returned ${response.status}. Try again later.`, 502);
     if (!response.ok) throw new HyeboardError("VNU_REQUEST_FAILED", `daotao.vnu.edu.vn rejected the request with HTTP ${response.status}.`, response.status);
-    const html = await response.text();
+    let html: string;
+    try {
+      html = await response.text();
+    } catch {
+      if (signal?.aborted) throw signal.reason ?? new DOMException("This operation was aborted", "AbortError");
+      throw new HyeboardError("VNU_UPSTREAM_UNAVAILABLE", "Could not read the response from daotao.vnu.edu.vn. The portal connection may have been interrupted.", 502);
+    }
+    // The ASP portal doesn't return 401s for an expired/invalid session — it
+    // just re-renders the login page. Detect that explicitly so callers get
+    // a real "sign in again" error instead of silently parsing an empty page.
     if (isDaotaoSessionExpired(response.url, html)) {
       throw new HyeboardError("VNU_SESSION_EXPIRED", "The university portal session has expired. Sign in again.", 401);
     }
@@ -84,9 +95,9 @@ export class DaotaoClient {
   // from the gated cross-lookup worker routes. The stdId is zero-padded to
   // the portal's 11-digit id shape here, server-side, so callers pass the
   // plain numeric id.
-  getTranscriptByStdIdHtml(stdId: string): Promise<string> {
+  getTranscriptByStdIdHtml(stdId: string, signal?: AbortSignal): Promise<string> {
     const query = new URLSearchParams({ selStd: stdId.padStart(11, "0") });
-    return this.fetchPage(`/ListPoint/listpoint_Brc1.asp?${query.toString()}`);
+    return this.fetchPage(`/ListPoint/listpoint_Brc1.asp?${query.toString()}`, signal);
   }
 
   // ListPoint/detailPoint.asp — per-component grade breakdown popup. The

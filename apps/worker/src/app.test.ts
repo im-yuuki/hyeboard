@@ -12,13 +12,15 @@ vi.mock("@hyeboard/university-adapters", async (importOriginal) => {
   return { ...actual, getAdapter: adapterMocks.getAdapter };
 });
 
-import { createApp, createCaptchaRelayToken, isVnuFarWalkEnabled, resolveSession, setCaptchaRelayCoordinator, setRuntimeConfig, setVnuProbeBudgetCoordinator, type RuntimeConfig } from "./app";
+import { createApp, createCaptchaRelayToken, requestLogPath, resolveSession, setCaptchaRelayCoordinator, setRuntimeConfig, setVnuProbeBudgetCoordinator, type RuntimeConfig } from "./app";
 import { LocalCaptchaRelayCoordinator, type CaptchaRelayCoordinator } from "./captcha-relay";
 import { selfHostedRuntimeConfig } from "./start";
 import type { VnuProbeBudgetCoordinator } from "./vnu-probe-budget";
 
 const SESSION_SECRET = "worker-test-secret-worker-test-secret";
 const VNU_STUDENT_CODE = "SYNTHETIC-STUDENT-001";
+const SYNTHETIC_VNU_CODE = 99_000_001;
+const SYNTHETIC_VNU_STD_ID = 99_000_000_001;
 const SENTINELS = [
   "PARENT_USERNAME_SENTINEL",
   "PARENT_PASSWORD_SENTINEL",
@@ -150,6 +152,8 @@ function vnuProfileHtml(studentCode = VNU_STUDENT_CODE): string {
 class TestVnuProbeBudget implements VnuProbeBudgetCoordinator {
   readonly identities: string[] = [];
   readonly amounts: number[] = [];
+  readonly consumedAmounts: number[] = [];
+  readonly reservedAmounts: number[] = [];
   readonly counts = new Map<string, number>();
   limit = Number.POSITIVE_INFINITY;
   unavailable = false;
@@ -159,6 +163,16 @@ class TestVnuProbeBudget implements VnuProbeBudgetCoordinator {
   }
 
   async consume(sessionIdentity: string, amount = 1): Promise<void> {
+    this.consumedAmounts.push(amount);
+    await this.record(sessionIdentity, amount);
+  }
+
+  async reserve(sessionIdentity: string, amount: number): Promise<void> {
+    this.reservedAmounts.push(amount);
+    await this.record(sessionIdentity, amount);
+  }
+
+  private async record(sessionIdentity: string, amount: number): Promise<void> {
     this.identities.push(sessionIdentity);
     this.amounts.push(amount);
     if (this.unavailable) throw new Error("synthetic budget outage");
@@ -173,9 +187,6 @@ class TestVnuProbeBudget implements VnuProbeBudgetCoordinator {
     this.counts.set(sessionIdentity, count + amount);
   }
 
-  async reserve(sessionIdentity: string, amount: number): Promise<void> {
-    await this.consume(sessionIdentity, amount);
-  }
 }
 
 async function requestVnuImport(app: ReturnType<typeof createApp>): Promise<Response> {
@@ -185,6 +196,13 @@ async function requestVnuImport(app: ReturnType<typeof createApp>): Promise<Resp
     body: JSON.stringify({ vnuUsername: "SYNTHETIC_VNU_USER", vnuPassword: "SYNTHETIC_VNU_PASSWORD" }),
   }));
 }
+
+describe("request-log privacy", () => {
+  it("requestLogPath strips query identifiers and opt-in values", () => {
+    expect(requestLogPath("https://hyeboard.test/api/vnu/cross-lookup/student-id?stdCode=99000002&allowCrossLookup=true"))
+      .toBe("/api/vnu/cross-lookup/student-id");
+  });
+});
 
 async function importVnu(app: ReturnType<typeof createApp>): Promise<VnuImportResponse> {
   const response = await requestVnuImport(app);
@@ -508,6 +526,8 @@ describe("VNU import session cache", () => {
   });
 
   it("validates a cache hit live and returns a fresh equivalent token without mutating the cache", async () => {
+    const probeBudget = new TestVnuProbeBudget();
+    setVnuProbeBudgetCoordinator(probeBudget);
     const first = await importVnu(app);
     const cached = await cache.importEntry();
     const cacheUrl = cache.importUrl();
@@ -527,6 +547,7 @@ describe("VNU import session cache", () => {
     expect(secondPayload.expiresAt).toBe("2099-01-01T00:00:00.000Z");
     expect(await cache.store.get(cacheUrl)!.response.clone().text()).toBe(bytesBefore);
     expect(cache.store.get(cacheUrl)!.expiresAt).toBe(storedBefore.expiresAt);
+    expect(probeBudget.count).toBe(0);
   });
 
   it("repairs a definitively expired cached upstream session and reuses the replacement", async () => {
@@ -881,11 +902,12 @@ describe("VNU cross-transcript route", () => {
     <tr><td>1</td><td>INT1001</td><td>Reliable Systems</td><td>3</td><td>8</td><td>B+</td><td>3.5</td><td></td></tr>
   </table><div>Tổng tín chỉ: 3</div>`;
 
-  async function authorizedRequest(query: string, route = "transcript", sessionCookie = "SYNTHETIC_TRANSCRIPT_COOKIE"): Promise<Response> {
+  async function authorizedRequest(query: string, route = "transcript", sessionCookie = "SYNTHETIC_TRANSCRIPT_COOKIE", signal?: AbortSignal): Promise<Response> {
     const session = { ...vnuSession(), vnu: { ...vnuSession().vnu!, value: sessionCookie } };
     const token = await encryptSession(session, SESSION_SECRET);
     return app.handle(new Request(`http://localhost/api/vnu/cross-lookup/${route}?${query}`, {
       headers: { Authorization: `Bearer ${token}` },
+      signal,
     }));
   }
 
@@ -1038,6 +1060,8 @@ describe("VNU cross-transcript route", () => {
     expect(JSON.stringify(body)).not.toContain("<table>");
     expect(transcriptSpy).toHaveBeenCalledTimes(1);
     expect(probeBudget.count).toBe(1);
+    expect(probeBudget.reservedAmounts).toEqual([1]);
+    expect(probeBudget.consumedAmounts).toEqual([]);
   });
 
   it("removes upstream notice prose from transcript responses", async () => {
@@ -1052,7 +1076,7 @@ describe("VNU cross-transcript route", () => {
     expect(payload).not.toContain("notice");
   });
 
-  it("spends resolver probes plus one separate transcript fetch for student-code mode", async () => {
+  it("cross-transcript by code reserves 34 and performs a separate final fetch", async () => {
     const response = await authorizedRequest("stdCode=20000001&allowCrossLookup=true");
     const body = await response.json() as { data: Record<string, unknown> };
 
@@ -1061,21 +1085,21 @@ describe("VNU cross-transcript route", () => {
     expect(body.data).toMatchObject({ header: { studentCode: "20000001" }, terms: [{ maHK: "251" }] });
     expect(JSON.stringify(body)).not.toContain("<table>");
     expect(transcriptSpy).toHaveBeenCalledTimes(2);
-    expect(transcriptSpy).toHaveBeenNthCalledWith(1, "1001");
-    expect(transcriptSpy).toHaveBeenNthCalledWith(2, "00000001001");
-    expect(probeBudget.count).toBe(2);
+    expect(transcriptSpy.mock.calls.map((call: unknown[]) => call[0])).toEqual(["1001", "00000001001"]);
+    expect(probeBudget.reservedAmounts).toEqual([34]);
+    expect(probeBudget.consumedAmounts).toEqual([]);
   });
 
-  it("blocks the final transcript fetch when resolver probes exhaust the budget", async () => {
-    probeBudget.limit = 1;
+  it("rejects a 34-unit transcript reservation before resolver or final fetch", async () => {
+    probeBudget.limit = 33;
 
     const response = await authorizedRequest("stdCode=20000001&allowCrossLookup=true");
 
     expect(response.status).toBe(429);
     expect(response.headers.get("Cache-Control")).toBe("no-store");
     await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_RATE_LIMITED" } });
-    expect(transcriptSpy).toHaveBeenCalledTimes(1);
-    expect(transcriptSpy).toHaveBeenCalledWith("1001");
+    expect(transcriptSpy).not.toHaveBeenCalled();
+    expect(probeBudget.reservedAmounts).toEqual([34]);
   });
 
   it("keeps separate budget identifiers and counters for separate VNU sessions", async () => {
@@ -1116,7 +1140,9 @@ describe("VNU cross-transcript route", () => {
     expect(byCode.status).toBe(200);
     expect(byId.headers.get("Cache-Control")).toBe("no-store");
     expect(byCode.headers.get("Cache-Control")).toBe("no-store");
-    expect(probeBudget.count).toBe(2);
+    expect(probeBudget.count).toBe(34);
+    expect(probeBudget.reservedAmounts).toEqual([1, 33]);
+    expect(probeBudget.consumedAmounts).toEqual([]);
     expect(new Set(probeBudget.identities).size).toBe(1);
     expect(probeBudget.identities[0]).toMatch(/^[0-9a-f]{64}$/);
     expect(probeBudget.identities.join(" ")).not.toContain("SYNTHETIC_TRANSCRIPT_COOKIE");
@@ -1157,6 +1183,118 @@ describe("VNU cross-transcript route", () => {
     expect(transcriptSpy).not.toHaveBeenCalled();
     expect(JSON.stringify(body)).not.toContain("SYNTHETIC_TRANSCRIPT_COOKIE");
     expect(JSON.stringify(body)).not.toMatch(/20000001|1002/);
+  });
+
+  it("student-id reserves exact 33 before Brc1 and limit 32 starts no upstream work", async () => {
+    probeBudget.limit = 32;
+
+    const response = await authorizedRequest("stdCode=20000001&allowCrossLookup=true", "student-id");
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(probeBudget.reservedAmounts).toEqual([33]);
+    expect(probeBudget.consumedAmounts).toEqual([]);
+    expect(transcriptSpy).not.toHaveBeenCalled();
+  });
+
+  it("direct abortable Request passes exact cancellation reason and settles started work", async () => {
+    const controller = new AbortController();
+    const reason = new DOMException("synthetic direct cancellation", "AbortError");
+    const observedReasons: unknown[] = [];
+    let settled = false;
+    transcriptSpy.mockImplementation(async (_stdId: string, signal?: AbortSignal) => {
+      try {
+        return await new Promise<string>((_resolve, reject) => signal?.addEventListener("abort", () => {
+          observedReasons.push(signal.reason);
+          reject(signal.reason);
+        }, { once: true }));
+      } finally {
+        settled = true;
+      }
+    });
+
+    const responsePromise = authorizedRequest("stdId=1001&allowCrossLookup=true", "student-code", undefined, controller.signal);
+    await vi.waitFor(() => expect(transcriptSpy).toHaveBeenCalledOnce());
+    controller.abort(reason);
+    const response = await responsePromise;
+
+    expect(response.status).toBe(500);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(observedReasons).toEqual([reason]);
+    expect(settled).toBe(true);
+  });
+
+  it("resolver route cancelled at configured concurrency 4 aborts and settles every started candidate", async () => {
+    setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET, VNU_CODE_LOOKUP_CONCURRENCY: "4" });
+    const controller = new AbortController();
+    const reason = { cancelled: "resolver request" };
+    const candidateSignals: AbortSignal[] = [];
+    let settledCandidates = 0;
+    transcriptSpy.mockImplementation(async (_stdId: string, signal?: AbortSignal) => {
+      if (transcriptSpy.mock.calls.length === 1) return "<html>headerless</html>";
+      candidateSignals.push(signal!);
+      try {
+        return await new Promise<string>((_resolve, reject) => signal!.addEventListener("abort", () => reject(signal!.reason), { once: true }));
+      } finally {
+        settledCandidates += 1;
+      }
+    });
+
+    const responsePromise = authorizedRequest("stdCode=20000001&allowCrossLookup=true", "student-id", undefined, controller.signal);
+    await vi.waitFor(() => expect(candidateSignals).toHaveLength(4));
+    controller.abort(reason);
+    const response = await responsePromise;
+
+    expect(response.status).toBe(500);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(candidateSignals.every((signal) => signal.aborted && signal.reason === reason)).toBe(true);
+    expect(settledCandidates).toBe(4);
+  });
+
+  it("fatal concurrent candidate aborts siblings and propagates exact 429 with no-store", async () => {
+    setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET, VNU_CODE_LOOKUP_CONCURRENCY: "4" });
+    const fatal = new HyeboardError("VNU_RATE_LIMITED", "synthetic candidate limit", 429);
+    const siblingSignals: AbortSignal[] = [];
+    let settledSiblings = 0;
+    transcriptSpy.mockImplementation(async (_stdId: string, signal?: AbortSignal) => {
+      if (transcriptSpy.mock.calls.length === 1) return "<html>headerless</html>";
+      if (transcriptSpy.mock.calls.length === 2) throw fatal;
+      siblingSignals.push(signal!);
+      try {
+        return await new Promise<string>((_resolve, reject) => signal!.addEventListener("abort", () => reject(signal!.reason), { once: true }));
+      } finally {
+        settledSiblings += 1;
+      }
+    });
+
+    const response = await authorizedRequest("stdCode=20000001&allowCrossLookup=true", "student-id");
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_RATE_LIMITED" } });
+    expect(siblingSignals).toHaveLength(3);
+    expect(siblingSignals.every((signal) => signal.aborted && signal.reason === fatal)).toBe(true);
+    expect(settledSiblings).toBe(3);
+  });
+
+  it("candidate session expiry aborts siblings and propagates 401 instead of not-converged", async () => {
+    setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET, VNU_CODE_LOOKUP_CONCURRENCY: "4" });
+    const fatal = new HyeboardError("VNU_SESSION_EXPIRED", "synthetic candidate expiry", 401);
+    const siblingSignals: AbortSignal[] = [];
+    transcriptSpy.mockImplementation(async (_stdId: string, signal?: AbortSignal) => {
+      if (transcriptSpy.mock.calls.length === 1) return "<html>headerless</html>";
+      if (transcriptSpy.mock.calls.length === 2) throw fatal;
+      siblingSignals.push(signal!);
+      return new Promise<string>((_resolve, reject) => signal!.addEventListener("abort", () => reject(signal!.reason), { once: true }));
+    });
+
+    const response = await authorizedRequest("stdCode=20000001&allowCrossLookup=true", "student-id");
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_SESSION_EXPIRED" } });
+    expect(siblingSignals).toHaveLength(3);
+    expect(siblingSignals.every((signal) => signal.aborted && signal.reason === fatal)).toBe(true);
   });
 
   it("reports budget unavailability as 503 without session-death semantics", async () => {
@@ -1263,7 +1401,7 @@ describe("VNU cross-transcript route", () => {
         error: { code: "VNU_SESSION_EXPIRED" },
       });
       expect(transcriptSpy).toHaveBeenCalledTimes(1);
-      expect(transcriptSpy).toHaveBeenCalledWith("1001");
+      expect(transcriptSpy).toHaveBeenCalledWith("1001", expect.any(AbortSignal));
     });
 
     it("reserves the resolver hard maximum once per code target without per-fetch double charging", async () => {
@@ -1280,7 +1418,8 @@ describe("VNU cross-transcript route", () => {
         { target: "20000001", status: "ok", result: { stdId: "00000001001", probes: 1 } },
         { target: "20000002", status: "ok", result: { stdId: "00000001002", probes: 1 } },
       ]);
-      expect(probeBudget.amounts).toEqual([44]);
+      expect(probeBudget.reservedAmounts).toEqual([66]);
+      expect(probeBudget.consumedAmounts).toEqual([]);
       expect(transcriptSpy).toHaveBeenCalledTimes(2);
     });
 
@@ -1291,6 +1430,108 @@ describe("VNU cross-transcript route", () => {
       expect(response.status).toBe(429);
       await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_RATE_LIMITED" } });
       expect(transcriptSpy).not.toHaveBeenCalled();
+    });
+
+    it("five direct targets reserve 5 atomically", async () => {
+      const response = await bulkRequest({ mode: "stdid-to-code", targets: ["1001", "1002", "1003", "1004", "1005"], allowCrossLookup: true });
+
+      expect(response.status).toBe(200);
+      expect(probeBudget.reservedAmounts).toEqual([5]);
+      expect(probeBudget.consumedAmounts).toEqual([]);
+    });
+
+    it("ordinary bulk systemic failure aborts chunk and starts no later item", async () => {
+      const fatal = new HyeboardError("VNU_UPSTREAM_UNAVAILABLE", "synthetic outage", 503);
+      transcriptSpy.mockImplementation(async (stdId: string) => {
+        if (stdId === "1002") throw fatal;
+        return targetTranscriptHtml;
+      });
+
+      const response = await bulkRequest({ mode: "stdid-to-code", targets: ["1001", "1002", "1003"], allowCrossLookup: true });
+
+      expect(response.status).toBe(503);
+      expect(response.headers.get("Cache-Control")).toBe("no-store");
+      expect(transcriptSpy.mock.calls.map((call: unknown[]) => call[0])).toEqual(["1001", "1002"]);
+    });
+
+    it("bulk targets stay sequential while each resolver overlaps configured candidate probes", async () => {
+      setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET, VNU_CODE_LOOKUP_CONCURRENCY: "4" });
+      profileSpy.mockResolvedValue(`<input name="hidStdID" value="${SYNTHETIC_VNU_STD_ID}"><input name="StdCode" value="${SYNTHETIC_VNU_CODE}">`);
+      const targetCodes = [SYNTHETIC_VNU_CODE + 100, SYNTHETIC_VNU_CODE + 200];
+      const projectedIds = targetCodes.map((code) => SYNTHETIC_VNU_STD_ID + code - SYNTHETIC_VNU_CODE);
+      let activeCandidates = 0;
+      const activeCandidatesByTarget = [0, 0];
+      let maxActiveCandidates = 0;
+      let secondStartedBeforeFirstSettled = false;
+      transcriptSpy.mockImplementation(async (stdIdText: string, signal?: AbortSignal) => {
+        const stdId = Number(stdIdText);
+        const targetIndex = Math.abs(stdId - projectedIds[0]) <= 16 ? 0 : 1;
+        if (targetIndex === 1 && activeCandidatesByTarget[0] > 0) secondStartedBeforeFirstSettled = true;
+        if (stdId === projectedIds[targetIndex]) return "<html>headerless</html>";
+        activeCandidates += 1;
+        activeCandidatesByTarget[targetIndex] += 1;
+        maxActiveCandidates = Math.max(maxActiveCandidates, activeCandidates);
+        try {
+          if (stdId === projectedIds[targetIndex] - 1) {
+            await Promise.resolve();
+            return `<table><tr><td>Mã số: ${targetCodes[targetIndex]}</td></tr></table>`;
+          }
+          return await new Promise<string>((_resolve, reject) => signal!.addEventListener("abort", () => reject(signal!.reason), { once: true }));
+        } finally {
+          activeCandidates -= 1;
+          activeCandidatesByTarget[targetIndex] -= 1;
+        }
+      });
+
+      const response = await bulkRequest({ mode: "code-to-stdid", targets: targetCodes.map(String), allowCrossLookup: true });
+      const payload = await response.json() as { data: { items: Array<{ target: string; status: string }> } };
+
+      expect(response.status).toBe(200);
+      expect(payload.data.items.map(({ target, status }) => ({ target, status }))).toEqual(targetCodes.map((target) => ({ target: String(target), status: "ok" })));
+      expect(probeBudget.reservedAmounts).toEqual([66]);
+      expect(maxActiveCandidates).toBe(4);
+      expect(secondStartedBeforeFirstSettled).toBe(false);
+    });
+
+    it("per-item nonconverged remains isolated and ordered", async () => {
+      profileSpy.mockResolvedValue(`<input name="hidStdID" value="${SYNTHETIC_VNU_STD_ID}"><input name="StdCode" value="${SYNTHETIC_VNU_CODE}">`);
+      const missingCode = SYNTHETIC_VNU_CODE + 100;
+      const foundCode = SYNTHETIC_VNU_CODE + 200;
+      const foundStdId = SYNTHETIC_VNU_STD_ID + 200;
+      transcriptSpy.mockImplementation(async (stdIdText: string) => Number(stdIdText) === foundStdId
+        ? `<table><tr><td>Mã số: ${foundCode}</td></tr></table>`
+        : "<html>headerless</html>");
+
+      const response = await bulkRequest({ mode: "code-to-stdid", targets: [String(missingCode), String(foundCode)], allowCrossLookup: true });
+      const payload = await response.json() as { data: { items: Array<Record<string, unknown>> } };
+
+      expect(response.status).toBe(200);
+      expect(payload.data.items).toMatchObject([
+        { target: String(missingCode), status: "error", errorCode: "VNU_CROSS_LOOKUP_NOT_CONVERGED" },
+        { target: String(foundCode), status: "ok", result: { stdId: String(foundStdId) } },
+      ]);
+    });
+
+    it("aborted bulk request starts no later item", async () => {
+      const controller = new AbortController();
+      const reason = { cancelled: "bulk" };
+      transcriptSpy.mockImplementation(async (_stdId: string, signal?: AbortSignal) => new Promise<string>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      }));
+      const token = await encryptSession(vnuSession(), SESSION_SECRET);
+      const responsePromise = app.handle(new Request("http://localhost/api/vnu/cross-lookup/bulk", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "stdid-to-code", targets: ["1001", "1002", "1003"], allowCrossLookup: true }),
+        signal: controller.signal,
+      }));
+      await vi.waitFor(() => expect(transcriptSpy).toHaveBeenCalledOnce());
+      controller.abort(reason);
+
+      const response = await responsePromise;
+      expect(response.status).toBe(500);
+      expect(response.headers.get("Cache-Control")).toBe("no-store");
+      expect(transcriptSpy).toHaveBeenCalledOnce();
     });
 
     it("fails with 503 before Brc1 when the reservation service is unavailable", async () => {
@@ -1335,53 +1576,19 @@ describe("VNU cross-transcript route", () => {
     });
   });
 
-  it("keeps far walking disabled by default before any Brc1 fetch", async () => {
-    const response = await authorizedRequest("stdCode=20000065&allowCrossLookup=true", "student-id");
+  it("normalizes self-hosted VNU file values and gives environment values precedence", () => {
+    const fileConfig: RuntimeConfig = {
+      VNU_CODE_LOOKUP_CONCURRENCY: "16",
+      VNU_CROSS_LOOKUP_BULK_MAX_TARGETS: "75",
+    };
 
-    expect(response.status).toBe(404);
-    await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_CROSS_LOOKUP_NOT_CONVERGED" } });
-    expect(probeBudget.count).toBe(0);
-    expect(transcriptSpy).not.toHaveBeenCalled();
-  });
-
-  it("permits far walking only when the test environment sets literal true", async () => {
-    setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET, VNU_FAR_WALK_ENABLED: "true" });
-    transcriptSpy.mockImplementation(async (stdId: string) => {
-      const studentCode = 20_000_000 + Number(stdId) - 1_000;
-      return `<table><tr><td>Sinh viên: SYNTHETIC TARGET</td><td>Mã số: ${studentCode}</td><td>Lớp quản lý: QH-SYNTHETIC</td></tr></table>`;
+    expect(selfHostedRuntimeConfig({
+      HYEB_SESSION_SECRET: SESSION_SECRET,
+      VNU_CODE_LOOKUP_CONCURRENCY: "32",
+    }, fileConfig)).toMatchObject({
+      VNU_CODE_LOOKUP_CONCURRENCY: "32",
+      VNU_CROSS_LOOKUP_BULK_MAX_TARGETS: "75",
     });
-
-    const response = await authorizedRequest("stdCode=20000100&allowCrossLookup=true", "student-id");
-
-    expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toMatchObject({ data: { stdId: "00000001100", stdCode: "20000100" } });
-    expect(probeBudget.count).toBeGreaterThan(0);
   });
 
-  it.each([true, "true", 1, "1", "TRUE", "True"])("ignores config-file far-walk value %j", (configValue) => {
-    const fileConfig = { VNU_FAR_WALK_ENABLED: configValue } as unknown as RuntimeConfig;
-
-    const config = selfHostedRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET }, fileConfig);
-
-    expect(config.VNU_FAR_WALK_ENABLED).toBeUndefined();
-    expect(isVnuFarWalkEnabled(config.VNU_FAR_WALK_ENABLED)).toBe(false);
-  });
-
-  it.each([undefined, "false", "1", "TRUE", "True", " true", "true "])("rejects non-literal environment value %j", (environmentValue) => {
-    const config = selfHostedRuntimeConfig({
-      HYEB_SESSION_SECRET: SESSION_SECRET,
-      VNU_FAR_WALK_ENABLED: environmentValue,
-    }, {});
-
-    expect(isVnuFarWalkEnabled(config.VNU_FAR_WALK_ENABLED)).toBe(false);
-  });
-
-  it("enables far walking for the exact environment string true", () => {
-    const config = selfHostedRuntimeConfig({
-      HYEB_SESSION_SECRET: SESSION_SECRET,
-      VNU_FAR_WALK_ENABLED: "true",
-    }, {});
-
-    expect(isVnuFarWalkEnabled(config.VNU_FAR_WALK_ENABLED)).toBe(true);
-  });
 });

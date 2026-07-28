@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { api, getActiveAccount, isSessionDeathCode, listAccounts, type StoredAccount } from "./api";
+import { api, getActiveAccount, isSessionDeathCode, listAccounts, switchAccount, type StoredAccount } from "./api";
 
 class MemoryStorage implements Storage {
   private readonly values = new Map<string, string>();
@@ -35,6 +35,21 @@ const ACCOUNT: StoredAccount = {
   token: "stored-session-token",
   studentCode: "SYNTHETIC-STUDENT",
   addedAt: "2026-07-27T00:00:00.000Z",
+};
+
+const SECOND_ACCOUNT: StoredAccount = {
+  id: "vnu-account-99",
+  universityId: "vnu",
+  token: "stored-session-token-99",
+  studentCode: "SYNTHETIC-STUDENT-99",
+  addedAt: "2099-12-31T00:00:00.000Z",
+};
+
+const UET_ACCOUNT: StoredAccount = {
+  ...ACCOUNT,
+  id: "uet-account",
+  universityId: "uet",
+  token: "stored-uet-session-token",
 };
 
 function seedAccount(): void {
@@ -82,6 +97,20 @@ describe("frontend session-death policy", () => {
     expect(localStorage.getItem("hyeboard.activeAccountId")).toBe(ACCOUNT.id);
   });
 
+  it("keeps a code-less 401 inline without removing the account", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      data: null,
+      error: { message: "Synthetic code-less failure" },
+    }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    })));
+
+    await expect(requestCrossLookup()).rejects.toMatchObject({ code: undefined, status: 401 });
+    expect(listAccounts()).toEqual([ACCOUNT]);
+    expect(getActiveAccount()).toEqual(ACCOUNT);
+  });
+
   it.each(["MISSING_SESSION", "SESSION_EXPIRED", "INVALID_SESSION"])("clears stored state for genuine session-death code %s", async (code) => {
     rejectNextRequest(code, 401);
 
@@ -127,5 +156,87 @@ describe("frontend session-death policy", () => {
     expect(studentCode).toEqual({ studentCode: "20000001", studentName: undefined, className: undefined });
     expect(crossTranscript).not.toHaveProperty("notice");
     expect(bulk[0]?.status === "ok" ? bulk[0].result : undefined).not.toHaveProperty("notice");
+  });
+
+  it("removes only the inactive originating UET account when its request dies late", async () => {
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([UET_ACCOUNT, SECOND_ACCOUNT]));
+    localStorage.setItem("hyeboard.activeAccountId", UET_ACCOUNT.id);
+    let releaseResponse!: (response: Response) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((resolve) => { releaseResponse = resolve; })));
+
+    const pending = requestCrossLookup();
+    switchAccount(SECOND_ACCOUNT.id);
+    releaseResponse(new Response(JSON.stringify({ data: null, error: { code: "INVALID_SESSION", message: "Synthetic expired request" } }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    }));
+
+    await expect(pending).rejects.toMatchObject({ code: "INVALID_SESSION" });
+    expect(getActiveAccount()).toEqual(SECOND_ACCOUNT);
+    expect(listAccounts()).toEqual([SECOND_ACCOUNT]);
+  });
+
+  it("writes a late refresh to the unchanged originating account after an account switch", async () => {
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([ACCOUNT, SECOND_ACCOUNT]));
+    let releaseResponse!: (response: Response) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((resolve) => { releaseResponse = resolve; })));
+
+    const pending = requestCrossLookup();
+    switchAccount(SECOND_ACCOUNT.id);
+    releaseResponse(new Response(JSON.stringify({
+      data: { stdCode: "SYNTHETIC-STUDENT", stdId: "99000000101", probes: 1 },
+      error: null,
+      meta: { refreshedToken: "late-refreshed-session-token" },
+    }), { headers: { "Content-Type": "application/json" } }));
+
+    await expect(pending).resolves.toBeUndefined();
+    expect(getActiveAccount()).toEqual(SECOND_ACCOUNT);
+    expect(listAccounts()).toEqual([{ ...ACCOUNT, token: "late-refreshed-session-token" }, SECOND_ACCOUNT]);
+  });
+
+  it("does not overwrite a same-account relogin with a late refresh", async () => {
+    let releaseResponse!: (response: Response) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((resolve) => { releaseResponse = resolve; })));
+
+    const pending = requestCrossLookup();
+    const reloggedAccount = { ...ACCOUNT, token: "relogged-session-token" };
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([reloggedAccount]));
+    releaseResponse(new Response(JSON.stringify({
+      data: { stdCode: "SYNTHETIC-STUDENT", stdId: "99000000101", probes: 1 },
+      error: null,
+      meta: { refreshedToken: "stale-refreshed-session-token" },
+    }), { headers: { "Content-Type": "application/json" } }));
+
+    await expect(pending).resolves.toBeUndefined();
+    expect(getActiveAccount()).toEqual(reloggedAccount);
+  });
+
+  it("does not remove a same-account relogin when the old request expires late", async () => {
+    let releaseResponse!: (response: Response) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((resolve) => { releaseResponse = resolve; })));
+
+    const pending = requestCrossLookup();
+    const reloggedAccount = { ...ACCOUNT, token: "relogged-session-token" };
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([reloggedAccount]));
+    releaseResponse(new Response(JSON.stringify({
+      data: null,
+      error: { code: "VNU_SESSION_EXPIRED", message: "Synthetic old session expiry" },
+    }), { status: 401, headers: { "Content-Type": "application/json" } }));
+
+    await expect(pending).rejects.toMatchObject({ code: "VNU_SESSION_EXPIRED" });
+    expect(listAccounts()).toEqual([reloggedAccount]);
+    expect(getActiveAccount()).toEqual(reloggedAccount);
+  });
+
+  it("still applies a refresh to the unchanged initiating account", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      data: { stdCode: "SYNTHETIC-STUDENT", stdId: "99000000101", probes: 1 },
+      error: null,
+      meta: { refreshedToken: "same-account-refreshed-token" },
+    }), { headers: { "Content-Type": "application/json" } })));
+
+    await requestCrossLookup();
+
+    expect(getActiveAccount()).toEqual({ ...ACCOUNT, token: "same-account-refreshed-token" });
   });
 });

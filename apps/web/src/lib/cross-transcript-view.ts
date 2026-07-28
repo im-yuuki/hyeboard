@@ -1,5 +1,6 @@
-import type { VnuProfile } from "@hyeboard/university-adapters/src/vnu/types";
+import type { VnuProfile, VnuTranscriptRow } from "@hyeboard/university-adapters/src/vnu/types";
 import type { VnuCrossTranscript, VnuCrossTranscriptInput } from "./api";
+import type { AcademicTermSummary } from "./term-academic-summary";
 
 export type CrossTranscriptInputState = {
   input: string;
@@ -13,7 +14,7 @@ export type CrossTranscriptErrorKind = "notFound" | "rateLimited" | "temporarily
 export type CrossTranscriptView =
   | { kind: "prompt" | "ready" | "invalid" | "selfTarget" | "loading" | "notFound" | "noRows" }
   | { kind: "error"; errorKind: CrossTranscriptErrorKind }
-  | { kind: "success"; transcript: VnuCrossTranscript; rowCount: number };
+  | { kind: "success"; transcript: VnuCrossTranscript; rowCount: number; derivedTerms: AcademicTermSummary<VnuTranscriptRow>[] };
 
 export function deriveCrossTranscriptInput(
   mode: VnuCrossTranscriptInput["mode"],
@@ -47,8 +48,9 @@ export function deriveCrossTranscriptView(options: {
   errorCode?: string;
   hasError: boolean;
   transcript?: VnuCrossTranscript;
+  derivedTerms: AcademicTermSummary<VnuTranscriptRow>[];
 }): CrossTranscriptView {
-  const { input, submitted, isLoading, errorCode, hasError, transcript } = options;
+  const { input, submitted, isLoading, errorCode, hasError, transcript, derivedTerms } = options;
   if (!input.input) return { kind: "prompt" };
   if (!input.isValid) return { kind: "invalid" };
   if (input.isSelfTarget) return { kind: "selfTarget" };
@@ -62,5 +64,5 @@ export function deriveCrossTranscriptView(options: {
 
   const rowCount = transcript.terms.reduce((count, term) => count + term.rows.length, 0);
   if (rowCount === 0) return { kind: "noRows" };
-  return { kind: "success", transcript, rowCount };
+  return { kind: "success", transcript, rowCount, derivedTerms };
 }

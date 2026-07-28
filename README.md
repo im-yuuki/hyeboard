@@ -17,13 +17,13 @@ pnpm install
 pnpm dev          # runs web (Vite, :5173) + worker (wrangler dev, :8787) together
 ```
 
-Required env for local dev, `apps/worker/.dev.vars` (gitignored):
+Local dev env, `apps/worker/.dev.vars` (gitignored): `HYEB_SESSION_SECRET` is required. Remaining values are optional; defaults shown.
 
 ```txt
 HYEB_SESSION_SECRET=replace-with-at-least-32-random-bytes
 HYEB_ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
-# Only the literal value true enables far walking. Keep false until sanitized live evidence verifies monotonicity.
-VNU_FAR_WALK_ENABLED=false
+VNU_CODE_LOOKUP_CONCURRENCY=16
+VNU_CROSS_LOOKUP_BULK_MAX_TARGETS=50
 ```
 
 Optional, `apps/web/.env.local`:
@@ -47,8 +47,11 @@ Two supported targets:
 **Cloudflare Workers** (single Worker serving the API + the built web app as static assets):
 
 ```bash
-pnpm deploy        # wrangler deploy
+pnpm build:web     # required immediately before every deployment
+pnpm deploy        # uploads the Worker and the current apps/web/dist assets
 ```
+
+`pnpm deploy` does not rebuild the frontend. Always run `pnpm build:web` immediately before it; otherwise Wrangler can upload a stale `apps/web/dist` while deploying the single Worker.
 
 **Self-hosted (Node.js/Bun)** — produces a standalone `dist/` directory with the bundled worker, the built web app, and a runtime `config.json`:
 
@@ -60,7 +63,11 @@ cp .env.example .env   # fill in HYEB_SESSION_SECRET
 node dist/index.js      # or: bun run dist/index.js
 ```
 
-Non-secret runtime configuration for allowed origins, host/port, and browser automation lives in `dist/config.json`; only `HYEB_SESSION_SECRET` is secret. The far-walk release gate is environment-only: exactly `VNU_FAR_WALK_ENABLED=true` enables it in Node/Bun, or the same literal string in the Cloudflare binding. Config-file values, numeric values, and mixed-case variants cannot enable it. VNU cross-lookup probe enforcement requires the Cloudflare `VNU_PROBE_BUDGET` Durable Object binding; self-hosted runtimes fail those probes closed with `VNU_PROBE_BUDGET_UNAVAILABLE`. Every cross-lookup response uses `Cache-Control: no-store`, and foreign-student DTOs exclude raw portal notices. Bulk lookup reserves each chunk's conservative worst-case units atomically before upstream work (1 per direct ID lookup/transcript, 22 per code resolver); unused reserved units remain consumed by design. Malformed targets produce ordered per-item errors; only empty input or more than 50 unique targets rejects a whole client run.
+Non-secret runtime configuration lives in `dist/config.json`; environment variables override matching file values. VNU resolver settings use `vnu.code_lookup_concurrency` and `vnu.cross_lookup_bulk_max_targets` in JSON, or `VNU_CODE_LOOKUP_CONCURRENCY` and `VNU_CROSS_LOOKUP_BULK_MAX_TARGETS` in the environment. Canonical non-negative base-10 safe integers are accepted; concurrency must be positive. Missing values default to 16 and 50. Malformed concurrency falls back to 1, while malformed bulk configuration disables bulk with 0. There is no product ceiling below JavaScript's safe-integer bound.
+
+VNU cross lookup requires the Cloudflare `VNU_PROBE_BUDGET` Durable Object. Self-hosted Node/Bun deployments fail cross lookup closed and omit its runtime limit metadata. The browser hides bulk when metadata is missing or zero, enforces the published whole-run maximum, and still sends sequential chunks of three code targets or five direct-ID/transcript targets. The Worker atomically reserves 1 unit for direct lookups, 33 for code-to-ID, and 34 for code-to-transcript before Brc1 work. Reservations are per session, authoritative, and non-refundable.
+
+Exports are explicit browser-only JSON or CSV downloads built from sanitized result models. They do not refetch, persist, or send result content to the server. Derived term GPA/CPA values exclude missing grades and remain labeled separately from portal-reported cumulative values.
 
 ## Security
 
