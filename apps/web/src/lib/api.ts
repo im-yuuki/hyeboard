@@ -1,10 +1,15 @@
-import type { ApiResponse, Assignment, ClassSession, Course, DashboardSummary, DocumentItem, ExamSession, Grade, NewsItem, ServiceRequest, Term, TrainingPoint, TuitionStatus, University } from "@hyeboard/schemas";
+import { apiErrorDetailsSchema, type ApiErrorDetails, type ApiResponse, type Assignment, type ClassSession, type Course, type DashboardSummary, type DocumentItem, type ExamSession, type Grade, type NewsItem, type ServiceRequest, type Term, type TrainingPoint, type TuitionStatus, type University } from "@hyeboard/schemas";
 import type { VnuExamCatalogRow, VnuPointDetail, VnuProfile, VnuTranscript } from "@hyeboard/university-adapters/src/vnu/types";
 import { mapExamRow, mapGpaSummary, mapGradeRow, mapProfile, mapSyllabusRow, mapTerms, mapTrainingPoints } from "@hyeboard/university-adapters/src/vnu/mapper";
 import { parseExamCatalogHtml, parseExamTermOptions, parseExamsHtml, parseGradesHtml, parsePointDetailHtml, parseProfileHtml, parseStudyProgressHtml, parseSyllabusHtml } from "@hyeboard/university-adapters/src/vnu/parser";
 import { createLinkedAbortController } from "./abort-deadline";
 import { canReauthenticateInline, requestInlineReauth } from "./reauth";
 import { readUetSessionStream } from "./uet-session-stream";
+import { ApiError, markVnuRefreshAttempted, wasVnuRefreshAttempted, type AuthResult, type ImportSessionInput, type StoredAccount } from "./api-types";
+import { classifyVnuRecovery, clearVnuRefreshGrant, readVnuRefreshGrant, requestPolicyFor, runVnuRefresh, storeVnuRefreshGrant, VNU_REQUEST_NOT_REPLAYED, VnuRequestNotReplayedError, type VnuRequestPolicy } from "./vnu-refresh";
+
+export { ApiError } from "./api-types";
+export type { AuthResult, ImportSessionInput, StoredAccount } from "./api-types";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
 const SESSION_KEY = "hyeboard.sessionToken";
@@ -24,7 +29,7 @@ function uuid(): string {
 // (e.g. a feature that needs a learning-platform credential the user never provided) is
 // a feature-specific problem that should NOT log the user out of a session
 // that is otherwise perfectly valid.
-const SESSION_INVALID_CODES: ReadonlySet<string> = new Set(["MISSING_SESSION", "SESSION_EXPIRED", "INVALID_SESSION", "VNU_SESSION_EXPIRED"]);
+const SESSION_INVALID_CODES: ReadonlySet<string> = new Set(["MISSING_SESSION", "SESSION_EXPIRED", "INVALID_SESSION"]);
 
 export function isSessionDeathCode(code: string | undefined): boolean {
   return code !== undefined && SESSION_INVALID_CODES.has(code);
@@ -41,21 +46,8 @@ export const SESSION_CLEARED_EVENT = "hyeboard:session-cleared";
 // remains). The app shell listens for this to re-sync universityId/palette
 // and refetch data for whichever account is now active.
 export const ACCOUNT_SWITCHED_EVENT = "hyeboard:account-switched";
-
-export type StoredAccount = {
-  id: string;
-  universityId: string;
-  token: string;
-  studentCode?: string;
-  addedAt: string;
-};
-
-export class ApiError extends Error {
-  constructor(message: string, public readonly code?: string, public readonly status?: number) {
-    super(message);
-    this.name = "ApiError";
-  }
-}
+export const VNU_REFRESH_COMMITTED_EVENT = "hyeboard:vnu-refresh-committed";
+export const VNU_REFRESH_STATUS_EVENT = "hyeboard:vnu-refresh-status";
 
 function readAccounts(): StoredAccount[] {
   try {
@@ -98,6 +90,10 @@ export function getActiveAccountId(): string | null {
 export function getActiveAccount(): StoredAccount | undefined {
   const id = getActiveAccountId();
   return id ? readAccounts().find((account) => account.id === id) : undefined;
+}
+
+export function getAccountById(id: string): StoredAccount | undefined {
+  return readAccounts().find((account) => account.id === id);
 }
 
 // Adds a new account or, if one already exists for this university+student
@@ -167,6 +163,27 @@ function findUnchangedStoredAccount(originatingAccount: StoredAccount | undefine
   return readAccounts().find((account) => account.id === originatingAccount.id && account.token === originatingAccount.token);
 }
 
+export function commitVnuRefresh(origin: StoredAccount, result: AuthResult): boolean {
+  const accounts = readAccounts();
+  const index = accounts.findIndex((account) => account.id === origin.id && account.token === origin.token);
+  if (index < 0 || getActiveAccountId() !== origin.id || !result.refreshGrant) return false;
+  const previousGrant = readVnuRefreshGrant(origin.id);
+  try {
+    storeVnuRefreshGrant(origin.id, result.refreshGrant);
+    accounts[index] = {
+      ...accounts[index],
+      token: result.token,
+      studentCode: result.session.studentCode ?? accounts[index].studentCode,
+    };
+    writeAccounts(accounts);
+    return true;
+  } catch (error) {
+    if (previousGrant) storeVnuRefreshGrant(origin.id, previousGrant);
+    else clearVnuRefreshGrant(origin.id);
+    throw error;
+  }
+}
+
 function setOriginatingSessionToken(originatingAccount: StoredAccount | undefined, token: string): void {
   const currentOriginatingAccount = findUnchangedStoredAccount(originatingAccount);
   if (!currentOriginatingAccount) return;
@@ -185,9 +202,27 @@ export function clearSessionToken(): void {
   else window.dispatchEvent(new CustomEvent(SESSION_CLEARED_EVENT));
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const originatingAccount = getActiveAccount();
-  const token = originatingAccount?.token;
+type InternalRequestOptions = {
+  policy?: VnuRequestPolicy;
+  noRefresh?: boolean;
+  tokenOverride?: string;
+};
+
+function apiErrorFromPayload(payload: ApiResponse<unknown>, response: Response): ApiError {
+  return new ApiError(
+    payload.error?.message ?? `Request failed: ${response.status}`,
+    payload.error?.code,
+    response.status,
+    parseApiErrorDetails(payload.error?.details),
+  );
+}
+
+function parseApiErrorDetails(details: unknown): ApiErrorDetails | undefined {
+  const parsed = apiErrorDetailsSchema.strip().safeParse(details);
+  return parsed.success ? parsed.data : undefined;
+}
+
+async function executeRequest<T>(path: string, init: RequestInit, token: string | undefined): Promise<{ data: T; meta?: Record<string, unknown> }> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...init,
     headers: {
@@ -203,7 +238,86 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     throw new ApiError(`Request failed: ${response.status} ${response.statusText}`, undefined, response.status);
   }
   if (!response.ok || payload.error) {
-    const code = payload.error?.code;
+    throw apiErrorFromPayload(payload, response);
+  }
+  return { data: payload.data as T, meta: payload.meta };
+}
+
+function reducedPolicy(routePolicy: VnuRequestPolicy, override: VnuRequestPolicy | undefined): VnuRequestPolicy {
+  if (!override || override === routePolicy) return routePolicy;
+  if (override === "never") return "never";
+  if (routePolicy === "safe-replay" && override === "refresh-no-replay") return "refresh-no-replay";
+  return routePolicy;
+}
+
+function normalizeRefreshError(error: unknown): ApiError {
+  if (error instanceof ApiError) return error;
+  if (error instanceof DOMException && error.name === "AbortError") {
+    return new ApiError("VNU reconnect was cancelled.", "VNU_REFRESH_CANCELLED", 499);
+  }
+  return new ApiError("VNU reconnect failed. Try again.", "VNU_REFRESH_NETWORK_ERROR", 503);
+}
+
+function removeUnchangedOrigin(account: StoredAccount): void {
+  if (getActiveAccountId() !== account.id || !findUnchangedStoredAccount(account)) return;
+  clearVnuRefreshGrant(account.id);
+  removeAccount(account.id);
+}
+
+const refreshDeps = {
+  getAccount: getAccountById,
+  getActiveAccountId,
+  fetchRefresh: async (account: StoredAccount, grant: string, signal: AbortSignal): Promise<AuthResult> => {
+    const result = await executeRequest<AuthResult>("/api/vnu/auth/refresh", {
+      method: "POST",
+      body: JSON.stringify({ refreshGrant: grant }),
+      signal,
+      cache: "no-store",
+    }, account.token);
+    return result.data;
+  },
+  commit: commitVnuRefresh,
+  terminal: removeUnchangedOrigin,
+  invalidate: (accountId: string) => window.dispatchEvent(new CustomEvent(VNU_REFRESH_COMMITTED_EVENT, { detail: { accountId } })),
+  status: (accountId: string, state: "reconnecting" | "retryable" | "idle") => window.dispatchEvent(new CustomEvent(VNU_REFRESH_STATUS_EVENT, { detail: { accountId, state } })),
+};
+
+async function request<T>(path: string, init: RequestInit = {}, internal: InternalRequestOptions = {}): Promise<T> {
+  const originatingAccount = getActiveAccount();
+  const failedToken = internal.tokenOverride ?? originatingAccount?.token;
+  try {
+    const result = await executeRequest<T>(path, init, failedToken);
+    const refreshedToken = result.meta?.refreshedToken;
+    if (typeof refreshedToken === "string" && refreshedToken) setOriginatingSessionToken(originatingAccount, refreshedToken);
+    return result.data;
+  } catch (error) {
+    if (!(error instanceof ApiError)) throw error;
+
+    if (originatingAccount?.universityId === "vnu" && classifyVnuRecovery(error)) {
+      const routePolicy = requestPolicyFor({ method: init.method ?? "GET", pathname: path });
+      const policy = reducedPolicy(routePolicy, internal.policy);
+      if (internal.noRefresh || policy === "never") throw error;
+      if (!readVnuRefreshGrant(originatingAccount.id)) {
+        removeUnchangedOrigin(originatingAccount);
+        throw error;
+      }
+      let outcome;
+      try {
+        outcome = await runVnuRefresh(originatingAccount, init.signal ?? undefined, refreshDeps);
+      } catch (refreshError) {
+        throw markVnuRefreshAttempted(normalizeRefreshError(refreshError));
+      }
+      if (outcome.kind === "stale") throw markVnuRefreshAttempted(error);
+      if (policy === "refresh-no-replay") throw markVnuRefreshAttempted(new VnuRequestNotReplayedError());
+      try {
+        return await request<T>(path, init, { noRefresh: true, tokenOverride: outcome.auth.token });
+      } catch (replayError) {
+        if (replayError instanceof ApiError) throw markVnuRefreshAttempted(replayError);
+        throw markVnuRefreshAttempted(normalizeRefreshError(replayError));
+      }
+    }
+
+    const code = error.code;
     const sessionDied = isSessionDeathCode(code);
     // The worker's lazy upstream refresh can stall on a StudentHub CAPTCHA
     // its server-side OCR couldn't solve. With stored credentials that is
@@ -219,14 +333,51 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       if (originatingAccountIsActive && canReauthenticateInline(currentOriginatingAccount.universityId)) requestInlineReauth();
       else if (sessionDied && currentOriginatingAccount) removeAccount(currentOriginatingAccount.id);
     }
-    throw new ApiError(payload.error?.message ?? `Request failed: ${response.status}`, code, response.status);
+    throw error;
   }
-  // Silent session refresh: the worker may refresh an expired UET upstream
-  // credential through Google automation or the parent direct CAPTCHA API,
-  // then return a fresh encrypted token via meta.refreshedToken.
-  const refreshedToken = payload.meta?.refreshedToken;
-  if (typeof refreshedToken === "string" && refreshedToken) setOriginatingSessionToken(originatingAccount, refreshedToken);
-  return payload.data as T;
+}
+
+export function shouldRetryQuery(failureCount: number, error: unknown): boolean {
+  if (failureCount >= 1) return false;
+  if (wasVnuRefreshAttempted(error)) return false;
+  if (classifyVnuRecovery(error)) return false;
+  if (!(error instanceof ApiError)) return true;
+  return !isSessionDeathCode(error.code) && error.code !== VNU_REQUEST_NOT_REPLAYED;
+}
+
+const INVALIDATABLE_VNU_QUERY_NAMES: ReadonlySet<string> = new Set([
+  "dashboard",
+  "terms",
+  "timetable",
+  "courses",
+  "assignments",
+  "grades",
+  "exams",
+  "documents",
+  "tuition",
+  "news",
+  "training-points",
+  "requests",
+  "vnu-point-detail",
+  "vnu-lookup-catalog",
+  "vnu-lookup-profile",
+]);
+
+type VnuRefreshQueryCandidate = {
+  queryKey: readonly unknown[];
+  isActive(): boolean;
+};
+
+export function shouldInvalidateVnuRefreshQuery(
+  query: VnuRefreshQueryCandidate,
+  recoveredAccountId: string,
+  activeAccountId: string | null,
+): boolean {
+  if (recoveredAccountId !== activeAccountId || !query.isActive()) return false;
+  const [queryName, universityId] = query.queryKey;
+  return universityId === "vnu"
+    && typeof queryName === "string"
+    && INVALIDATABLE_VNU_QUERY_NAMES.has(queryName);
 }
 
 function queryString(params: Record<string, string | undefined>): string {
@@ -407,9 +558,10 @@ export const api = {
   vnuCrossStudentId: (params: { stdCode: string }) => vnuCrossStudentId(params),
   vnuCrossTranscript: (input: VnuCrossTranscriptInput) => vnuCrossTranscript(input),
   vnuCrossLookupBulk: (mode: VnuBulkLookupMode, targets: string[], signal?: AbortSignal) => vnuCrossLookupBulk(mode, targets, signal),
-  importSession: async (universityId: string, body: { studentCode?: string; studenthubGoogleCredential?: string; studenthubToken?: string; studenthubCookie?: string; canvasToken?: string; canvasCookie?: string; canvasCsrfToken?: string; vnuUsername?: string; vnuPassword?: string }) => {
-    const data = await request<{ token: string; session?: { studentCode?: string } }>(`/api/${universityId}/auth/import-session`, { method: "POST", body: JSON.stringify(body) });
-    upsertAccount(universityId, data.token, data.session?.studentCode);
+  importSession: async (universityId: string, body: ImportSessionInput) => {
+    const data = await request<AuthResult>(`/api/${universityId}/auth/import-session`, { method: "POST", body: JSON.stringify(body) });
+    const account = upsertAccount(universityId, data.token, data.session?.studentCode);
+    if (universityId === "vnu" && data.refreshGrant) storeVnuRefreshGrant(account.id, data.refreshGrant);
     return data;
   },
   // UET Google automation can take 90s+; parent direct login may pause for a
@@ -451,7 +603,8 @@ export const api = {
         } catch {
           // Body wasn't JSON either — fall through to the generic error below.
         }
-        throw new ApiError(payload?.error?.message ?? `Request failed: ${response.status}`, payload?.error?.code, response.status);
+        if (payload) throw apiErrorFromPayload(payload, response);
+        throw new ApiError(`Request failed: ${response.status}`, undefined, response.status);
       }
       const reader = response.body.getReader();
       const data = await readUetSessionStream(reader, {
