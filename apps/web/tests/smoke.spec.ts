@@ -90,13 +90,29 @@ async function openMockedLookup(page: import("@playwright/test").Page, bulkMaxim
   return requestCounts;
 }
 
-function trackApiRequestCounts(page: import("@playwright/test").Page) {
+type ApiRequestSnapshot = {
+  total: number;
+  paths: Array<readonly [string, number]>;
+};
+
+type ApiRequestTracker = {
+  count(path: string): number;
+  snapshot(): ApiRequestSnapshot;
+};
+
+function trackApiRequestCounts(page: import("@playwright/test").Page): ApiRequestTracker {
   const counts = new Map<string, number>();
   page.on("request", (request) => {
     const path = new URL(request.url()).pathname;
     if (path.startsWith("/api/")) counts.set(path, (counts.get(path) ?? 0) + 1);
   });
-  return (path: string) => counts.get(path) ?? 0;
+  return {
+    count: (path) => counts.get(path) ?? 0,
+    snapshot: () => {
+      const paths = [...counts.entries()].sort(([left], [right]) => left.localeCompare(right));
+      return { total: paths.reduce((total, [, count]) => total + count, 0), paths };
+    },
+  };
 }
 
 function parseDownloadedRfc4180Csv(input: string): string[][] {
@@ -105,6 +121,7 @@ function parseDownloadedRfc4180Csv(input: string): string[][] {
   let row: string[] = [];
   let field = "";
   let quoted = false;
+  let quoteClosed = false;
   let index = 1;
 
   while (index < input.length) {
@@ -117,6 +134,7 @@ function parseDownloadedRfc4180Csv(input: string): string[][] {
       }
       if (character === '"') {
         quoted = false;
+        quoteClosed = true;
         index += 1;
         continue;
       }
@@ -124,8 +142,11 @@ function parseDownloadedRfc4180Csv(input: string): string[][] {
       index += 1;
       continue;
     }
+    if (quoteClosed && character !== "," && character !== "\r") {
+      throw new Error("Unexpected character after closing CSV quote");
+    }
     if (character === '"') {
-      expect(field).toBe("");
+      if (field !== "") throw new Error("Unexpected quote inside unquoted CSV field");
       quoted = true;
       index += 1;
       continue;
@@ -133,51 +154,236 @@ function parseDownloadedRfc4180Csv(input: string): string[][] {
     if (character === ",") {
       row.push(field);
       field = "";
+      quoteClosed = false;
       index += 1;
       continue;
     }
     if (character === "\r") {
-      expect(input[index + 1]).toBe("\n");
+      if (input[index + 1] !== "\n") throw new Error("CSV records must use CRLF separators");
       row.push(field);
       rows.push(row);
       row = [];
       field = "";
+      quoteClosed = false;
       index += 2;
       continue;
     }
-    expect(character).not.toBe("\n");
+    if (character === "\n") throw new Error("Bare LF outside a quoted CSV field");
     field += character;
     index += 1;
   }
 
-  expect(quoted).toBe(false);
-  expect(row).toEqual([]);
-  expect(field).toBe("");
+  if (quoted) throw new Error("Unclosed quoted CSV field");
+  if (quoteClosed || row.length > 0 || field.length > 0) {
+    row.push(field);
+    rows.push(row);
+  }
   return rows;
 }
 
+type DownloadedIdentity = {
+  studentCode?: string;
+  internalStudentId?: string;
+  studentName?: string;
+  managingClass?: string;
+};
+
+type DownloadedCourse = {
+  courseCode: string;
+  courseName: string;
+  credits?: number;
+  point10?: number;
+  letter?: string;
+  point4?: number;
+};
+
+type DownloadedTerm = {
+  termCode: string;
+  termLabel?: string;
+  estimateKind?: string;
+  listedCredits?: number;
+  includedCredits?: number;
+  termGpa4?: number;
+  derivedCpa4?: number;
+  courses: DownloadedCourse[];
+  [key: string]: unknown;
+};
+
+type DownloadedResult = {
+  target?: string;
+  status?: string;
+  identity?: DownloadedIdentity;
+  classResult?: { classCode: string; classNumber?: string; classId: string; courseName?: string };
+  resolver?: { resolvedStudentCode: string; resolvedInternalStudentId: string; probes: number };
+  reported?: { cumulativeGpa4?: number };
+  derivedTerms?: DownloadedTerm[];
+  result?: DownloadedResult;
+};
+
 type DownloadedExport = {
   surface: string;
+  universityId?: string;
+  query?: { mode: string; value: string };
+  identity?: DownloadedIdentity;
   reported?: { cumulativeGpa4?: number };
-  derivedTerms?: Array<{
-    termCode: string;
-    termGpa4?: number;
-    derivedCpa4?: number;
-    courses: Array<{ courseName: string; [key: string]: unknown }>;
-    [key: string]: unknown;
-  }>;
+  derivedTerms?: DownloadedTerm[];
   run?: { status: string; mode: string; processedCount: number; totalCount: number };
-  results?: Array<Record<string, unknown>>;
+  results?: DownloadedResult[];
+};
+
+type CsvRecord = Record<string, string>;
+type CsvExpectation = Record<string, string>;
+
+function csvIdentifier(value: string): string {
+  return `'${value}`;
+}
+
+function csvValue(value: string | number | undefined): string {
+  return value === undefined ? "" : String(value);
+}
+
+function expectCsvRecordsInOrder(records: CsvRecord[], expectations: CsvExpectation[]): void {
+  let nextRecordIndex = 0;
+  for (const expectedRecord of expectations) {
+    const relativeIndex = records.slice(nextRecordIndex).findIndex((record) => (
+      Object.entries(expectedRecord).every(([field, value]) => record[field] === value)
+    ));
+    expect(relativeIndex, `Missing ordered CSV record ${JSON.stringify(expectedRecord)}`).toBeGreaterThanOrEqual(0);
+    nextRecordIndex += relativeIndex + 1;
+  }
+}
+
+function expectAcademicCsvMatchesJson(model: DownloadedExport, records: CsvRecord[]): void {
+  const expectedRecords: CsvExpectation[] = [];
+  if (model.query) {
+    expectedRecords.push({ record_type: "query", query_mode: model.query.mode, query_value: csvIdentifier(model.query.value) });
+  }
+  if (model.identity) {
+    expectedRecords.push({
+      record_type: "identity",
+      student_code: model.identity.studentCode ? csvIdentifier(model.identity.studentCode) : "",
+      internal_student_id: model.identity.internalStudentId ? csvIdentifier(model.identity.internalStudentId) : "",
+      student_name: model.identity.studentName ?? "",
+      managing_class: model.identity.managingClass ? csvIdentifier(model.identity.managingClass) : "",
+    });
+  }
+  if (model.reported) {
+    expectedRecords.push({ record_type: "reported_summary", reported_cumulative_gpa4: csvValue(model.reported.cumulativeGpa4) });
+  }
+  for (const term of model.derivedTerms ?? []) {
+    expectedRecords.push({
+      record_type: "term_summary",
+      term_code: csvIdentifier(term.termCode),
+      listed_credits: csvValue(term.listedCredits),
+      included_credits: csvValue(term.includedCredits),
+      term_gpa4: csvValue(term.termGpa4),
+      derived_cpa4: csvValue(term.derivedCpa4),
+    });
+    for (const course of term.courses) {
+      expectedRecords.push({
+        record_type: "course",
+        term_code: csvIdentifier(term.termCode),
+        course_code: csvIdentifier(course.courseCode),
+        course_name: course.courseName,
+        credits: csvValue(course.credits),
+        point10: csvValue(course.point10),
+        letter: csvValue(course.letter),
+        point4: csvValue(course.point4),
+      });
+    }
+  }
+  expectCsvRecordsInOrder(records, expectedRecords);
+}
+
+function expectClassCsvMatchesJson(model: DownloadedExport, records: CsvRecord[]): void {
+  const classResult = model.results?.[0]?.classResult;
+  expect(model.query).toBeDefined();
+  expect(classResult).toBeDefined();
+  expectCsvRecordsInOrder(records, [
+    { record_type: "query", query_mode: model.query!.mode, query_value: csvIdentifier(model.query!.value) },
+    {
+      record_type: "result",
+      class_code: csvIdentifier(classResult!.classCode),
+      class_number: classResult!.classNumber ? csvIdentifier(classResult!.classNumber) : "",
+      class_id: csvIdentifier(classResult!.classId),
+      course_name: classResult!.courseName ?? "",
+    },
+  ]);
+}
+
+function expectResolverCsvMatchesJson(model: DownloadedExport, records: CsvRecord[]): void {
+  const result = model.results?.[0];
+  expect(model.query).toBeDefined();
+  expect(result).toBeDefined();
+  const resultExpectation: CsvExpectation = result?.resolver
+    ? {
+        record_type: "result",
+        resolved_student_code: csvIdentifier(result.resolver.resolvedStudentCode),
+        resolved_internal_student_id: csvIdentifier(result.resolver.resolvedInternalStudentId),
+        probes: String(result.resolver.probes),
+      }
+    : {
+        record_type: "result",
+        student_code: result?.identity?.studentCode ? csvIdentifier(result.identity.studentCode) : "",
+        internal_student_id: result?.identity?.internalStudentId ? csvIdentifier(result.identity.internalStudentId) : "",
+        student_name: result?.identity?.studentName ?? "",
+      };
+  expectCsvRecordsInOrder(records, [
+    { record_type: "query", query_mode: model.query!.mode, query_value: csvIdentifier(model.query!.value) },
+    resultExpectation,
+  ]);
+}
+
+function expectBulkCsvMatchesJson(model: DownloadedExport, records: CsvRecord[]): void {
+  const run = model.run;
+  const results = model.results ?? [];
+  expect(run).toBeDefined();
+  expect(results).toHaveLength(run!.processedCount);
+
+  const firstRowsByItem = results.map((_, index) => records.find((record) => record.item_index === String(index + 1)));
+  expect(firstRowsByItem.every(Boolean)).toBe(true);
+  expect(firstRowsByItem.map((record) => record!.target)).toEqual(results.map((item) => csvIdentifier(item.target!)));
+  expect(new Set(records.filter((record) => record.item_index).map((record) => record.item_index)).size).toBe(run!.processedCount);
+
+  results.forEach((item, index) => {
+    const itemRows = records.filter((record) => record.item_index === String(index + 1));
+    expect(itemRows.length).toBeGreaterThan(0);
+    expect(itemRows.every((record) => record.run_status === run!.status && record.status === item.status)).toBe(true);
+    expect(itemRows.every((record) => record.target === csvIdentifier(item.target!))).toBe(true);
+    const result = item.result;
+    if (result?.identity) {
+      expect(itemRows.some((record) => record.student_code === csvIdentifier(result.identity!.studentCode!))).toBe(true);
+    }
+    if (result?.resolver) {
+      expect(itemRows.some((record) => (
+        record.resolved_student_code === csvIdentifier(result.resolver!.resolvedStudentCode)
+        && record.resolved_internal_student_id === csvIdentifier(result.resolver!.resolvedInternalStudentId)
+      ))).toBe(true);
+    }
+    if (result?.derivedTerms?.[0]) {
+      const term = result.derivedTerms[0];
+      expectCsvRecordsInOrder(itemRows, [
+        { record_type: "term_summary", term_code: csvIdentifier(term.termCode), term_gpa4: csvValue(term.termGpa4), derived_cpa4: csvValue(term.derivedCpa4) },
+        { record_type: "course", term_code: csvIdentifier(term.termCode), course_code: csvIdentifier(term.courses[0]!.courseCode), course_name: term.courses[0]!.courseName },
+      ]);
+    }
+  });
+}
+
+type ExportFormatExpectations = {
+  sourcePath: string;
+  assertCsv(model: DownloadedExport, records: CsvRecord[]): void;
 };
 
 async function expectExportFormats(
   page: import("@playwright/test").Page,
   surface: string,
-  relevantRequestCount: () => number,
+  apiRequests: ApiRequestTracker,
+  expectations: ExportFormatExpectations,
 ): Promise<DownloadedExport> {
   const exportRoot = page.locator(`[data-export-surface="${surface}"]`).first();
   const trigger = exportRoot.getByRole("button", { name: "Export" });
-  const requestsBeforeExport = relevantRequestCount();
+  expect(apiRequests.count(expectations.sourcePath), `Expected source request ${expectations.sourcePath}`).toBeGreaterThan(0);
 
   await trigger.focus();
   await page.keyboard.press("Enter");
@@ -185,6 +391,7 @@ async function expectExportFormats(
   await page.keyboard.press("Escape");
   await expect(trigger).toBeFocused();
 
+  const requestsBeforeJson = apiRequests.snapshot();
   const jsonPromise = page.waitForEvent("download");
   await trigger.click();
   await page.getByRole("menuitem", { name: "Download JSON" }).click();
@@ -193,9 +400,10 @@ async function expectExportFormats(
   const jsonModel = JSON.parse(await downloadText(jsonDownload)) as DownloadedExport;
   expect(jsonModel.surface).toBe(surface);
   expect(jsonModel.derivedTerms?.length ?? jsonModel.results?.length ?? 0).toBeGreaterThan(0);
-  expect(relevantRequestCount()).toBe(requestsBeforeExport);
+  expect(apiRequests.snapshot()).toEqual(requestsBeforeJson);
   await expect(trigger).toBeFocused();
 
+  const requestsBeforeCsv = apiRequests.snapshot();
   const csvPromise = page.waitForEvent("download");
   await trigger.click();
   await page.getByRole("menuitem", { name: "Download CSV" }).click();
@@ -206,12 +414,66 @@ async function expectExportFormats(
   expect(csvHeader.slice(0, 3)).toEqual(["record_type", "surface", "run_status"]);
   const surfaceColumn = csvHeader.indexOf("surface");
   expect(surfaceColumn).toBeGreaterThanOrEqual(0);
-  const csvRecords = csvRows.slice(1);
+  const csvRecords = csvRows.slice(1).map((row) => Object.fromEntries(csvHeader.map((header, index) => [header, row[index] ?? ""])));
   expect(csvRecords.length).toBeGreaterThan(0);
-  expect(csvRecords.every((record) => record[surfaceColumn] === surface)).toBe(true);
-  expect(relevantRequestCount()).toBe(requestsBeforeExport);
+  expect(csvRecords.every((record) => record.surface === surface)).toBe(true);
+  expectations.assertCsv(jsonModel, csvRecords);
+  expect(apiRequests.snapshot()).toEqual(requestsBeforeCsv);
   await expect(trigger).toBeFocused();
   return jsonModel;
+}
+
+async function expectInsideViewport(page: import("@playwright/test").Page, locator: import("@playwright/test").Locator): Promise<void> {
+  const box = await locator.boundingBox();
+  expect(box).not.toBeNull();
+  const viewport = page.viewportSize();
+  expect(viewport).not.toBeNull();
+  expect(box!.x).toBeGreaterThanOrEqual(0);
+  expect(box!.y).toBeGreaterThanOrEqual(0);
+  expect(box!.x + box!.width).toBeLessThanOrEqual(viewport!.width);
+  expect(box!.y + box!.height).toBeLessThanOrEqual(viewport!.height);
+}
+
+async function readOpenMenuTheme(page: import("@playwright/test").Page) {
+  return page.getByRole("menu").evaluate((menu) => {
+    const createTokenProbe = (background: string, color: string) => {
+      const probe = document.createElement("div");
+      probe.style.backgroundColor = background;
+      probe.style.color = color;
+      document.body.append(probe);
+      const styles = getComputedStyle(probe);
+      const result = { background: styles.backgroundColor, color: styles.color };
+      probe.remove();
+      return result;
+    };
+    const cardToken = createTokenProbe("hsl(var(--card))", "hsl(var(--card-foreground))");
+    const accentToken = createTokenProbe("hsl(var(--accent))", "hsl(var(--accent-foreground))");
+    const menuStyles = getComputedStyle(menu);
+    const highlightedItem = menu.querySelector<HTMLElement>('[role="menuitem"][data-highlighted]');
+    if (!highlightedItem) throw new Error("Export menu has no highlighted keyboard item");
+    const itemStyles = getComputedStyle(highlightedItem);
+    return {
+      menuBackground: menuStyles.backgroundColor,
+      menuForeground: menuStyles.color,
+      itemBackground: itemStyles.backgroundColor,
+      itemForeground: itemStyles.color,
+      cardToken,
+      accentToken,
+    };
+  });
+}
+
+async function expectOpenMenuUsesThemeTokens(page: import("@playwright/test").Page) {
+  await expect.poll(async () => {
+    const theme = await readOpenMenuTheme(page);
+    return {
+      menuBackground: theme.menuBackground === theme.cardToken.background,
+      menuForeground: theme.menuForeground === theme.cardToken.color,
+      itemBackground: theme.itemBackground === theme.accentToken.background,
+      itemForeground: theme.itemForeground === theme.accentToken.color,
+    };
+  }).toEqual({ menuBackground: true, menuForeground: true, itemBackground: true, itemForeground: true });
+  return readOpenMenuTheme(page);
 }
 
 type SyntheticBulkMode = "stdid-to-code" | "code-to-stdid" | "stdid-to-transcript";
@@ -244,6 +506,16 @@ test.beforeEach(async ({ page }) => {
     localStorage.clear();
     sessionStorage.clear();
   });
+});
+
+test("downloaded CSV parser rejects characters after a closing quote", () => {
+  expect(() => parseDownloadedRfc4180Csv('\ufeff"value"junk\r\n'))
+    .toThrow("Unexpected character after closing CSV quote");
+});
+
+test("downloaded CSV parser preserves quoted controls and doubled quotes", () => {
+  expect(parseDownloadedRfc4180Csv('\ufeff"LF\nCR\rCRLF\r\nQuote ""ok""",tail\r\n"EOF"'))
+    .toEqual([["LF\nCR\rCRLF\r\nQuote \"ok\"", "tail"], ["EOF"]]);
 });
 
 test("dashboard redirects to login without a session", async ({ page }) => {
@@ -625,11 +897,15 @@ test("bulk keeps complete exports ordered for all modes and fixed chunks", async
     await bulk.getByLabel("Targets, one per line").fill(testCase.targets.join("\n"));
     await bulk.getByRole("button", { name: "Run bulk lookup" }).click();
     await expect(bulk.getByText(`${testCase.targets.length} completed`)).toBeVisible();
-    const document = await expectExportFormats(page, testCase.surface, () => apiRequestCount("/api/vnu/cross-lookup/bulk"));
+    const document = await expectExportFormats(page, testCase.surface, apiRequestCount, {
+      sourcePath: "/api/vnu/cross-lookup/bulk",
+      assertCsv: expectBulkCsvMatchesJson,
+    });
     expect(document.surface).toBe(testCase.surface);
     expect(document.run).toEqual({ status: "complete", mode: testCase.mode, processedCount: testCase.targets.length, totalCount: testCase.targets.length });
     const results = document.results as Array<{ target: string; status: string; result: Record<string, unknown> }>;
     expect(results.map((item) => item.target)).toEqual(testCase.targets);
+    expect(results.every((item) => item.status === "ok")).toBe(true);
     expect(JSON.stringify(results)).not.toContain("ignoredField");
     if (testCase.mode === "stdid-to-code") expect(results[0]?.result).toEqual({ identity: { studentCode: "99000101", internalStudentId: testCase.targets[0], studentName: "Synthetic 9901", managingClass: "SYNTHETIC-99" } });
     if (testCase.mode === "code-to-stdid") expect(results[0]?.result).toEqual({ resolver: { resolvedStudentCode: testCase.targets[0], resolvedInternalStudentId: "99000000101", probes: 1 } });
@@ -657,7 +933,10 @@ test("bulk exports prior five results after later 429 and while retrying", async
   await bulk.getByLabel("Targets, one per line").fill(targets.join("\n"));
   await bulk.getByRole("button", { name: "Run bulk lookup" }).click();
   await expect(bulk.getByRole("button", { name: "Retry remaining" })).toBeVisible();
-  const partial = await expectExportFormats(page, "bulk-id-to-code", () => apiRequestCount("/api/vnu/cross-lookup/bulk"));
+  const partial = await expectExportFormats(page, "bulk-id-to-code", apiRequestCount, {
+    sourcePath: "/api/vnu/cross-lookup/bulk",
+    assertCsv: expectBulkCsvMatchesJson,
+  });
   expect(partial.run).toEqual({ status: "partial", mode: "stdid-to-code", processedCount: 5, totalCount: 6 });
   expect((partial.results as Array<{ target: string }>).map((item) => item.target)).toEqual(targets.slice(0, 5));
 
@@ -684,8 +963,12 @@ test("bulk keeps prior export during and after cancellation of second chunk", as
   await bulk.getByRole("button", { name: "Cancel" }).click();
   await expect(bulk.getByRole("button", { name: "Retry remaining" })).toBeVisible();
   await expect(bulk.getByRole("button", { name: "Export" })).toBeVisible();
-  const partial = await expectExportFormats(page, "bulk-id-to-code", () => apiRequestCount("/api/vnu/cross-lookup/bulk"));
+  const partial = await expectExportFormats(page, "bulk-id-to-code", apiRequestCount, {
+    sourcePath: "/api/vnu/cross-lookup/bulk",
+    assertCsv: expectBulkCsvMatchesJson,
+  });
   expect(partial.run).toEqual({ status: "partial", mode: "stdid-to-code", processedCount: 5, totalCount: 6 });
+  expect(partial.results?.map((item) => item.target)).toEqual(targets.slice(0, 5));
 });
 
 test("bulk resets without stale resurrection while second chunk is gated", async ({ page }) => {
@@ -822,7 +1105,10 @@ test("bulk rejects malformed success without exporting unsafe result fields", as
   await bulk.getByLabel("Targets, one per line").fill(targets.join("\n"));
   await bulk.getByRole("button", { name: "Run bulk lookup" }).click();
   await expect(bulk.getByText("The lookup returned an invalid result. Retry the remaining targets.")).toBeVisible();
-  const partial = await expectExportFormats(page, "bulk-id-to-code", () => apiRequestCount("/api/vnu/cross-lookup/bulk"));
+  const partial = await expectExportFormats(page, "bulk-id-to-code", apiRequestCount, {
+    sourcePath: "/api/vnu/cross-lookup/bulk",
+    assertCsv: expectBulkCsvMatchesJson,
+  });
   expect(partial.run).toEqual({ status: "partial", mode: "stdid-to-code", processedCount: 5, totalCount: 6 });
   expect(JSON.stringify(partial)).not.toContain("unsafe");
 });
@@ -836,22 +1122,45 @@ test("lookup successful single results export both formats without refetch and c
   await page.getByRole("option", { name: "Semester 2, 2025–2026 (supplementary)" }).click();
   const forwardRow = page.getByTestId("lookup-results").locator(".list-row").filter({ hasText: "Synthetic Export Systems" });
   await expect(forwardRow).toBeVisible();
-  expect(await expectExportFormats(page, "class-forward", () => apiRequestCount("/api/vnu/raw/exams"))).toMatchObject({ surface: "class-forward", universityId: "mock" });
+  const forwardDocument = await expectExportFormats(page, "class-forward", apiRequestCount, {
+    sourcePath: "/api/vnu/raw/exams",
+    assertCsv: expectClassCsvMatchesJson,
+  });
+  expect(forwardDocument).toMatchObject({
+    surface: "class-forward",
+    universityId: "mock",
+    results: [{ classResult: { classCode: "SYN9900", classNumber: "99", classId: SYNTHETIC_CLASS_ID, courseName: "Synthetic Export Systems" } }],
+  });
 
   await page.getByRole("button", { name: "Class ID to course" }).click();
   const reverseSection = page.getByTestId("reverse-class-lookup");
   await reverseSection.getByLabel("Term").click();
   await page.getByRole("option", { name: "Semester 2, 2025–2026 (supplementary)" }).click();
   await reverseSection.getByLabel("Internal class ID").fill(SYNTHETIC_CLASS_ID);
-  expect(await expectExportFormats(page, "class-reverse", () => apiRequestCount("/api/vnu/raw/exams"))).toMatchObject({ surface: "class-reverse", universityId: "mock" });
+  const reverseDocument = await expectExportFormats(page, "class-reverse", apiRequestCount, {
+    sourcePath: "/api/vnu/raw/exams",
+    assertCsv: expectClassCsvMatchesJson,
+  });
+  expect(reverseDocument).toMatchObject({
+    surface: "class-reverse",
+    universityId: "mock",
+    results: [{ classResult: { classCode: "SYN9900", classNumber: "99", classId: SYNTHETIC_CLASS_ID, courseName: "Synthetic Export Systems" } }],
+  });
 
   const codeSection = page.getByTestId("cross-student-code");
   const codeInput = codeSection.getByLabel("Target internal student ID");
   await codeInput.fill(SYNTHETIC_TARGET_INTERNAL_ID);
   await codeSection.getByRole("button", { name: "Look up" }).click();
   await expect(codeSection.getByText(SYNTHETIC_TARGET_STUDENT_CODE)).toBeVisible();
-  const codeDocument = await expectExportFormats(page, "student-id-to-code", () => apiRequestCount("/api/vnu/cross-lookup/student-code"));
-  expect(codeDocument).toMatchObject({ surface: "student-id-to-code", query: { mode: "stdId", value: SYNTHETIC_TARGET_INTERNAL_ID } });
+  const codeDocument = await expectExportFormats(page, "student-id-to-code", apiRequestCount, {
+    sourcePath: "/api/vnu/cross-lookup/student-code",
+    assertCsv: expectResolverCsvMatchesJson,
+  });
+  expect(codeDocument).toMatchObject({
+    surface: "student-id-to-code",
+    query: { mode: "stdId", value: SYNTHETIC_TARGET_INTERNAL_ID },
+    results: [{ identity: { studentCode: SYNTHETIC_TARGET_STUDENT_CODE, internalStudentId: SYNTHETIC_TARGET_INTERNAL_ID, studentName: "Synthetic Target" } }],
+  });
   await codeInput.fill(SYNTHETIC_ERROR_INTERNAL_ID);
   await expect(codeSection.getByRole("button", { name: "Export" })).toHaveCount(0);
 
@@ -861,7 +1170,10 @@ test("lookup successful single results export both formats without refetch and c
   await idInput.fill(SYNTHETIC_TARGET_STUDENT_CODE);
   await idSection.getByRole("button", { name: "Look up" }).click();
   await expect(idSection.getByText(SYNTHETIC_TARGET_INTERNAL_ID)).toBeVisible();
-  const idDocument = await expectExportFormats(page, "student-code-to-id", () => apiRequestCount("/api/vnu/cross-lookup/student-id"));
+  const idDocument = await expectExportFormats(page, "student-code-to-id", apiRequestCount, {
+    sourcePath: "/api/vnu/cross-lookup/student-id",
+    assertCsv: expectResolverCsvMatchesJson,
+  });
   expect(idDocument).toMatchObject({ surface: "student-code-to-id", results: [{ resolver: { resolvedStudentCode: SYNTHETIC_TARGET_STUDENT_CODE, resolvedInternalStudentId: SYNTHETIC_TARGET_INTERNAL_ID, probes: 2 } }] });
   await idInput.fill(SYNTHETIC_ERROR_STUDENT_CODE);
   await expect(idSection.getByRole("button", { name: "Export" })).toHaveCount(0);
@@ -879,15 +1191,21 @@ test("lookup successful single results export both formats without refetch and c
   await expect(derivedHeader.getByText("CPA", { exact: true }).locator("..")).toContainText("3.50");
   await expect(derivedHeader.getByText("Included credits").locator("..")).toContainText("3 / 5 listed");
   await expect(transcriptSection.getByRole("button", { name: "Export" })).toHaveCount(1);
-  const transcriptDocument = await expectExportFormats(page, "cross-transcript", () => apiRequestCount("/api/vnu/cross-lookup/transcript"));
+  const transcriptDocument = await expectExportFormats(page, "cross-transcript", apiRequestCount, {
+    sourcePath: "/api/vnu/cross-lookup/transcript",
+    assertCsv: expectAcademicCsvMatchesJson,
+  });
   expect(transcriptDocument).toMatchObject({
     surface: "cross-transcript",
     query: { mode: "stdId", value: SYNTHETIC_TARGET_INTERNAL_ID },
+    identity: { studentCode: SYNTHETIC_TARGET_STUDENT_CODE, studentName: "Synthetic Target", managingClass: "SYNTHETIC-99" },
     reported: { cumulativeGpa4: 3.91 },
   });
   const transcriptTerms = transcriptDocument.derivedTerms as Array<Record<string, unknown>>;
   expect(transcriptTerms.map((term) => term.termCode)).toEqual(["252", "251"]);
-  expect(transcriptTerms[0]).toMatchObject({ termCode: "252", estimateKind: "derived", listedCredits: 5, includedCredits: 3 });
+  expect(transcriptTerms[0]).toMatchObject({ termCode: "252", estimateKind: "derived", listedCredits: 5, includedCredits: 3, termGpa4: 4, derivedCpa4: 3.5 });
+  expect((transcriptTerms[0]?.courses as Array<{ courseCode: string }>).map((course) => course.courseCode)).toEqual(["SYN9902", "SYN9903"]);
+  expect(transcriptTerms[1]).toMatchObject({ termCode: "251", estimateKind: "derived", listedCredits: 3, includedCredits: 3, termGpa4: 3, derivedCpa4: 3 });
   await transcriptInput.fill(SYNTHETIC_ERROR_INTERNAL_ID);
   await expect(transcriptSection.getByRole("button", { name: "Export" })).toHaveCount(0);
   await expectNoPageOverflow(page);
@@ -1009,7 +1327,10 @@ test("grades render derived term GPA and CPA and export current page and term st
   await expect(newestTerm.locator("tbody > tr").nth(0)).toContainText("Web Application Development");
   await expect(newestTerm.locator("tbody > tr").nth(2)).toContainText("Linear Algebra");
 
-  const pageDocument = await expectExportFormats(page, "grades-page", () => apiRequestCount("/api/mock/grades"));
+  const pageDocument = await expectExportFormats(page, "grades-page", apiRequestCount, {
+    sourcePath: "/api/mock/grades",
+    assertCsv: expectAcademicCsvMatchesJson,
+  });
   expect(pageDocument).toMatchObject({
     surface: "grades-page",
     universityId: "mock",
@@ -1023,14 +1344,23 @@ test("grades render derived term GPA and CPA and export current page and term st
   expect(pageDocument.derivedTerms?.[0]?.courses.map((course) => course.courseName)).toEqual(["Web Application Development", "Linear Algebra"]);
   expect(Object.keys(pageDocument.derivedTerms?.[0]?.courses[0] ?? {})).toEqual(["courseCode", "courseName", "credits", "point10", "letter", "point4"]);
 
-  const termDocument = await expectExportFormats(page, "grades-term", () => apiRequestCount("/api/mock/grades"));
+  const termDocument = await expectExportFormats(page, "grades-term", apiRequestCount, {
+    sourcePath: "/api/mock/grades",
+    assertCsv: expectAcademicCsvMatchesJson,
+  });
   expect(termDocument.derivedTerms).toHaveLength(1);
+  expect(termDocument.derivedTerms?.[0]).toMatchObject({ termCode: "20251" });
+  expect(termDocument.derivedTerms?.[0]?.termGpa4).toBeCloseTo(3.45);
+  expect(termDocument.derivedTerms?.[0]?.derivedCpa4).toBeCloseTo(3.43, 2);
   expect(termDocument.derivedTerms?.[0]?.courses).toEqual(pageDocument.derivedTerms?.[0]?.courses);
 
   await page.getByRole("combobox", { name: "Term" }).click();
   await page.getByRole("option", { name: "All terms" }).click();
   await expect(page.getByTestId("academic-term-header")).toHaveCount(2);
-  const allTermsDocument = await expectExportFormats(page, "grades-page", () => apiRequestCount("/api/mock/grades"));
+  const allTermsDocument = await expectExportFormats(page, "grades-page", apiRequestCount, {
+    sourcePath: "/api/mock/grades",
+    assertCsv: expectAcademicCsvMatchesJson,
+  });
   expect(allTermsDocument.derivedTerms?.map((term) => term.termCode)).toEqual(["20251", "20242"]);
 });
 
@@ -1070,7 +1400,10 @@ test("grades keep missing and reserved term identities collision-safe", async ({
   await expect(page.getByText("Missing term")).toBeVisible();
   await expect(page.getByText("Blank term")).toBeVisible();
 
-  const document = await expectExportFormats(page, "grades-page", () => apiRequestCount("/api/mock/grades"));
+  const document = await expectExportFormats(page, "grades-page", apiRequestCount, {
+    sourcePath: "/api/mock/grades",
+    assertCsv: expectAcademicCsvMatchesJson,
+  });
   const termIdentities = document.derivedTerms?.map((term) => [term.termCode, term.termLabel]);
   expect(termIdentities).toEqual(expect.arrayContaining([
     ["unknown", "Unknown term"],
@@ -1124,13 +1457,16 @@ test("export menu reports local failures, remains responsive, and localizes with
   await expect(page.getByRole("menuitem", { name: "Download JSON" })).toBeVisible();
   await page.keyboard.press("ArrowDown");
   await expect(page.getByRole("menuitem", { name: "Download CSV" })).toBeFocused();
+  const darkMenuTheme = await expectOpenMenuUsesThemeTokens(page);
   await page.keyboard.press("Escape");
   await expect(themedTrigger).toBeFocused();
 
   await page.evaluate(() => { document.documentElement.dataset.theme = "uet"; });
   await themedTrigger.click();
-  const uetMenuBackground = await page.getByRole("menu").evaluate((element) => getComputedStyle(element).backgroundColor);
-  expect(uetMenuBackground).not.toBe("rgba(0, 0, 0, 0)");
+  await page.keyboard.press("ArrowDown");
+  const uetMenuTheme = await expectOpenMenuUsesThemeTokens(page);
+  expect(uetMenuTheme.itemBackground).not.toBe(darkMenuTheme.itemBackground);
+  expect(uetMenuTheme.itemForeground).not.toBe(darkMenuTheme.itemForeground);
   await page.keyboard.press("Escape");
 
   await page.evaluate(() => {
@@ -1179,9 +1515,39 @@ test("export menu reports local failures, remains responsive, and localizes with
   for (const viewport of [{ width: 390, height: 844 }, { width: 768, height: 1024 }, { width: 1440, height: 900 }]) {
     await page.setViewportSize(viewport);
     await expectNoPageOverflow(page);
+    await expectInsideViewport(page, localizedTrigger);
     const triggerBox = await localizedTrigger.boundingBox();
-    expect(triggerBox).not.toBeNull();
     expect(triggerBox!.height).toBeGreaterThanOrEqual(43.9);
+
+    const featureHeader = page.getByRole("heading", { name: "Điểm số", exact: true }).locator("..").locator("..");
+    const featureHeaderBox = await featureHeader.boundingBox();
+    expect(featureHeaderBox).not.toBeNull();
+    expect(triggerBox!.x).toBeGreaterThanOrEqual(featureHeaderBox!.x);
+    expect(triggerBox!.y).toBeGreaterThanOrEqual(featureHeaderBox!.y);
+    expect(triggerBox!.x + triggerBox!.width).toBeLessThanOrEqual(featureHeaderBox!.x + featureHeaderBox!.width);
+    expect(triggerBox!.y + triggerBox!.height).toBeLessThanOrEqual(featureHeaderBox!.y + featureHeaderBox!.height);
+    expect(await featureHeader.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+
+    const termHeader = page.getByTestId("academic-term-header").first();
+    const termTrigger = termHeader.getByRole("button", { name: "Xuất dữ liệu" });
+    const termHeaderBox = await termHeader.boundingBox();
+    const termTriggerBox = await termTrigger.boundingBox();
+    expect(termHeaderBox).not.toBeNull();
+    expect(termTriggerBox).not.toBeNull();
+    expect(termTriggerBox!.x).toBeGreaterThanOrEqual(termHeaderBox!.x);
+    expect(termTriggerBox!.y).toBeGreaterThanOrEqual(termHeaderBox!.y);
+    expect(termTriggerBox!.x + termTriggerBox!.width).toBeLessThanOrEqual(termHeaderBox!.x + termHeaderBox!.width);
+    expect(termTriggerBox!.y + termTriggerBox!.height).toBeLessThanOrEqual(termHeaderBox!.y + termHeaderBox!.height);
+    expect(await termHeader.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+
+    await localizedTrigger.click();
+    const openMenu = page.getByRole("menu");
+    await expect(openMenu).toBeVisible();
+    await expectInsideViewport(page, openMenu);
+    const menuBox = await openMenu.boundingBox();
+    expect(menuBox!.height).toBeGreaterThanOrEqual(43.9 * 2);
+    await page.keyboard.press("Escape");
+    await expect(localizedTrigger).toBeFocused();
   }
 });
 

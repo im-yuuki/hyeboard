@@ -1,13 +1,14 @@
 # Hyeboard Architecture
 
-Hyeboard is split into a client-heavy dashboard and a small Cloudflare Worker BFF.
+Hyeboard uses one Cloudflare Worker deployment containing the client-heavy dashboard and its API/BFF.
 
 ```txt
-Cloudflare Pages web app
-  -> Hyeboard Worker API
-  -> university adapter registry
-  -> UET adapter
-  -> StudentHub + Canvas upstream APIs
+Cloudflare Worker
+  ├─ static React assets (apps/web/dist)
+  └─ /api/* BFF
+       -> university adapter registry
+       -> UET adapter
+       -> StudentHub + Canvas upstream APIs
 ```
 
 The frontend never calls university upstream systems directly. University-specific behavior lives in adapters.
@@ -19,7 +20,7 @@ The frontend never calls university upstream systems directly. University-specif
 
 ## Session Model
 
-Separate web/API origins make third-party cookies fragile. Hyeboard therefore uses an encrypted Bearer token:
+University upstream origins make browser-managed third-party cookies fragile. Hyeboard therefore uses an encrypted Bearer token:
 
 1. API receives or discovers upstream credentials.
 2. API encrypts them with AES-GCM using `HYEB_SESSION_SECRET`.

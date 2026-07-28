@@ -47,8 +47,11 @@ Two supported targets:
 **Cloudflare Workers** (single Worker serving the API + the built web app as static assets):
 
 ```bash
-pnpm deploy        # wrangler deploy
+pnpm build:web     # required immediately before every deployment
+pnpm deploy        # uploads the Worker and the current apps/web/dist assets
 ```
+
+`pnpm deploy` does not rebuild the frontend. Always run `pnpm build:web` immediately before it; otherwise Wrangler can upload a stale `apps/web/dist` while deploying the single Worker.
 
 **Self-hosted (Node.js/Bun)** — produces a standalone `dist/` directory with the bundled worker, the built web app, and a runtime `config.json`:
 
