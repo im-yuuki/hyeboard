@@ -93,6 +93,19 @@ describe("frontend session-death policy", () => {
     expect(localStorage.getItem("hyeboard.activeAccountId")).toBeNull();
   });
 
+  it("removes the originating account when bulk lookup returns top-level VNU_SESSION_EXPIRED", async () => {
+    rejectNextRequest("VNU_SESSION_EXPIRED", 401);
+
+    await expect(api.vnuCrossLookupBulk("stdid-to-transcript", ["1001", "1002"])).rejects.toMatchObject({
+      code: "VNU_SESSION_EXPIRED",
+    });
+
+    expect(isSessionDeathCode("VNU_SESSION_EXPIRED")).toBe(true);
+    expect(listAccounts()).toEqual([]);
+    expect(getActiveAccount()).toBeUndefined();
+    expect(localStorage.getItem("hyeboard.activeAccountId")).toBeNull();
+  });
+
   it("strips upstream notice prose from every cross-lookup response shape", async () => {
     const upstreamNoticeSentinel = "UPSTREAM_NOTICE_SENTINEL_DO_NOT_EXPOSE";
     const transcript = {

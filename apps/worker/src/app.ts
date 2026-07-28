@@ -1157,6 +1157,7 @@ export function createApp(adapter: any) {
           });
           items.push({ target, status: "ok", result: resolution });
         } catch (error) {
+          if (error instanceof HyeboardError && error.code === "VNU_SESSION_EXPIRED") throw error;
           items.push({
             target,
             status: "error",

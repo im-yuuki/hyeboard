@@ -561,6 +561,46 @@ describe("VNU import session cache", () => {
     await expect(decryptSession(cachedRelogin.token, SESSION_SECRET)).resolves.toEqual(normalizedRepaired);
   });
 
+  it("repairs a cache hit when the real profile client receives a standalone HTTP 200 expiry notice", async () => {
+    const expiryNoticeSentinel = "CACHE_HIT_PROFILE_EXPIRY_SENTINEL";
+    const expiryNotice = "Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.";
+    const expiryNoticeHtml = `<html><body><table data-synthetic-marker="${expiryNoticeSentinel}"><tr><td>${expiryNotice}</td></tr></table></body></html>`;
+    const repairedSession: EncryptedSessionPayload = {
+      ...vnuSession(),
+      vnu: { kind: "cookie", value: "REPAIRED_HTTP_BOUNDARY_COOKIE", expiresAt: "2099-01-01T00:00:00.000Z" },
+    };
+    await importVnu(app);
+    const oldCached = await cache.importEntry();
+    profileSpy.mockRestore();
+    const upstreamFetch = vi.fn(async () => new Response(expiryNoticeHtml, {
+      status: 200,
+      headers: { "Content-Type": "text/html" },
+    }));
+    vi.stubGlobal("fetch", upstreamFetch);
+    adapterMocks.importSession.mockResolvedValueOnce(importedVnu(repairedSession));
+
+    const response = await requestVnuImport(app);
+    const responseText = await response.text();
+    const payload = JSON.parse(responseText) as { data: VnuImportResponse; error: null };
+    const replacement = await cache.importEntry();
+
+    expect(response.status).toBe(200);
+    expect(payload.error).toBeNull();
+    expect(upstreamFetch).toHaveBeenCalledTimes(1);
+    expect(upstreamFetch).toHaveBeenCalledWith(
+      "https://daotao.vnu.edu.vn/StdInfo/TabStdSelf.asp",
+      expect.objectContaining({ headers: expect.objectContaining({ Cookie: "SYNTHETIC_VNU_COOKIE" }) }),
+    );
+    expect(adapterMocks.importSession).toHaveBeenCalledTimes(2);
+    expect(replacement.seed).not.toBe(oldCached.seed);
+    const normalizedRepaired = { ...repairedSession, studentCode: VNU_STUDENT_CODE };
+    await expect(decryptSession(payload.data.token, SESSION_SECRET)).resolves.toEqual(normalizedRepaired);
+    await expect(decryptSession(replacement.seed, SESSION_SECRET)).resolves.toEqual(normalizedRepaired);
+    expect(replacement.session).toEqual(payload.data.session);
+    expect(responseText).not.toContain(expiryNoticeSentinel);
+    expect(responseText).not.toContain(expiryNotice);
+  });
+
   it("does not cache or expose a runtime VNU_SESSION_EXPIRED response", async () => {
     const expiryNoticeSentinel = "SYNTHETIC_EXPIRY_NOTICE_SENTINEL";
     const expiryNotice = "Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.";
@@ -1208,6 +1248,22 @@ describe("VNU cross-transcript route", () => {
       expect(transcriptSpy.mock.calls.map((call: unknown[]) => call[0] as string)).toEqual(["1001", "1002"]);
       expect(probeBudget.amounts).toEqual([4]);
       expect(JSON.stringify(payload)).not.toContain("<html>");
+    });
+
+    it("propagates terminal transcript expiry for the whole chunk and stops later targets", async () => {
+      transcriptSpy
+        .mockRejectedValueOnce(new HyeboardError("VNU_SESSION_EXPIRED", "Synthetic upstream session expired", 401))
+        .mockResolvedValueOnce(targetTranscriptHtml);
+
+      const response = await bulkRequest({ mode: "stdid-to-transcript", targets: ["1001", "1002"], allowCrossLookup: true });
+
+      expect(response.status).toBe(401);
+      await expect(response.json()).resolves.toMatchObject({
+        data: null,
+        error: { code: "VNU_SESSION_EXPIRED" },
+      });
+      expect(transcriptSpy).toHaveBeenCalledTimes(1);
+      expect(transcriptSpy).toHaveBeenCalledWith("1001");
     });
 
     it("reserves the resolver hard maximum once per code target without per-fetch double charging", async () => {
