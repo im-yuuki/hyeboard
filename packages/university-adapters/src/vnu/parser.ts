@@ -19,14 +19,28 @@ import type {
   VnuTranscriptHeader,
 } from "./types";
 
+const DAOTAO_ORIGIN = "https://daotao.vnu.edu.vn";
+const DAOTAO_LOGIN_PATH = "/dkmh/login.asp";
+const DAOTAO_SESSION_ENDED_SENTENCE = "Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.";
+const HTML_ENTITY_RE = /&(?:nbsp|amp|lt|gt|quot|#[^;&\s]*);/gi;
+
 function decodeEntities(text: string): string {
   return text
-    .replaceAll("&nbsp;", " ")
-    .replaceAll("&amp;", "&")
-    .replaceAll("&lt;", "<")
-    .replaceAll("&gt;", ">")
-    .replaceAll("&#39;", "'")
-    .replaceAll("&quot;", '"')
+    .replace(HTML_ENTITY_RE, (entity) => {
+      const token = entity.slice(1, -1).toLowerCase();
+      if (token === "nbsp") return " ";
+      if (token === "amp") return "&";
+      if (token === "lt") return "<";
+      if (token === "gt") return ">";
+      if (token === "quot") return '"';
+
+      const numericMatch = token.match(/^#(?:(x)([0-9a-f]+)|(\d+))$/i);
+      if (!numericMatch) return entity;
+
+      const codePoint = Number.parseInt(numericMatch[2] ?? numericMatch[3], numericMatch[1] ? 16 : 10);
+      if (codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) return entity;
+      return String.fromCodePoint(codePoint);
+    })
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -43,15 +57,15 @@ function parseOptionalNumber(value: string | undefined): number | undefined {
 }
 
 function attrOf(tag: string, attr: string): string | undefined {
-  const match = tag.match(new RegExp(`${attr}\\s*=\\s*"([^"]*)"`, "i"));
-  return match?.[1];
+  const match = tag.match(new RegExp(`(?:^|\\s)${attr}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, "i"));
+  return match?.[1] ?? match?.[2];
 }
 
 function tagWithAttr(html: string, tag: string, attrName: string, attrValue: string): string | undefined {
   const re = new RegExp(`<${tag}\\b[^>]*>`, "gi");
   let match: RegExpExecArray | null;
   while ((match = re.exec(html))) {
-    if (new RegExp(`${attrName}\\s*=\\s*"${attrValue}"`, "i").test(match[0])) return match[0];
+    if (attrOf(match[0], attrName)?.toLowerCase() === attrValue.toLowerCase()) return match[0];
   }
   return undefined;
 }
@@ -105,7 +119,7 @@ export function parseProfileHtml(html: string): VnuProfile {
 }
 
 function tdCells(rowHtml: string): string[] {
-  return [...rowHtml.matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/gi)].map((m) => decodeEntities(stripTags(m[1])));
+  return [...rowHtml.matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/gi)].map((m) => stripTags(m[1]));
 }
 
 // ListPoint/listpoint_Brc1.asp — term-grouped transcript table plus
@@ -339,13 +353,13 @@ export function parseSyllabusHtml(html: string): VnuSyllabusRow[] {
   while ((match = trRe.exec(html))) {
     const cellsHtml = [...match[1].matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/gi)].map((m) => m[1]);
     if (cellsHtml.length < 7) continue;
-    const codeText = decodeEntities(stripTags(cellsHtml[1] ?? ""));
+    const codeText = stripTags(cellsHtml[1] ?? "");
     if (!/^[A-Za-zĐ]{2,6}\d{3,4}/.test(codeText)) continue;
-    const nameText = decodeEntities(stripTags(cellsHtml[2] ?? ""));
-    const creditsText = decodeEntities(stripTags(cellsHtml[3] ?? ""));
+    const nameText = stripTags(cellsHtml[2] ?? "");
+    const creditsText = stripTags(cellsHtml[3] ?? "");
     const fileHrefMatch = (cellsHtml[4] ?? "").match(/href="([^"]+\.pdf)"/i);
-    const sizeText = decodeEntities(stripTags(cellsHtml[6] ?? ""));
-    const dateText = cellsHtml[7] ? decodeEntities(stripTags(cellsHtml[7])) : undefined;
+    const sizeText = stripTags(cellsHtml[6] ?? "");
+    const dateText = cellsHtml[7] ? stripTags(cellsHtml[7]) : undefined;
     const credits = Number.parseFloat(creditsText);
     rows.push({
       courseCode: codeText.trim(),
@@ -442,6 +456,129 @@ export function parsePortalNotice(html: string): string | undefined {
   return phraseMatch?.[0].trim() || undefined;
 }
 
-export function hasLoginForm(html: string): boolean {
-  return html.includes('name="txtLoginId"') || html.includes("name='txtLoginId'");
+function isHtmlWhitespace(character: string | undefined): boolean {
+  return character === " " || character === "\t" || character === "\n" || character === "\r" || character === "\f";
+}
+
+function startsWithAsciiCaseInsensitive(text: string, token: string, index: number): boolean {
+  for (let offset = 0; offset < token.length; offset += 1) {
+    if (text[index + offset]?.toLowerCase() !== token[offset]) return false;
+  }
+  return true;
+}
+
+function isScriptOpeningAt(html: string, index: number): boolean {
+  if (!startsWithAsciiCaseInsensitive(html, "<script", index)) return false;
+  const boundary = html[index + "<script".length];
+  return boundary === undefined || boundary === ">" || boundary === "/" || isHtmlWhitespace(boundary);
+}
+
+function scriptClosingTagEndAt(html: string, index: number): number | undefined {
+  if (!startsWithAsciiCaseInsensitive(html, "</script", index)) return undefined;
+
+  let cursor = index + "</script".length;
+  while (isHtmlWhitespace(html[cursor])) cursor += 1;
+  return html[cursor] === ">" ? cursor + 1 : undefined;
+}
+
+function hasCompleteLoginForm(html: string): boolean {
+  type LoginFormCandidate = { hasLoginId: boolean; hasPassword: boolean };
+
+  let candidate: LoginFormCandidate | undefined;
+  let formDepth = 0;
+  let formRegionTainted = false;
+  let cursor = 0;
+
+  while (cursor < html.length) {
+    const tagStart = html.indexOf("<", cursor);
+    if (tagStart === -1) return false;
+
+    if (html.startsWith("<!--", tagStart)) {
+      const commentEnd = html.indexOf("-->", tagStart + 4);
+      if (commentEnd === -1) return false;
+      cursor = commentEnd + 3;
+      continue;
+    }
+
+    if (isScriptOpeningAt(html, tagStart)) {
+      const openingTagEnd = html.indexOf(">", tagStart + 7);
+      if (openingTagEnd === -1) return false;
+
+      cursor = openingTagEnd + 1;
+      while (cursor < html.length) {
+        const closingTagEnd = scriptClosingTagEndAt(html, cursor);
+        if (closingTagEnd !== undefined) {
+          cursor = closingTagEnd;
+          break;
+        }
+        cursor += 1;
+      }
+      if (cursor >= html.length) return false;
+      continue;
+    }
+
+    const tagEnd = html.indexOf(">", tagStart + 1);
+    if (tagEnd === -1) return false;
+    const tag = html.slice(tagStart, tagEnd + 1);
+    cursor = tagEnd + 1;
+
+    if (/^<form\b/i.test(tag)) {
+      formDepth += 1;
+      if (formDepth > 1) {
+        formRegionTainted = true;
+        candidate = undefined;
+        continue;
+      }
+      candidate = attrOf(tag, "action")?.toLowerCase() === DAOTAO_LOGIN_PATH
+        ? { hasLoginId: false, hasPassword: false }
+        : undefined;
+      continue;
+    }
+
+    if (/^<\/form\s*>$/i.test(tag)) {
+      if (formDepth === 0) continue;
+      formDepth -= 1;
+      if (formDepth > 0) continue;
+      if (!formRegionTainted && candidate?.hasLoginId && candidate.hasPassword) return true;
+      candidate = undefined;
+      formRegionTainted = false;
+      continue;
+    }
+
+    if (formDepth !== 1 || formRegionTainted || !candidate || !/^<input\b/i.test(tag)) continue;
+    const inputName = attrOf(tag, "name")?.toLowerCase();
+    if (inputName === "txtloginid") candidate.hasLoginId = true;
+    if (inputName === "txtpassword") candidate.hasPassword = true;
+  }
+
+  return false;
+}
+
+function isTrustedLoginUrl(finalUrl: string): boolean {
+  try {
+    const url = new URL(finalUrl);
+    return url.origin === DAOTAO_ORIGIN && url.pathname.toLowerCase() === DAOTAO_LOGIN_PATH;
+  } catch {
+    return false;
+  }
+}
+
+function hasStandaloneSessionEndedNotice(html: string): boolean {
+  const bodyMatch = html.match(/<body\b[^>]*>([\s\S]*?)<\/body\s*>/i);
+  if (!bodyMatch) return false;
+
+  const body = bodyMatch[1];
+  if ((body.match(/<table\b/gi) ?? []).length !== 1) return false;
+  if ((body.match(/<tr\b/gi) ?? []).length !== 1) return false;
+  if ((body.match(/<td\b/gi) ?? []).length !== 1) return false;
+  if (/<(?:form|input|select|textarea|button)\b/i.test(body)) return false;
+  if (!/^\s*<table\b[^>]*>\s*<tr\b[^>]*>\s*<td\b[^>]*>[\s\S]*<\/td\s*>\s*<\/tr\s*>\s*<\/table\s*>\s*$/i.test(body)) return false;
+
+  return stripTags(body) === DAOTAO_SESSION_ENDED_SENTENCE;
+}
+
+export function isDaotaoSessionExpired(finalUrl: string, html: string): boolean {
+  if (isTrustedLoginUrl(finalUrl)) return true;
+  if (hasCompleteLoginForm(html)) return true;
+  return hasStandaloneSessionEndedNotice(html);
 }

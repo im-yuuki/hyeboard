@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { parseGradesHtml, parseTranscriptHtml } from "./parser";
+import { isDaotaoSessionExpired, parseGradesHtml, parsePortalNotice, parseTranscriptHtml } from "./parser";
+import {
+  loginFormHtml,
+  mixedAttributeLoginFormHtml,
+  standaloneSessionEndedNoticeHtml,
+} from "./session-expiry-fixtures";
 
 const transcriptHtml = `
   <table>
@@ -64,5 +69,119 @@ describe("parseTranscriptHtml", () => {
       totals: {},
       notice: undefined,
     });
+  });
+
+  it("decodes table-cell entities exactly once", () => {
+    const grades = parseGradesHtml(`<table><tr>
+      <td>1</td><td>INT1001</td><td>&amp;#xEA;</td><td>3</td><td>8.0</td><td>B</td><td>3.0</td>
+    </tr></table>`);
+
+    expect(grades.rows[0]?.courseName).toBe("&#xEA;");
+  });
+});
+
+describe("parsePortalNotice entity decoding", () => {
+  it.each([
+    ["an encoded entity", "&amp;#xEA;", "&#xEA;"],
+    ["a supplementary scalar", "&#x1F600;", "😀"],
+    ["the maximum scalar", "&#x10FFFF;", String.fromCodePoint(0x10ffff)],
+    ["a surrogate", "&#xD800;", "&#xD800;"],
+    ["an out-of-range value", "&#x110000;", "&#x110000;"],
+    ["a malformed reference", "&#xZZ;", "&#xZZ;"],
+  ])("decodes %s in one pass", (_case, entity, expected) => {
+    expect(parsePortalNotice(`<script>alert('${entity}')</script>`)).toBe(expected);
+  });
+});
+
+describe("isDaotaoSessionExpired", () => {
+  const authenticatedUrl = "https://daotao.vnu.edu.vn/StdInfo/StudentProfile.asp";
+
+  it("matches the trusted login URL case-insensitively and permits a query", () => {
+    expect(isDaotaoSessionExpired("https://daotao.vnu.edu.vn/DKMH/LOGIN.ASP?return=profile", "")).toBe(true);
+  });
+
+  it("rejects a login-looking URL on a foreign origin", () => {
+    expect(isDaotaoSessionExpired("https://example.com/dkmh/login.asp", "")).toBe(false);
+  });
+
+  it.each([loginFormHtml, mixedAttributeLoginFormHtml])("matches a complete login form", (html) => {
+    expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(true);
+  });
+
+  it.each([
+    ["comment", "<!-- ".repeat(5_000)],
+    ["script", "<script>".repeat(5_000)],
+  ])("fails closed after repeated unterminated %s openers", (_case, openers) => {
+    const loginForm = `<form action="/dkmh/login.asp"><input name="txtLoginId"><input name="txtPassword"></form>`;
+
+    expect(isDaotaoSessionExpired(authenticatedUrl, `${openers}${loginForm}`)).toBe(false);
+  });
+
+  it.each([
+    ["a format end tag", "</format>"],
+    ["a form-invalid end tag", "</form-invalid>"],
+    ["a comment", "<!-- </form> -->"],
+    ["a script", "<script>const closingTag = '</form>';</script>"],
+  ])("ignores a fake form closing tag in %s", (_case, fakeClosingTag) => {
+    const html = `<form action="/dkmh/login.asp"><input name="txtLoginId">${fakeClosingTag}<input name="txtPassword"></form>`;
+
+    expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(true);
+  });
+
+  it.each([
+    `<form action="/dkmh/login.asp"><input name="txtLoginId"></form>`,
+    `<form action='/dkmh/login.asp'><input name='txtPassword'></form>`,
+  ])("rejects a login form missing one required control", (html) => {
+    expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(false);
+  });
+
+  it("scans many unterminated login-form candidates without matching controls across forms", () => {
+    const candidates = Array.from({ length: 20_000 }, (_, index) => (
+      `<form action="/dkmh/login.asp"><input name="${index % 2 === 0 ? "txtLoginId" : "txtPassword"}">`
+    )).join("");
+
+    expect(isDaotaoSessionExpired(authenticatedUrl, `${candidates}</form>`)).toBe(false);
+  });
+
+  it("rejects a complete login form nested inside a non-login form", () => {
+    const html = `<form action="/account"><form action="/dkmh/login.asp"><input name="txtLoginId"><input name="txtPassword"></form></form>`;
+
+    expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(false);
+  });
+
+  it("taints an outer login form containing a nested form, then resumes after the outer close", () => {
+    const malformed = `<form action="/dkmh/login.asp"><input name="txtLoginId"><form action="/account"></form><input name="txtPassword"></form>`;
+    const valid = `<form action="/dkmh/login.asp"><input name="txtLoginId"><input name="txtPassword"></form>`;
+
+    expect(isDaotaoSessionExpired(authenticatedUrl, malformed)).toBe(false);
+    expect(isDaotaoSessionExpired(authenticatedUrl, `${malformed}${valid}`)).toBe(true);
+  });
+
+  it("matches the complete standalone session-ended notice", () => {
+    expect(isDaotaoSessionExpired(authenticatedUrl, standaloneSessionEndedNoticeHtml)).toBe(true);
+  });
+
+  it("uses body evidence when the final URL is malformed", () => {
+    expect(isDaotaoSessionExpired("not a URL", standaloneSessionEndedNoticeHtml)).toBe(true);
+  });
+
+  it.each([
+    ["an extra row", `<html><body><table><tr><td>Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.</td></tr><tr><td></td></tr></table></body></html>`],
+    ["an extra cell", `<html><body><table><tr><td>Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.</td><td></td></tr></table></body></html>`],
+    ["an empty button", `<html><body><table><tr><td>Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.<button></button></td></tr></table></body></html>`],
+  ])("rejects a standalone notice with %s", (_case, html) => {
+    expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(false);
+  });
+
+  it.each([
+    "Please log in because your session may have ended.",
+    `<html><body><form><input name="StdCode" value="SYNTHETIC"></form><table><tr><td>Current term</td></tr></table></body></html>`,
+    `<html><body><table><tr><td><font color="red">Unrelated notice.</font></td></tr></table></body></html>`,
+    `<html><body><table><tr><td>Phiên làm việc đã kết thúc.</td></tr></table></body></html>`,
+    `<html><body><header>Authenticated profile</header><table><tr><td>Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.</td></tr></table></body></html>`,
+    `<html><body><table><tr><td>Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.<input name="state"></td></tr></table></body></html>`,
+    `<html><body><table><tr><td>Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.</td></tr></table><table><tr><td></td></tr></table></body></html>`,
+  ])("rejects non-standalone prose and authenticated content", (html) => {
+    expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(false);
   });
 });

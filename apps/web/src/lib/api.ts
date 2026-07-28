@@ -24,7 +24,7 @@ function uuid(): string {
 // (e.g. a feature that needs a learning-platform credential the user never provided) is
 // a feature-specific problem that should NOT log the user out of a session
 // that is otherwise perfectly valid.
-const SESSION_INVALID_CODES: ReadonlySet<string> = new Set(["MISSING_SESSION", "SESSION_EXPIRED", "INVALID_SESSION"]);
+const SESSION_INVALID_CODES: ReadonlySet<string> = new Set(["MISSING_SESSION", "SESSION_EXPIRED", "INVALID_SESSION", "VNU_SESSION_EXPIRED"]);
 
 export function isSessionDeathCode(code: string | undefined): boolean {
   return code !== undefined && SESSION_INVALID_CODES.has(code);
@@ -125,8 +125,8 @@ export function switchAccount(id: string): void {
   window.dispatchEvent(new CustomEvent(ACCOUNT_SWITCHED_EVENT));
 }
 
-// Removes an account entirely (e.g. sign-out, or a dead session detected via
-// a 401). If the removed account was the active one, auto-switches to
+// Removes an account entirely (e.g. sign-out, or an explicitly coded dead
+// session). If the removed account was the active one, auto-switches to
 // another remaining account if any exist, otherwise fires
 // SESSION_CLEARED_EVENT so the app bounces to /login.
 export function removeAccount(id: string): void {
@@ -162,6 +162,21 @@ export function setSessionToken(token: string): void {
   writeAccounts(accounts);
 }
 
+function findUnchangedStoredAccount(originatingAccount: StoredAccount | undefined): StoredAccount | undefined {
+  if (!originatingAccount) return undefined;
+  return readAccounts().find((account) => account.id === originatingAccount.id && account.token === originatingAccount.token);
+}
+
+function setOriginatingSessionToken(originatingAccount: StoredAccount | undefined, token: string): void {
+  const currentOriginatingAccount = findUnchangedStoredAccount(originatingAccount);
+  if (!currentOriginatingAccount) return;
+  const accounts = readAccounts();
+  const index = accounts.findIndex((account) => account.id === currentOriginatingAccount.id);
+  if (index === -1) return;
+  accounts[index] = { ...accounts[index], token };
+  writeAccounts(accounts);
+}
+
 // Signs out of the active account only. If other accounts remain, switches
 // to one of them instead of forcing a login redirect (see removeAccount).
 export function clearSessionToken(): void {
@@ -171,7 +186,8 @@ export function clearSessionToken(): void {
 }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const token = getSessionToken();
+  const originatingAccount = getActiveAccount();
+  const token = originatingAccount?.token;
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...init,
     headers: {
@@ -188,7 +204,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
   if (!response.ok || payload.error) {
     const code = payload.error?.code;
-    const sessionDied = code ? isSessionDeathCode(code) : response.status === 401;
+    const sessionDied = isSessionDeathCode(code);
     // The worker's lazy upstream refresh can stall on a StudentHub CAPTCHA
     // its server-side OCR couldn't solve. With stored credentials that is
     // recoverable inline too, so it joins the re-auth path instead of
@@ -196,10 +212,12 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     // own, because the Hyeboard session itself is still valid.
     const refreshNeedsCaptcha = code === "STUDENTHUB_CAPTCHA_REQUIRED";
     if (sessionDied || refreshNeedsCaptcha) {
+      const currentOriginatingAccount = findUnchangedStoredAccount(originatingAccount);
+      const originatingAccountIsActive = currentOriginatingAccount !== undefined && getActiveAccountId() === currentOriginatingAccount.id;
       // A recoverable UET session death shows the inline re-auth dialog
       // (see components/reauth.tsx) instead of signing the user out.
-      if (canReauthenticateInline(getActiveAccount()?.universityId)) requestInlineReauth();
-      else if (sessionDied) clearSessionToken();
+      if (originatingAccountIsActive && canReauthenticateInline(currentOriginatingAccount.universityId)) requestInlineReauth();
+      else if (sessionDied && currentOriginatingAccount) removeAccount(currentOriginatingAccount.id);
     }
     throw new ApiError(payload.error?.message ?? `Request failed: ${response.status}`, code, response.status);
   }
@@ -207,7 +225,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   // credential through Google automation or the parent direct CAPTCHA API,
   // then return a fresh encrypted token via meta.refreshedToken.
   const refreshedToken = payload.meta?.refreshedToken;
-  if (typeof refreshedToken === "string" && refreshedToken) setSessionToken(refreshedToken);
+  if (typeof refreshedToken === "string" && refreshedToken) setOriginatingSessionToken(originatingAccount, refreshedToken);
   return payload.data as T;
 }
 

@@ -9,6 +9,80 @@ async function loginDemo(page: import("@playwright/test").Page) {
   await expect(page.getByRole("heading", { name: /Welcome back, Demo Student/i })).toBeVisible();
 }
 
+async function startMockedVnuSession(
+  page: import("@playwright/test").Page,
+  error: { code?: string; status: number; message: string },
+  options: { deferRawResponses?: boolean } = {},
+) {
+  const initialAccountCount = await page.evaluate(() => {
+    const accounts = JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as unknown[];
+    return accounts.length;
+  });
+  let releaseRawRequests!: () => void;
+  const featureNavigationReady = new Promise<void>((resolve) => {
+    releaseRawRequests = resolve;
+  });
+  const expectedRawPaths = new Set([
+    "/api/vnu/raw/profile",
+    "/api/vnu/raw/grades",
+    "/api/vnu/raw/progress",
+  ]);
+  const pendingRawRequestPaths = new Set(expectedRawPaths);
+  let markAllRawRequestsStarted!: () => void;
+  const allRawRequestsStarted = new Promise<void>((resolve) => {
+    markAllRawRequestsStarted = resolve;
+  });
+  const pendingRawResponsePaths = new Set(expectedRawPaths);
+  let markAllRawResponsesFulfilled!: () => void;
+  const allRawResponsesFulfilled = new Promise<void>((resolve) => {
+    markAllRawResponsesFulfilled = resolve;
+  });
+
+  await page.route("**/api/uet/dashboard**", (route) => route.abort());
+  await page.route("**/api/mock/**", (route) => route.abort());
+  await page.route("**/api/vnu/auth/import-session", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          token: "synthetic-vnu-token",
+          session: {
+            authenticated: true,
+            studentCode: "synthetic-vnu-student",
+            expiresAt: "2099-01-01T00:00:00.000Z",
+          },
+        },
+      }),
+    });
+  });
+  await page.route("**/api/vnu/raw/**", async (route) => {
+    const rawPath = new URL(route.request().url()).pathname;
+    if (pendingRawRequestPaths.delete(rawPath) && pendingRawRequestPaths.size === 0) markAllRawRequestsStarted();
+    await featureNavigationReady;
+    await route.fulfill({
+      status: error.status,
+      contentType: "application/json",
+      body: JSON.stringify({ error: { code: error.code, message: error.message } }),
+    });
+    if (pendingRawResponsePaths.delete(rawPath) && pendingRawResponsePaths.size === 0) markAllRawResponsesFulfilled();
+  });
+
+  await page.goto("/login");
+  await page.getByRole("combobox", { name: "School" }).click();
+  await page.getByRole("option", { name: "VNU (daotao)" }).click();
+  await page.getByLabel("Username").fill("synthetic-vnu-user");
+  await page.getByLabel("Password", { exact: true }).fill("synthetic-vnu-password");
+  await page.getByRole("button", { name: "Import university session", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => {
+    const accounts = JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as unknown[];
+    return accounts.length;
+  })).toBe(initialAccountCount + 1);
+  await expect(page).toHaveURL(/\/$/);
+  if (!options.deferRawResponses) releaseRawRequests();
+  return { releaseRawRequests, allRawRequestsStarted, allRawResponsesFulfilled };
+}
+
 async function openMockedLookup(page: import("@playwright/test").Page) {
   await page.route("**/api/universities", async (route) => {
     const response = await route.fetch();
@@ -115,6 +189,118 @@ test("login keeps relogin fields after session expiry", async ({ page }) => {
   await expect(page.getByPlaceholder("Student code / username")).toHaveValue("24000000");
   await expect(page.getByPlaceholder("Password")).toHaveValue("vnu-relogin-password");
 });
+
+test("VNU session expiry clears account and preserves relogin credentials", async ({ page }) => {
+  await startMockedVnuSession(page, {
+    code: "VNU_SESSION_EXPIRED",
+    status: 401,
+    message: "Synthetic VNU session expired",
+  });
+
+  await expect(page).toHaveURL(/\/login$/);
+  const storage = await page.evaluate(() => ({
+    accounts: JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as unknown[],
+    activeAccountId: localStorage.getItem("hyeboard.activeAccountId"),
+  }));
+  expect(storage.accounts).toHaveLength(0);
+  expect(storage.activeAccountId).toBeNull();
+
+  await page.getByRole("combobox", { name: "School" }).click();
+  await page.getByRole("option", { name: "VNU (daotao)" }).click();
+  await expect(page.getByLabel("Username")).toHaveValue("synthetic-vnu-user");
+  await expect(page.getByLabel("Password", { exact: true })).toHaveValue("synthetic-vnu-password");
+
+  const credentialStorage = await page.evaluate(() => {
+    const credentialEntries = Object.entries(sessionStorage).filter(([, value]) => value === "synthetic-vnu-user" || value === "synthetic-vnu-password");
+    return {
+      sessionCredentials: Object.fromEntries(credentialEntries),
+      localStorageSerialized: JSON.stringify({ ...localStorage }),
+    };
+  });
+  expect(credentialStorage.sessionCredentials).toEqual({
+    "hyeboard.relogin.vnu.username": "synthetic-vnu-user",
+    "hyeboard.relogin.vnu.password": "synthetic-vnu-password",
+  });
+  expect(credentialStorage.localStorageSerialized).not.toContain("synthetic-vnu-user");
+  expect(credentialStorage.localStorageSerialized).not.toContain("synthetic-vnu-password");
+
+  const newTab = await page.context().newPage();
+  await newTab.goto("/login");
+  await newTab.getByRole("combobox", { name: "School" }).click();
+  await newTab.getByRole("option", { name: "VNU (daotao)" }).click();
+  await expect(newTab.getByLabel("Username")).toHaveValue("");
+  await expect(newTab.getByLabel("Password", { exact: true })).toHaveValue("");
+  expect(await newTab.evaluate(() => ({
+    username: sessionStorage.getItem("hyeboard.relogin.vnu.username"),
+    password: sessionStorage.getItem("hyeboard.relogin.vnu.password"),
+  }))).toEqual({ username: null, password: null });
+  await newTab.close();
+});
+
+test("concurrent VNU session expiry removes only its originating account", async ({ page }) => {
+  await loginDemo(page);
+  const survivingAccount = await page.evaluate(() => {
+    const accounts = JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ id: string; universityId: string; token: string }>;
+    return accounts.find((account) => account.universityId === "mock");
+  });
+  expect(survivingAccount).toBeDefined();
+
+  const mockedSession = await startMockedVnuSession(page, {
+    code: "VNU_SESSION_EXPIRED",
+    status: 401,
+    message: "Synthetic concurrent VNU session expiry",
+  }, { deferRawResponses: true });
+  const harmlessExtraRawRequest = page.evaluate(() => fetch("/api/vnu/raw/syllabus").then((response) => response.status));
+  await mockedSession.allRawRequestsStarted;
+
+  await page.getByRole("button", { name: "Open account menu" }).click();
+  await page.getByTestId("account-switch-item").filter({ hasText: "(MOCK)" }).click();
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("hyeboard.activeAccountId"))).toBe(survivingAccount?.id);
+
+  mockedSession.releaseRawRequests();
+  await mockedSession.allRawResponsesFulfilled;
+  await expect(harmlessExtraRawRequest).resolves.toBe(401);
+  await page.waitForLoadState("networkidle");
+  await expect.poll(() => page.evaluate((expectedAccount) => {
+    const accounts = JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ id: string; universityId: string; token: string }>;
+    return {
+      accountCount: accounts.length,
+      survivingIdMatches: accounts[0]?.id === expectedAccount?.id,
+      survivingTokenMatches: accounts[0]?.token === expectedAccount?.token,
+      survivingUniversityMatches: accounts[0]?.universityId === expectedAccount?.universityId,
+      activeAccountMatches: localStorage.getItem("hyeboard.activeAccountId") === expectedAccount?.id,
+    };
+  }, survivingAccount)).toEqual({
+    accountCount: 1,
+    survivingIdMatches: true,
+    survivingTokenMatches: true,
+    survivingUniversityMatches: true,
+    activeAccountMatches: true,
+  });
+  await expect(page).not.toHaveURL(/\/login$/);
+});
+
+for (const error of [
+  { status: 401, message: "Synthetic code-less VNU failure" },
+  { code: "VNU_UNKNOWN_FAILURE", status: 401, message: "Synthetic unknown VNU failure" },
+  { code: "VNU_REQUEST_FAILED", status: 401, message: "Synthetic VNU request failed" },
+  { code: "VNU_RATE_LIMITED", status: 429, message: "Synthetic VNU rate limit" },
+  { code: "VNU_UPSTREAM_UNAVAILABLE", status: 502, message: "Synthetic VNU upstream unavailable" },
+  { code: "VNU_CROSS_LOOKUP_NOT_FOUND", status: 404, message: "Synthetic VNU lookup not found" },
+]) {
+  test(`${error.code ?? "VNU code-less 401"} remains inline and keeps the active account`, async ({ page }) => {
+    await startMockedVnuSession(page, error);
+
+    await expect(page).not.toHaveURL(/\/login$/);
+    await expect(page.getByText(error.message).first()).toBeVisible();
+    const storage = await page.evaluate(() => ({
+      accounts: JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as unknown[],
+      activeAccountId: localStorage.getItem("hyeboard.activeAccountId"),
+    }));
+    expect(storage.accounts).toHaveLength(1);
+    expect(storage.activeAccountId).not.toBeNull();
+  });
+}
 
 test("login always shows the correct accent color for the selected school, never a stale one", async ({ page }) => {
   // Simulate a browser that previously had a mock (geist) session persisted,

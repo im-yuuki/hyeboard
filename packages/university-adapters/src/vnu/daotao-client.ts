@@ -6,7 +6,7 @@
 
 import { HyeboardError, type EncryptedSessionPayload } from "@hyeboard/core";
 import { BROWSER_USER_AGENT } from "../http";
-import { hasLoginForm } from "./parser";
+import { isDaotaoSessionExpired } from "./parser";
 
 const BASE = "https://daotao.vnu.edu.vn";
 
@@ -32,10 +32,9 @@ export class DaotaoClient {
     if (response.status >= 500) throw new HyeboardError("VNU_UPSTREAM_UNAVAILABLE", `daotao.vnu.edu.vn returned ${response.status}. Try again later.`, 502);
     if (!response.ok) throw new HyeboardError("VNU_REQUEST_FAILED", `daotao.vnu.edu.vn rejected the request with HTTP ${response.status}.`, response.status);
     const html = await response.text();
-    // The ASP portal doesn't return 401s for an expired/invalid session — it
-    // just re-renders the login page. Detect that explicitly so callers get
-    // a real "sign in again" error instead of silently parsing an empty page.
-    if (hasLoginForm(html)) throw new HyeboardError("VNU_SESSION_EXPIRED", "The university portal session has expired. Sign in again.", 401);
+    if (isDaotaoSessionExpired(response.url, html)) {
+      throw new HyeboardError("VNU_SESSION_EXPIRED", "The university portal session has expired. Sign in again.", 401);
+    }
     return html;
   }
 
