@@ -1,12 +1,14 @@
 import { configureLogger } from "@hyeboard/core";
 import { env } from "cloudflare:workers";
 import { CloudflareAdapter } from "elysia/adapter/cloudflare-worker";
-import { createApp, setCaptchaRelayCoordinator, setCloudflareBrowserBinding, setRuntimeConfig, setVnuProbeBudgetCoordinator } from "./app";
+import { createApp, setCaptchaRelayCoordinator, setCloudflareBrowserBinding, setRuntimeConfig, setVnuProbeBudgetCoordinator, setVnuRefreshControlCoordinator } from "./app";
 import { DurableObjectCaptchaRelayCoordinator } from "./captcha-relay-cloudflare";
 import { DurableObjectVnuProbeBudgetCoordinator } from "./vnu-probe-budget";
+import { DurableObjectVnuRefreshControlCoordinator } from "./vnu-refresh-control";
 
 export { CaptchaRelayDurableObject } from "./captcha-relay-durable-object";
 export { VnuProbeBudgetDurableObject } from "./vnu-probe-budget-durable-object";
+export { VnuRefreshControlDurableObject } from "./vnu-refresh-control-durable-object";
 
 const cfEnv = env;
 
@@ -22,5 +24,6 @@ setRuntimeConfig({
 setCloudflareBrowserBinding(cfEnv.BROWSER);
 setCaptchaRelayCoordinator(new DurableObjectCaptchaRelayCoordinator(cfEnv.CAPTCHA_RELAY));
 setVnuProbeBudgetCoordinator(new DurableObjectVnuProbeBudgetCoordinator(cfEnv.VNU_PROBE_BUDGET));
+setVnuRefreshControlCoordinator(new DurableObjectVnuRefreshControlCoordinator(cfEnv.VNU_REFRESH_CONTROL));
 
 export default createApp(CloudflareAdapter);

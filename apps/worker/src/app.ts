@@ -4,6 +4,7 @@ import { DaotaoClient, getAdapter, isDaotaoSessionExpired, listUniversities, par
 import { Elysia, t } from "elysia";
 import { LocalCaptchaRelayCoordinator, captchaRelayCancelled, captchaRelayNotFound, type CaptchaRelayCoordinator, type PreparedCaptchaRelay } from "./captcha-relay";
 import { probeBudgetUnavailable, type VnuProbeBudgetCoordinator } from "./vnu-probe-budget";
+import { vnuRefreshUnavailable, type VnuRefreshControlCoordinator } from "./vnu-refresh-control";
 import { resolveVnuStudentId, VNU_STUDENT_ID_RESOLVER_MAX_PROBES } from "./vnu-student-id-resolver";
 import { normalizeSelfHostedInteger, parseVnuRuntimeConfig, type EffectiveVnuRuntimeConfig } from "./vnu-runtime-config";
 
@@ -594,6 +595,17 @@ let probeBudgetCoordinatorInstalled = false;
 export function setVnuProbeBudgetCoordinator(coordinator: VnuProbeBudgetCoordinator): void {
   vnuProbeBudgetCoordinator = coordinator;
   probeBudgetCoordinatorInstalled = true;
+}
+
+let vnuRefreshControlCoordinator: VnuRefreshControlCoordinator | undefined;
+
+export function setVnuRefreshControlCoordinator(coordinator: VnuRefreshControlCoordinator | undefined): void {
+  vnuRefreshControlCoordinator = coordinator;
+}
+
+function requireVnuRefreshControlCoordinator(): VnuRefreshControlCoordinator {
+  if (!vnuRefreshControlCoordinator) throw vnuRefreshUnavailable();
+  return vnuRefreshControlCoordinator;
 }
 
 async function vnuProbeBudgetKey(session: EncryptedSessionPayload): Promise<string> {

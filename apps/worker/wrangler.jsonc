@@ -34,6 +34,10 @@
       {
         "name": "VNU_PROBE_BUDGET",
         "class_name": "VnuProbeBudgetDurableObject"
+      },
+      {
+        "name": "VNU_REFRESH_CONTROL",
+        "class_name": "VnuRefreshControlDurableObject"
       }
     ]
   },
@@ -45,6 +49,10 @@
     {
       "tag": "v2",
       "new_sqlite_classes": ["VnuProbeBudgetDurableObject"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["VnuRefreshControlDurableObject"]
     }
   ],
   "secrets": {

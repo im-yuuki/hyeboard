@@ -17,6 +17,10 @@ export default defineConfig({
             className: "VnuProbeBudgetDurableObject",
             useSQLite: true,
           },
+          VNU_REFRESH_CONTROL: {
+            className: "VnuRefreshControlDurableObject",
+            useSQLite: true,
+          },
         },
       },
     }),
