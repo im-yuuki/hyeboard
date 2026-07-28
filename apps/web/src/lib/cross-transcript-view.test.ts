@@ -1,13 +1,23 @@
 import { describe, expect, it } from "vitest";
 import type { VnuCrossTranscript } from "./api";
 import { deriveCrossTranscriptInput, deriveCrossTranscriptView, mapCrossTranscriptError } from "./cross-transcript-view";
+import { calculateTermAcademicSummaries, newestAcademicTermsFirst } from "./term-academic-summary";
 
 const profile = { internalStudentId: "1000", studentCode: "20000000" };
 const transcript: VnuCrossTranscript = {
   header: { studentCode: "20000001", studentName: "Synthetic Student" },
-  terms: [{ maHK: "251", rows: [{ courseCode: "INT1001", courseName: "Reliable Systems" }] }],
-  totals: {},
+  terms: [{ maHK: "251", rows: [{ courseCode: "SYN9901", courseName: "Reserved Synthetic Course", credits: 3, grade4: 3.5 }] }],
+  totals: { gpa4: 3.91 },
 };
+const derivedTerms = newestAcademicTermsFirst(calculateTermAcademicSummaries(
+  transcript.terms.flatMap((term) => term.rows.map((course) => ({
+    termKey: term.maHK,
+    credits: course.credits,
+    point4: course.grade4,
+    course,
+  }))),
+  "vnu",
+));
 
 describe("cross-transcript input", () => {
   it("parses a valid internal-ID target and normalizes whitespace", () => {
@@ -51,6 +61,7 @@ describe("cross-transcript view", () => {
     isLoading: false,
     hasError: false,
     transcript,
+    derivedTerms,
     ...overrides,
   });
 
@@ -64,7 +75,13 @@ describe("cross-transcript view", () => {
     expect(view({ isLoading: true })).toEqual({ kind: "loading" });
     expect(view({ transcript: { ...transcript, header: {} } })).toEqual({ kind: "notFound" });
     expect(view({ transcript: { ...transcript, terms: [] } })).toEqual({ kind: "noRows" });
-    expect(view()).toMatchObject({ kind: "success", rowCount: 1, transcript });
+    const success = view();
+    expect(success.kind).toBe("success");
+    if (success.kind !== "success") throw new Error("Expected a successful cross-transcript view");
+    expect(success).toEqual({ kind: "success", rowCount: 1, transcript, derivedTerms });
+    expect(success.derivedTerms).toBe(derivedTerms);
+    expect(success.transcript.totals.gpa4).toBe(3.91);
+    expect(success.derivedTerms[0]).toMatchObject({ termGpa4: 3.5, cpa4: 3.5 });
   });
 
   it("models translated error categories without exposing API messages", () => {

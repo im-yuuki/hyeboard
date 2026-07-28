@@ -1,7 +1,8 @@
-import type { VnuExamCatalogRow, VnuExamTermInfo, VnuProfile, VnuTranscriptTerm } from "@hyeboard/university-adapters/src/vnu/types";
+import type { VnuExamCatalogRow, VnuExamTermInfo, VnuProfile, VnuTranscriptRow } from "@hyeboard/university-adapters/src/vnu/types";
 import { VNU_EXAM_TERMS } from "@hyeboard/university-adapters/src/vnu/exam-terms";
 import { useQuery } from "@tanstack/react-query";
-import { useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
+import { ExportMenu } from "@/components/export-menu";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -14,8 +15,10 @@ import { Empty, FeatureFrame, SummaryStat, SummaryStrip } from "@/components/sha
 import { api, ApiError, type VnuBulkLookupItem, type VnuBulkLookupMode, type VnuCrossTranscriptInput } from "@/lib/api";
 import { deriveBulkLookupViewState, executeBulkLookup, parseBulkTargets, type BulkLookupProgress } from "@/lib/bulk-lookup";
 import { deriveCrossTranscriptInput, deriveCrossTranscriptView } from "@/lib/cross-transcript-view";
+import { createClassLookupExport, createResolverLookupExport, createTranscriptExport, type ExportDerivedTerm, type ExportDocument } from "@/lib/data-export";
 import { useLocale } from "@/lib/i18n";
 import { formatTermLabel } from "@/lib/presentation";
+import { calculateTermAcademicSummaries, newestAcademicTermsFirst, type AcademicTermSummary } from "@/lib/term-academic-summary";
 import { useHyeboard } from "@/state";
 
 // Newest first - matches the convention every other term picker in the app
@@ -51,7 +54,11 @@ function filterCatalogRowsByClassId(rows: VnuExamCatalogRow[], classId: string):
   return rows.filter((row) => row.classId === classIdQuery);
 }
 
-function ClassResultRow({ row, expanded, onToggleDetail }: { row: VnuExamCatalogRow; expanded: boolean; onToggleDetail: () => void }) {
+function classExportResult(row: VnuExamCatalogRow) {
+  return { classCode: row.courseCode, classNumber: row.classNo, classId: row.classId, courseName: row.courseName };
+}
+
+function ClassResultRow({ row, expanded, onToggleDetail, exportModel }: { row: VnuExamCatalogRow; expanded: boolean; onToggleDetail: () => void; exportModel: ExportDocument }) {
   const { t } = useLocale();
   return (
     <div className="list-row flex-col items-stretch gap-3 sm:flex-row sm:items-center">
@@ -61,6 +68,7 @@ function ClassResultRow({ row, expanded, onToggleDetail }: { row: VnuExamCatalog
       </div>
       <div className="flex flex-wrap items-center gap-2 sm:shrink-0 sm:justify-end">
         <Badge className="max-w-full break-all border border-border bg-background font-mono font-normal tabular-nums text-foreground">{row.classId}</Badge>
+        <ExportMenu model={exportModel} />
         <Button type="button" variant="outline" size="sm" className="min-h-11" aria-expanded={expanded} onClick={onToggleDetail}>{t.lookup.pointDetailAction}</Button>
       </div>
     </div>
@@ -170,7 +178,17 @@ function ClassResolver() {
                   <div className="divide-y divide-border">
                     {filteredRows.map((row) => (
                       <div key={row.classId}>
-                        <ClassResultRow row={row} expanded={expandedClassId === row.classId} onToggleDetail={() => setExpandedClassId((current) => (current === row.classId ? null : row.classId))} />
+                        <ClassResultRow
+                          row={row}
+                          expanded={expandedClassId === row.classId}
+                          onToggleDetail={() => setExpandedClassId((current) => (current === row.classId ? null : row.classId))}
+                          exportModel={createClassLookupExport({
+                            surface: "class-forward",
+                            universityId: state.universityId,
+                            query: { mode: "course-and-class", value: [termOrdinal, courseCode.trim(), classNo.trim()].filter(Boolean).join(" / ") },
+                            result: classExportResult(row),
+                          })}
+                        />
                         {expandedClassId === row.classId && termOrdinal ? <PointDetailPanel classId={row.classId} termOrdinal={termOrdinal} /> : null}
                       </div>
                     ))}
@@ -189,7 +207,7 @@ function ClassResolver() {
 // identically to the forward exam-schedule view - now that
 // parseExamCatalogHtml captures the same descriptive columns parseExamsHtml
 // does, none of these fields need re-deriving here.
-function ReverseClassResultRow({ row }: { row: VnuExamCatalogRow }) {
+function ReverseClassResultRow({ row, exportModel }: { row: VnuExamCatalogRow; exportModel: ExportDocument }) {
   const { t } = useLocale();
   const meta = [row.examDate || undefined, row.hour, row.method, row.room, row.seatNumber ? t.lookup.crossSeat(row.seatNumber) : undefined].filter(Boolean).join(" · ");
   return (
@@ -198,7 +216,10 @@ function ReverseClassResultRow({ row }: { row: VnuExamCatalogRow }) {
         <p className="break-words text-sm font-medium">{row.courseCode}{row.classNo ? ` · ${row.classNo}` : ""} — {row.courseName}</p>
         <p className="break-words text-xs text-muted-foreground">{meta || "-"}</p>
       </div>
-      <Badge className="max-w-full self-start break-all border border-border bg-background font-mono font-normal tabular-nums text-foreground sm:shrink-0 sm:self-auto">{row.classId}</Badge>
+      <div className="flex flex-wrap items-center gap-2 sm:shrink-0 sm:justify-end">
+        <Badge className="max-w-full break-all border border-border bg-background font-mono font-normal tabular-nums text-foreground">{row.classId}</Badge>
+        <ExportMenu model={exportModel} />
+      </div>
     </div>
   );
 }
@@ -259,7 +280,16 @@ function ReverseClassResolver() {
                 <span>{t.lookup.headers[1]}</span>
               </div>
               <div className="divide-y divide-border">
-                {matchedRows.map((row, index) => <ReverseClassResultRow key={`${row.classId}-${index}`} row={row} />)}
+                {matchedRows.map((row, index) => <ReverseClassResultRow
+                  key={`${row.classId}-${index}`}
+                  row={row}
+                  exportModel={createClassLookupExport({
+                    surface: "class-reverse",
+                    universityId: state.universityId,
+                    query: { mode: "class-id", value: `${termOrdinal} / ${trimmedClassId}` },
+                    result: classExportResult(row),
+                  })}
+                />)}
               </div>
           </div>
         )}
@@ -325,6 +355,17 @@ function CrossStudentCodeSection({ profile }: { profile: VnuProfile }) {
   };
 
   const result = codeQuery.data;
+  const exportModel = submitted && result?.studentCode && !codeQuery.error ? createResolverLookupExport({
+    surface: "student-id-to-code",
+    universityId: state.universityId,
+    query: { mode: "stdId", value: submitted.stdId },
+    identity: {
+      internalStudentId: submitted.stdId,
+      studentCode: result.studentCode,
+      studentName: result.studentName,
+      managingClass: result.className,
+    },
+  }) : undefined;
   const codeError = codeQuery.error instanceof ApiError && codeQuery.error.code === "VNU_CROSS_LOOKUP_NOT_FOUND"
     ? t.lookup.crossCodeNotFound
     : codeQuery.error instanceof ApiError && codeQuery.error.code === "VNU_RATE_LIMITED"
@@ -354,7 +395,10 @@ function CrossStudentCodeSection({ profile }: { profile: VnuProfile }) {
                   <p className="break-words text-sm font-medium">{result.studentName ?? t.lookup.crossCodeResolvedTitle}</p>
                   <p className="break-words text-xs text-muted-foreground">{[t.lookup.crossCodeResolvedFrom(submitted.stdId), result.className || undefined].filter(Boolean).join(" · ")}</p>
                 </div>
-                <Badge className="max-w-full shrink-0 break-all border border-border bg-background font-mono font-normal tabular-nums text-foreground">{result.studentCode}</Badge>
+                <div className="flex flex-wrap items-center gap-2 sm:shrink-0 sm:justify-end">
+                  <Badge className="max-w-full break-all border border-border bg-background font-mono font-normal tabular-nums text-foreground">{result.studentCode}</Badge>
+                  {exportModel ? <ExportMenu model={exportModel} /> : null}
+                </div>
               </div>
             </div>
           )
@@ -396,6 +440,16 @@ function CrossStudentIdSection({ profile }: { profile: VnuProfile }) {
   };
 
   const result = idQuery.data;
+  const exportModel = submitted && result && !idQuery.error ? createResolverLookupExport({
+    surface: "student-code-to-id",
+    universityId: state.universityId,
+    query: { mode: "stdCode", value: submitted.stdCode },
+    resolver: {
+      resolvedStudentCode: result.stdCode,
+      resolvedInternalStudentId: result.stdId,
+      probes: result.probes,
+    },
+  }) : undefined;
   const notConverged = idQuery.error instanceof ApiError && idQuery.error.code === "VNU_CROSS_LOOKUP_NOT_CONVERGED";
   const idError = idQuery.error instanceof ApiError && idQuery.error.code === "VNU_RATE_LIMITED"
     ? t.lookup.crossTranscriptRateLimited
@@ -424,7 +478,10 @@ function CrossStudentIdSection({ profile }: { profile: VnuProfile }) {
                   <p className="break-words text-sm font-medium">{t.lookup.crossIdResolvedTitle}</p>
                   <p className="break-words text-xs text-muted-foreground">{[t.lookup.crossIdResolvedFrom(result.stdCode), t.lookup.crossIdProbes(result.probes)].join(" · ")}</p>
                 </div>
-                <Badge className="max-w-full shrink-0 break-all border border-border bg-background font-mono font-normal tabular-nums text-foreground">{result.stdId}</Badge>
+                <div className="flex flex-wrap items-center gap-2 sm:shrink-0 sm:justify-end">
+                  <Badge className="max-w-full break-all border border-border bg-background font-mono font-normal tabular-nums text-foreground">{result.stdId}</Badge>
+                  {exportModel ? <ExportMenu model={exportModel} /> : null}
+                </div>
               </div>
             </div>
           ) : null
@@ -433,11 +490,44 @@ function CrossStudentIdSection({ profile }: { profile: VnuProfile }) {
   );
 }
 
-function CrossTranscriptTerm({ term }: { term: VnuTranscriptTerm }) {
+function CompactAcademicMetric({ label, value }: { label: string; value: string }) {
+  return <span className="inline-flex items-baseline gap-1.5 whitespace-nowrap"><span className="text-xs text-muted-foreground">{label}</span><span className="font-semibold tabular-nums">{value}</span></span>;
+}
+
+function crossTranscriptExportTerm(summary: AcademicTermSummary<VnuTranscriptRow>, label: string): ExportDerivedTerm {
+  return {
+    termCode: summary.termKey,
+    termLabel: label,
+    estimateKind: "derived",
+    listedCredits: summary.listedCredits,
+    includedCredits: summary.includedCredits,
+    termGpa4: summary.termGpa4,
+    derivedCpa4: summary.cpa4,
+    courses: summary.courses.map((row) => ({
+      courseCode: row.courseCode,
+      courseName: row.courseName,
+      credits: row.credits,
+      point10: row.grade10,
+      letter: row.letterGrade,
+      point4: row.grade4,
+    })),
+  };
+}
+
+function CrossTranscriptTerm({ summary }: { summary: AcademicTermSummary<VnuTranscriptRow> }) {
   const { t } = useLocale();
+  const label = formatTermLabel(summary.termKey, "vnu", t.terms);
   return (
-    <section className="space-y-2" aria-labelledby={`cross-transcript-term-${term.maHK}`}>
-      <h3 id={`cross-transcript-term-${term.maHK}`} className="text-sm font-semibold">{formatTermLabel(term.maHK, "vnu", t.terms)}</h3>
+    <section className="space-y-2" aria-labelledby={`cross-transcript-term-${summary.termKey}`}>
+      <header data-testid="academic-term-header" className="flex flex-wrap items-center gap-x-4 gap-y-2 border-y border-border py-3">
+        <h4 id={`cross-transcript-term-${summary.termKey}`} className="text-sm font-semibold">{label}</h4>
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          <Badge className="border border-border bg-muted text-foreground" title={t.grades.derivedDetail}>{t.grades.derived}</Badge>
+          <CompactAcademicMetric label={t.grades.termGpa} value={summary.termGpa4?.toFixed(2) ?? "-"} />
+          <CompactAcademicMetric label={t.grades.cpa} value={summary.cpa4?.toFixed(2) ?? "-"} />
+          <CompactAcademicMetric label={t.grades.includedCredits} value={t.grades.creditRatio(summary.includedCredits, summary.listedCredits)} />
+        </div>
+      </header>
       <div data-testid="cross-transcript-table" className="max-h-[32rem] overflow-auto rounded-xl border border-border">
         <table className="w-full min-w-[36rem] table-fixed text-sm">
           <colgroup><col /><col className="w-20" /><col className="w-20" /><col className="w-20" /><col className="w-20" /></colgroup>
@@ -451,7 +541,7 @@ function CrossTranscriptTerm({ term }: { term: VnuTranscriptTerm }) {
             </tr>
           </thead>
           <tbody className="divide-y divide-border">
-            {term.rows.map((row, index) => (
+            {summary.courses.map((row, index) => (
               <tr key={`${row.courseCode}-${row.classId ?? index}`}>
                 <td className="min-w-0 px-3 py-2">
                   <p className="break-words font-medium">{row.courseName}</p>
@@ -487,6 +577,15 @@ function CrossTranscriptSection({ profile }: { profile: VnuProfile }) {
     },
     enabled: Boolean(submitted),
   });
+  const derivedTerms = useMemo(() => newestAcademicTermsFirst(calculateTermAcademicSummaries(
+    (transcriptQuery.data?.terms ?? []).flatMap((term) => term.rows.map((row) => ({
+      termKey: term.maHK,
+      credits: row.credits,
+      point4: row.grade4,
+      course: row,
+    }))),
+    "vnu",
+  )), [transcriptQuery.data]);
 
   const submit = () => {
     if (!inputState.target) return;
@@ -499,7 +598,23 @@ function CrossTranscriptSection({ profile }: { profile: VnuProfile }) {
     hasError: Boolean(transcriptQuery.error),
     errorCode: transcriptQuery.error instanceof ApiError ? transcriptQuery.error.code : undefined,
     transcript: transcriptQuery.data,
+    derivedTerms,
   });
+  const transcriptExportModel = transcriptView.kind === "success" && submitted ? createTranscriptExport({
+    universityId: state.universityId,
+    query: { mode: submitted.mode, value: submitted.mode === "stdId" ? submitted.stdId : submitted.stdCode },
+    identity: {
+      studentCode: transcriptView.transcript.header.studentCode,
+      studentName: transcriptView.transcript.header.studentName,
+      managingClass: transcriptView.transcript.header.className,
+    },
+    reported: {
+      cumulativeGpa4: transcriptView.transcript.totals.gpa4,
+      totalCredits: transcriptView.transcript.totals.totalCredits,
+      accumulatedCredits: transcriptView.transcript.totals.accumulatedCredits,
+    },
+    derivedTerms: transcriptView.derivedTerms.map((summary) => crossTranscriptExportTerm(summary, formatTermLabel(summary.termKey, "vnu", t.terms))),
+  }) : undefined;
   const translatedError = transcriptView.kind === "error"
     ? transcriptView.errorKind === "rateLimited"
       ? t.lookup.crossTranscriptRateLimited
@@ -510,7 +625,10 @@ function CrossTranscriptSection({ profile }: { profile: VnuProfile }) {
 
   return (
     <section data-testid="cross-transcript" className="space-y-4" aria-labelledby="cross-transcript-heading">
-      <div className="space-y-1"><h3 id="cross-transcript-heading" className="text-sm font-semibold">{t.lookup.crossTranscriptTitle}</h3><p className="max-w-[70ch] text-sm text-muted-foreground">{t.lookup.crossTranscriptDescription}</p></div>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0 space-y-1"><h3 id="cross-transcript-heading" className="text-sm font-semibold">{t.lookup.crossTranscriptTitle}</h3><p className="max-w-[70ch] text-sm text-muted-foreground">{t.lookup.crossTranscriptDescription}</p></div>
+        {transcriptExportModel ? <ExportMenu model={transcriptExportModel} /> : null}
+      </div>
         <div className="grid min-h-11 grid-cols-2 rounded-lg border border-border p-1 sm:inline-grid" role="group" aria-label={t.lookup.crossTranscriptModeLabel}>
           <Button type="button" size="sm" variant={mode === "stdId" ? "default" : "ghost"} className="min-h-11" aria-pressed={mode === "stdId"} onClick={() => { setMode("stdId"); setSubmitted(null); }}>{t.lookup.crossTranscriptStdIdMode}</Button>
           <Button type="button" size="sm" variant={mode === "stdCode" ? "default" : "ghost"} className="min-h-11" aria-pressed={mode === "stdCode"} onClick={() => { setMode("stdCode"); setSubmitted(null); }}>{t.lookup.crossTranscriptStdCodeMode}</Button>
@@ -551,7 +669,7 @@ function CrossTranscriptSection({ profile }: { profile: VnuProfile }) {
                 <SummaryStat label={t.lookup.crossTranscriptAccumulatedCredits} value={transcriptView.transcript.totals.accumulatedCredits ?? "-"} />
                 <SummaryStat label={t.lookup.crossTranscriptGpa4} value={transcriptView.transcript.totals.gpa4 ?? "-"} />
               </SummaryStrip>
-              {transcriptView.transcript.terms.filter((term) => term.rows.length > 0).map((term) => <CrossTranscriptTerm key={term.maHK} term={term} />)}
+              {transcriptView.derivedTerms.map((summary) => <CrossTranscriptTerm key={summary.termKey} summary={summary} />)}
             </div>
           ) : null}</div>
     </section>

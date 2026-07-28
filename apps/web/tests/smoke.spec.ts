@@ -18,24 +18,82 @@ async function loginDemo(page: import("@playwright/test").Page) {
   await expect(page.getByRole("heading", { name: /Welcome back, Demo Student/i })).toBeVisible();
 }
 
-async function openMockedLookup(page: import("@playwright/test").Page) {
+const SYNTHETIC_OWN_STUDENT_CODE = "99000000";
+const SYNTHETIC_TARGET_STUDENT_CODE = "99000001";
+const SYNTHETIC_ERROR_STUDENT_CODE = "99000002";
+const SYNTHETIC_OWN_INTERNAL_ID = "99000000000";
+const SYNTHETIC_TARGET_INTERNAL_ID = "99000000001";
+const SYNTHETIC_ERROR_INTERNAL_ID = "99000000002";
+const SYNTHETIC_CLASS_ID = "990099";
+
+type LookupRequestCounts = { exams: number; studentCode: number; studentId: number; transcript: number };
+
+async function openMockedLookup(page: import("@playwright/test").Page): Promise<LookupRequestCounts> {
+  const requestCounts: LookupRequestCounts = { exams: 0, studentCode: 0, studentId: 0, transcript: 0 };
   await page.route("**/api/universities", async (route) => {
     const response = await route.fetch();
-    const payload = await response.json() as { data: Array<{ id: string; capabilities: Record<string, boolean> }> };
+    const payload = await response.json() as { data: Array<{ id: string; capabilities: Record<string, boolean>; limits?: { crossLookup?: { bulkMaxTargets: number } } }> };
     const mock = payload.data.find((university) => university.id === "mock");
     if (mock) {
       mock.capabilities.classLookup = true;
       mock.capabilities.crossLookup = true;
+      mock.limits = { crossLookup: { bulkMaxTargets: 50 } };
     }
     await route.fulfill({ response, json: payload });
   });
   await page.route("**/api/vnu/raw/profile", async (route) => {
-    const html = '<input name="StdCode" value="24000000"><input name="StdName" value="Demo Student"><input name="hidStdID" value="123456">';
+    const html = `<input name="StdCode" value="${SYNTHETIC_OWN_STUDENT_CODE}"><input name="StdName" value="Synthetic Demo"><input name="hidStdID" value="${SYNTHETIC_OWN_INTERNAL_ID}">`;
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { html } }) });
+  });
+  await page.route("**/api/vnu/raw/exams**", async (route) => {
+    requestCounts.exams += 1;
+    const html = `<table><tr><td>1</td><td>252-SYN9900-99</td><td>Synthetic Export Systems</td><td>31/12/2099</td><td>9(09:00)</td><td>Synthetic</td><td>LAB-99</td><td>99</td><td><input name="hidCrdID" value="${SYNTHETIC_CLASS_ID}"></td></tr></table>`;
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { html } }) });
+  });
+  await page.route("**/api/vnu/cross-lookup/student-code**", async (route) => {
+    requestCounts.studentCode += 1;
+    const isError = new URL(route.request().url()).searchParams.get("stdId") === SYNTHETIC_ERROR_INTERNAL_ID;
+    await route.fulfill({
+      status: isError ? 404 : 200,
+      contentType: "application/json",
+      body: JSON.stringify(isError
+        ? { data: null, error: { code: "VNU_CROSS_LOOKUP_NOT_FOUND", message: "Synthetic not found" } }
+        : { data: { studentCode: SYNTHETIC_TARGET_STUDENT_CODE, studentName: "Synthetic Target", className: "SYNTHETIC-99" }, error: null }),
+    });
+  });
+  await page.route("**/api/vnu/cross-lookup/student-id**", async (route) => {
+    requestCounts.studentId += 1;
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { stdCode: SYNTHETIC_TARGET_STUDENT_CODE, stdId: SYNTHETIC_TARGET_INTERNAL_ID, probes: 2 }, error: null }) });
+  });
+  await page.route("**/api/vnu/cross-lookup/transcript**", async (route) => {
+    requestCounts.transcript += 1;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: {
+        header: { studentCode: SYNTHETIC_TARGET_STUDENT_CODE, studentName: "Synthetic Target", className: "SYNTHETIC-99" },
+        totals: { totalCredits: 8, accumulatedCredits: 6, gpa4: 3.91 },
+        terms: [
+          { maHK: "251", rows: [{ courseCode: "SYN9901", courseName: "Synthetic Foundations", credits: 3, grade10: 8, letterGrade: "B", grade4: 3 }] },
+          { maHK: "252", rows: [
+            { courseCode: "SYN9902", courseName: "Synthetic Resolution", credits: 3, grade10: 9, letterGrade: "A", grade4: 4 },
+            { courseCode: "SYN9903", courseName: "Synthetic Pending", credits: 2 },
+          ] },
+        ],
+      }, error: null }),
+    });
   });
   await loginDemo(page);
   await page.goto("/lookup");
   await expect(page.getByRole("heading", { name: "Lookup", exact: true })).toBeVisible();
+  return requestCounts;
+}
+
+async function downloadJsonExport(scope: import("@playwright/test").Locator): Promise<Record<string, unknown>> {
+  await scope.getByRole("button", { name: "Export" }).click();
+  const downloadPromise = scope.page().waitForEvent("download");
+  await scope.page().getByRole("menuitem", { name: "Download JSON" }).click();
+  return JSON.parse(await downloadText(await downloadPromise)) as Record<string, unknown>;
 }
 
 test.beforeEach(async ({ page }) => {
@@ -382,6 +440,97 @@ test("lookup groups use progressive modes, accessible labels, and responsive tou
   }
 });
 
+test("lookup successful single results export JSON without refetch and clear stale actions", async ({ page }) => {
+  const requests = await openMockedLookup(page);
+
+  await page.getByLabel("Course code").fill("SYN9900");
+  await page.getByLabel("Term").click();
+  await page.getByRole("option", { name: "Semester 2, 2025–2026 (supplementary)" }).click();
+  const forwardRow = page.getByTestId("lookup-results").locator(".list-row").filter({ hasText: "Synthetic Export Systems" });
+  await expect(forwardRow).toBeVisible();
+  const forwardRequests = requests.exams;
+  expect(await downloadJsonExport(forwardRow)).toMatchObject({ surface: "class-forward", universityId: "mock" });
+  expect(requests.exams).toBe(forwardRequests);
+
+  await page.getByRole("button", { name: "Class ID to course" }).click();
+  const reverseSection = page.getByTestId("reverse-class-lookup");
+  await reverseSection.getByLabel("Term").click();
+  await page.getByRole("option", { name: "Semester 2, 2025–2026 (supplementary)" }).click();
+  await reverseSection.getByLabel("Internal class ID").fill(SYNTHETIC_CLASS_ID);
+  const reverseRequests = requests.exams;
+  expect(await downloadJsonExport(reverseSection)).toMatchObject({ surface: "class-reverse", universityId: "mock" });
+  expect(requests.exams).toBe(reverseRequests);
+
+  const codeSection = page.getByTestId("cross-student-code");
+  const codeInput = codeSection.getByLabel("Target internal student ID");
+  await codeInput.fill(SYNTHETIC_TARGET_INTERNAL_ID);
+  await codeSection.getByRole("button", { name: "Look up" }).click();
+  await expect(codeSection.getByText(SYNTHETIC_TARGET_STUDENT_CODE)).toBeVisible();
+  const codeRequests = requests.studentCode;
+  const codeDocument = await downloadJsonExport(codeSection);
+  expect(codeDocument).toMatchObject({ surface: "student-id-to-code", query: { mode: "stdId", value: SYNTHETIC_TARGET_INTERNAL_ID } });
+  expect(requests.studentCode).toBe(codeRequests);
+  await codeInput.fill(SYNTHETIC_ERROR_INTERNAL_ID);
+  await expect(codeSection.getByRole("button", { name: "Export" })).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Code → ID" }).click();
+  const idSection = page.getByTestId("cross-student-id");
+  const idInput = idSection.getByLabel("Target student code");
+  await idInput.fill(SYNTHETIC_TARGET_STUDENT_CODE);
+  await idSection.getByRole("button", { name: "Look up" }).click();
+  await expect(idSection.getByText(SYNTHETIC_TARGET_INTERNAL_ID)).toBeVisible();
+  const idRequests = requests.studentId;
+  const idDocument = await downloadJsonExport(idSection);
+  expect(idDocument).toMatchObject({ surface: "student-code-to-id", results: [{ resolver: { resolvedStudentCode: SYNTHETIC_TARGET_STUDENT_CODE, resolvedInternalStudentId: SYNTHETIC_TARGET_INTERNAL_ID, probes: 2 } }] });
+  expect(requests.studentId).toBe(idRequests);
+  await idInput.fill(SYNTHETIC_ERROR_STUDENT_CODE);
+  await expect(idSection.getByRole("button", { name: "Export" })).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Transcript", exact: true }).click();
+  const transcriptSection = page.getByTestId("cross-transcript");
+  const transcriptInput = transcriptSection.getByLabel("Target internal student ID");
+  await transcriptInput.fill(SYNTHETIC_TARGET_INTERNAL_ID);
+  await transcriptSection.getByRole("button", { name: "View transcript" }).click();
+  await expect(transcriptSection.getByText("Portal cumulative GPA (4.0)", { exact: true })).toBeVisible();
+  await expect(transcriptSection.getByText("3.91", { exact: true })).toBeVisible();
+  const derivedHeader = transcriptSection.getByTestId("academic-term-header").first();
+  await expect(derivedHeader.getByText("Derived", { exact: true })).toBeVisible();
+  await expect(derivedHeader.getByText("Term GPA").locator("..")).toContainText("4.00");
+  await expect(derivedHeader.getByText("CPA", { exact: true }).locator("..")).toContainText("3.50");
+  await expect(derivedHeader.getByText("Included credits").locator("..")).toContainText("3 / 5 listed");
+  await expect(transcriptSection.getByRole("button", { name: "Export" })).toHaveCount(1);
+  const transcriptRequests = requests.transcript;
+  const transcriptDocument = await downloadJsonExport(transcriptSection);
+  expect(transcriptDocument).toMatchObject({
+    surface: "cross-transcript",
+    query: { mode: "stdId", value: SYNTHETIC_TARGET_INTERNAL_ID },
+    reported: { cumulativeGpa4: 3.91 },
+  });
+  const transcriptTerms = transcriptDocument.derivedTerms as Array<Record<string, unknown>>;
+  expect(transcriptTerms.map((term) => term.termCode)).toEqual(["252", "251"]);
+  expect(transcriptTerms[0]).toMatchObject({ termCode: "252", estimateKind: "derived", listedCredits: 5, includedCredits: 3 });
+  expect(requests.transcript).toBe(transcriptRequests);
+  await transcriptInput.fill(SYNTHETIC_ERROR_INTERNAL_ID);
+  await expect(transcriptSection.getByRole("button", { name: "Export" })).toHaveCount(0);
+  await expectNoPageOverflow(page);
+});
+
+test("lookup single-result errors remove stale export actions", async ({ page }) => {
+  await openMockedLookup(page);
+  const section = page.getByTestId("cross-student-code");
+  const input = section.getByLabel("Target internal student ID");
+
+  await input.fill(SYNTHETIC_TARGET_INTERNAL_ID);
+  await section.getByRole("button", { name: "Look up" }).click();
+  await expect(section.getByRole("button", { name: "Export" })).toBeVisible();
+
+  await input.fill(SYNTHETIC_ERROR_INTERNAL_ID);
+  await expect(section.getByRole("button", { name: "Export" })).toHaveCount(0);
+  await section.getByRole("button", { name: "Look up" }).click();
+  await expect(section.getByText("The portal did not render a student code for this internal ID. The ID may not exist.")).toBeVisible();
+  await expect(section.getByRole("button", { name: "Export" })).toHaveCount(0);
+});
+
 test("cross-student forms reject malformed identifiers client-side before any request", async ({ page }) => {
   await openMockedLookup(page);
 
@@ -393,7 +542,7 @@ test("cross-student forms reject malformed identifiers client-side before any re
   await expect(codeInput).toHaveAttribute("aria-invalid", "true");
   await expect(page.getByText("Enter 1 to 11 digits for the internal student ID.")).toBeVisible();
   await expect(page.getByRole("button", { name: "Look up" })).toBeDisabled();
-  await codeInput.fill("123456");
+  await codeInput.fill(SYNTHETIC_OWN_INTERNAL_ID);
   await expect(codeInput).toHaveAttribute("aria-invalid", "false");
   await expect(page.getByText("That is your own internal ID — your own ID mapping is shown above.")).toBeVisible();
   await expect(page.getByRole("button", { name: "Look up" })).toBeDisabled();
@@ -405,7 +554,7 @@ test("cross-student forms reject malformed identifiers client-side before any re
   await expect(idInput).toHaveAttribute("aria-invalid", "true");
   await expect(page.getByText("Enter an 8-digit student code.")).toBeVisible();
   await expect(page.getByRole("button", { name: "Look up" })).toBeDisabled();
-  await idInput.fill("24000000");
+  await idInput.fill(SYNTHETIC_OWN_STUDENT_CODE);
   await expect(page.getByText("That is your own student code — your own ID mapping is shown above.")).toBeVisible();
   await expect(page.getByRole("button", { name: "Look up" })).toBeDisabled();
 });
