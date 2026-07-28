@@ -28,7 +28,7 @@ const SYNTHETIC_CLASS_ID = "990099";
 
 type LookupRequestCounts = { exams: number; studentCode: number; studentId: number; transcript: number };
 
-async function openMockedLookup(page: import("@playwright/test").Page): Promise<LookupRequestCounts> {
+async function openMockedLookup(page: import("@playwright/test").Page, bulkMaximum: number | null = 50): Promise<LookupRequestCounts> {
   const requestCounts: LookupRequestCounts = { exams: 0, studentCode: 0, studentId: 0, transcript: 0 };
   await page.route("**/api/universities", async (route) => {
     const response = await route.fetch();
@@ -37,7 +37,8 @@ async function openMockedLookup(page: import("@playwright/test").Page): Promise<
     if (mock) {
       mock.capabilities.classLookup = true;
       mock.capabilities.crossLookup = true;
-      mock.limits = { crossLookup: { bulkMaxTargets: 50 } };
+      if (bulkMaximum === null) delete mock.limits;
+      else mock.limits = { crossLookup: { bulkMaxTargets: bulkMaximum } };
     }
     await route.fulfill({ response, json: payload });
   });
@@ -94,6 +95,30 @@ async function downloadJsonExport(scope: import("@playwright/test").Locator): Pr
   const downloadPromise = scope.page().waitForEvent("download");
   await scope.page().getByRole("menuitem", { name: "Download JSON" }).click();
   return JSON.parse(await downloadText(await downloadPromise)) as Record<string, unknown>;
+}
+
+type SyntheticBulkMode = "stdid-to-code" | "code-to-stdid" | "stdid-to-transcript";
+
+function syntheticBulkResult(mode: SyntheticBulkMode, target: string) {
+  const suffix = target.slice(-2);
+  if (mode === "stdid-to-code") return { studentCode: `990001${suffix}`, studentName: `Synthetic 99${suffix}`, className: "SYNTHETIC-99", ignoredField: "must-not-export" };
+  if (mode === "code-to-stdid") return { stdCode: target, stdId: `990000001${suffix}`, probes: Number(suffix), ignoredField: "must-not-export" };
+  return {
+    header: { studentCode: `990001${suffix}`, studentName: `Synthetic 99${suffix}`, className: "SYNTHETIC-99", ignoredField: "must-not-export" },
+    totals: { totalCredits: 3, accumulatedCredits: 3, gpa4: 4, ignoredField: "must-not-export" },
+    terms: [{ maHK: "252", ignoredField: "must-not-export", rows: [{ courseCode: `SYN99${suffix}`, courseName: `Synthetic Course 99${suffix}`, credits: 3, grade10: 9, letterGrade: "A", grade4: 4, ignoredField: "must-not-export" }] }],
+    ignoredField: "must-not-export",
+  };
+}
+
+async function fulfillBulkSuccess(route: import("@playwright/test").Route, chunks: string[][]) {
+  const body = route.request().postDataJSON() as { mode: SyntheticBulkMode; targets: string[] };
+  chunks.push([...body.targets]);
+  await route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ data: { items: body.targets.map((target) => ({ target, status: "ok", result: syntheticBulkResult(body.mode, target) })) }, error: null }),
+  });
 }
 
 test.beforeEach(async ({ page }) => {
@@ -438,6 +463,246 @@ test("lookup groups use progressive modes, accessible labels, and responsive tou
     await page.setViewportSize(viewport);
     await expectNoPageOverflow(page);
   }
+});
+
+test("bulk hides when maximum is zero or missing while single cross lookup remains", async ({ page }) => {
+  for (const maximum of [0, null] as const) {
+    await openMockedLookup(page, maximum);
+    await expect(page.getByTestId("student-record-tools")).toBeVisible();
+    await expect(page.getByTestId("cross-student-code")).toBeVisible();
+    await expect(page.getByTestId("bulk-lookup")).toHaveCount(0);
+    await page.unrouteAll({ behavior: "wait" });
+  }
+});
+
+test("bulk enforces configured deduplicated maximum and dynamic copy", async ({ page }) => {
+  await openMockedLookup(page, 2);
+  const bulk = page.getByTestId("bulk-lookup");
+  await expect(bulk.getByText("Process up to 2 identifiers in sequential batches. Each target reports its own result.")).toBeVisible();
+  await bulk.getByLabel("Targets, one per line").fill("99000000101\n99000000101\n99000000102");
+  await expect(bulk.getByText("Use no more than 2 unique identifiers at once.")).toHaveCount(0);
+  await bulk.getByLabel("Targets, one per line").fill("99000000101\n99000000101\n99000000102\n99000000103");
+  await expect(bulk.getByText("Use no more than 2 unique identifiers at once.")).toBeVisible();
+  await expect(bulk.getByRole("button", { name: "Run bulk lookup" })).toBeDisabled();
+});
+
+test("bulk keeps complete JSON exports ordered for all modes and fixed chunks", async ({ page }) => {
+  const chunks: Record<SyntheticBulkMode, string[][]> = { "stdid-to-code": [], "code-to-stdid": [], "stdid-to-transcript": [] };
+  await page.route("**/api/vnu/cross-lookup/bulk", async (route) => {
+    const mode = (route.request().postDataJSON() as { mode: SyntheticBulkMode }).mode;
+    await fulfillBulkSuccess(route, chunks[mode]);
+  });
+  await openMockedLookup(page);
+  const bulk = page.getByTestId("bulk-lookup");
+  const cases: Array<{ mode: SyntheticBulkMode; option: string; targets: string[]; surface: string; sizes: number[] }> = [
+    { mode: "stdid-to-code", option: "Internal IDs to student codes", targets: Array.from({ length: 6 }, (_, index) => `9900000010${index + 1}`), surface: "bulk-id-to-code", sizes: [5, 1] },
+    { mode: "code-to-stdid", option: "Student codes to internal IDs", targets: Array.from({ length: 4 }, (_, index) => `9900010${index + 1}`), surface: "bulk-code-to-id", sizes: [3, 1] },
+    { mode: "stdid-to-transcript", option: "Internal IDs to transcripts", targets: Array.from({ length: 6 }, (_, index) => `9900000020${index + 1}`), surface: "bulk-id-to-transcript", sizes: [5, 1] },
+  ];
+
+  for (const testCase of cases) {
+    await bulk.getByLabel("Lookup mode").click();
+    await page.getByRole("option", { name: testCase.option }).click();
+    await bulk.getByLabel("Targets, one per line").fill(testCase.targets.join("\n"));
+    await bulk.getByRole("button", { name: "Run bulk lookup" }).click();
+    await expect(bulk.getByText(`${testCase.targets.length} completed`)).toBeVisible();
+    const document = await downloadJsonExport(bulk);
+    expect(document.surface).toBe(testCase.surface);
+    expect(document.run).toEqual({ status: "complete", mode: testCase.mode, processedCount: testCase.targets.length, totalCount: testCase.targets.length });
+    const results = document.results as Array<{ target: string; status: string; result: Record<string, unknown> }>;
+    expect(results.map((item) => item.target)).toEqual(testCase.targets);
+    expect(JSON.stringify(results)).not.toContain("ignoredField");
+    if (testCase.mode === "stdid-to-code") expect(results[0]?.result).toEqual({ identity: { studentCode: "99000101", internalStudentId: testCase.targets[0], studentName: "Synthetic 9901", managingClass: "SYNTHETIC-99" } });
+    if (testCase.mode === "code-to-stdid") expect(results[0]?.result).toEqual({ resolver: { resolvedStudentCode: testCase.targets[0], resolvedInternalStudentId: "99000000101", probes: 1 } });
+    if (testCase.mode === "stdid-to-transcript") expect(results[0]?.result).toMatchObject({ identity: { internalStudentId: testCase.targets[0] }, reported: { cumulativeGpa4: 4 }, derivedTerms: [{ termCode: "252", estimateKind: "derived", courses: [{ courseCode: "SYN9901" }] }] });
+  }
+
+  for (const testCase of cases) expect(chunks[testCase.mode].map((chunk) => chunk.length)).toEqual(testCase.sizes);
+});
+
+test("bulk exports prior five results after later 429 and while retrying", async ({ page }) => {
+  let call = 0;
+  await page.route("**/api/vnu/cross-lookup/bulk", async (route) => {
+    call += 1;
+    if (call === 2) {
+      await route.fulfill({ status: 429, contentType: "application/json", body: JSON.stringify({ data: null, error: { code: "VNU_RATE_LIMITED", message: "Synthetic 99 limit" } }) });
+      return;
+    }
+    if (call === 3) await new Promise((resolve) => setTimeout(resolve, 500));
+    await fulfillBulkSuccess(route, []);
+  });
+  await openMockedLookup(page);
+  const bulk = page.getByTestId("bulk-lookup");
+  const targets = Array.from({ length: 6 }, (_, index) => `9900000030${index + 1}`);
+  await bulk.getByLabel("Targets, one per line").fill(targets.join("\n"));
+  await bulk.getByRole("button", { name: "Run bulk lookup" }).click();
+  await expect(bulk.getByRole("button", { name: "Retry remaining" })).toBeVisible();
+  const partial = await downloadJsonExport(bulk);
+  expect(partial.run).toEqual({ status: "partial", mode: "stdid-to-code", processedCount: 5, totalCount: 6 });
+  expect((partial.results as Array<{ target: string }>).map((item) => item.target)).toEqual(targets.slice(0, 5));
+
+  await bulk.getByRole("button", { name: "Retry remaining" }).click();
+  await expect(bulk.getByRole("button", { name: "Export" })).toBeVisible();
+  await expect(bulk.getByText("6 completed")).toBeVisible();
+});
+
+test("bulk keeps prior export during and after cancellation of second chunk", async ({ page }) => {
+  let call = 0;
+  await page.route("**/api/vnu/cross-lookup/bulk", async (route) => {
+    call += 1;
+    if (call === 2) await new Promise((resolve) => setTimeout(resolve, 750));
+    await fulfillBulkSuccess(route, []);
+  });
+  await openMockedLookup(page);
+  const bulk = page.getByTestId("bulk-lookup");
+  const targets = Array.from({ length: 6 }, (_, index) => `9900000040${index + 1}`);
+  await bulk.getByLabel("Targets, one per line").fill(targets.join("\n"));
+  await bulk.getByRole("button", { name: "Run bulk lookup" }).click();
+  await expect(bulk.locator("#bulk-lookup-progress-label")).toHaveText("5 of 6 processed");
+  await expect(bulk.getByRole("button", { name: "Export" })).toBeVisible();
+  await bulk.getByRole("button", { name: "Cancel" }).click();
+  await expect(bulk.getByRole("button", { name: "Retry remaining" })).toBeVisible();
+  await expect(bulk.getByRole("button", { name: "Export" })).toBeVisible();
+  const partial = await downloadJsonExport(bulk);
+  expect(partial.run).toEqual({ status: "partial", mode: "stdid-to-code", processedCount: 5, totalCount: 6 });
+});
+
+test("bulk resets without stale resurrection while second chunk is gated", async ({ page }) => {
+  let releaseSecond!: () => void;
+  let markSecondStarted!: () => void;
+  const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve; });
+  const secondStarted = new Promise<void>((resolve) => { markSecondStarted = resolve; });
+  const chunks: string[][] = [];
+  let failedRequests = 0;
+  page.on("requestfailed", (request) => { if (request.url().includes("/api/vnu/cross-lookup/bulk")) failedRequests += 1; });
+  await page.route("**/api/vnu/cross-lookup/bulk", async (route) => {
+    const body = route.request().postDataJSON() as { targets: string[] };
+    chunks.push(body.targets);
+    if (chunks.length === 2) {
+      markSecondStarted();
+      await secondGate;
+    }
+    try { await fulfillBulkSuccess(route, []); } catch { /* Request was invalidated by reset. */ }
+  });
+  await openMockedLookup(page);
+  const bulk = page.getByTestId("bulk-lookup");
+  const targets = Array.from({ length: 11 }, (_, index) => `990000005${String(index + 1).padStart(2, "0")}`);
+  await bulk.getByLabel("Targets, one per line").fill(targets.join("\n"));
+  await bulk.getByRole("button", { name: "Run bulk lookup" }).click();
+  await secondStarted;
+  await bulk.getByRole("button", { name: "Reset" }).click();
+  await expect.poll(() => failedRequests).toBe(1);
+  await expect(bulk.getByRole("button", { name: "Export" })).toHaveCount(0);
+  await expect(bulk.getByText(targets[0]!)).toHaveCount(0);
+  await expect(bulk.locator("#bulk-lookup-progress-label")).toHaveCount(0);
+  releaseSecond();
+  await page.waitForTimeout(100);
+  expect(chunks).toHaveLength(2);
+  await expect(bulk.getByRole("button", { name: "Export" })).toHaveCount(0);
+  await expect(bulk.getByText(targets[0]!)).toHaveCount(0);
+});
+
+test("bulk clears account results and aborts gated work on session freshness change", async ({ page }) => {
+  let releaseSecond!: () => void;
+  let markSecondStarted!: () => void;
+  const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve; });
+  const secondStarted = new Promise<void>((resolve) => { markSecondStarted = resolve; });
+  const chunks: string[][] = [];
+  let failedRequests = 0;
+  page.on("requestfailed", (request) => { if (request.url().includes("/api/vnu/cross-lookup/bulk")) failedRequests += 1; });
+  await page.route("**/api/vnu/cross-lookup/bulk", async (route) => {
+    const body = route.request().postDataJSON() as { targets: string[] };
+    chunks.push(body.targets);
+    if (chunks.length === 2) {
+      markSecondStarted();
+      await secondGate;
+    }
+    try { await fulfillBulkSuccess(route, []); } catch { /* Request was invalidated by account switch. */ }
+  });
+  await openMockedLookup(page);
+  const bulk = page.getByTestId("bulk-lookup");
+  const targets = Array.from({ length: 11 }, (_, index) => `990000006${String(index + 1).padStart(2, "0")}`);
+  await bulk.getByLabel("Targets, one per line").fill(targets.join("\n"));
+  await bulk.getByRole("button", { name: "Run bulk lookup" }).click();
+  await secondStarted;
+  await page.evaluate(() => {
+    const accounts = JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<Record<string, unknown>>;
+    const current = accounts[0];
+    if (!current) throw new Error("Synthetic account fixture missing");
+    const next = { ...current, id: "synthetic-account-99", studentCode: "99009999", addedAt: "2099-12-31T00:00:00.000Z" };
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([...accounts, next]));
+    localStorage.setItem("hyeboard.activeAccountId", "synthetic-account-99");
+    window.dispatchEvent(new CustomEvent("hyeboard:account-switched"));
+  });
+  await expect.poll(() => failedRequests).toBe(1);
+  await expect(page.getByTestId("bulk-lookup").getByRole("button", { name: "Export" })).toHaveCount(0);
+  await expect(page.getByTestId("bulk-lookup").getByText(targets[0]!)).toHaveCount(0);
+  releaseSecond();
+  await page.waitForTimeout(100);
+  expect(chunks).toHaveLength(2);
+  await expect(page.getByTestId("bulk-lookup").getByRole("button", { name: "Export" })).toHaveCount(0);
+  await expect(page.getByTestId("bulk-lookup").getByText(targets[0]!)).toHaveCount(0);
+});
+
+test("bulk bounds rendered rows and pages through every result", async ({ page }) => {
+  await page.route("**/api/vnu/cross-lookup/bulk", async (route) => fulfillBulkSuccess(route, []));
+  await openMockedLookup(page, 101);
+  const bulk = page.getByTestId("bulk-lookup");
+  const targets = Array.from({ length: 101 }, (_, index) => `9900001${String(index + 1).padStart(4, "0")}`);
+  await bulk.getByLabel("Targets, one per line").fill(targets.join("\n"));
+  await bulk.getByRole("button", { name: "Run bulk lookup" }).click();
+  await expect(bulk.getByText("101 completed")).toBeVisible();
+  const resultsList = bulk.getByTestId("bulk-results-list");
+  await expect(resultsList.locator(":scope > .list-row")).toHaveCount(50);
+  await expect(resultsList.getByText(targets[0]!)).toBeVisible();
+  await expect(resultsList.getByText(targets[50]!)).toHaveCount(0);
+  await expect(bulk.getByText("Showing 1–50 of 101 results")).toBeVisible();
+  await expect(bulk.getByRole("button", { name: "Previous page" })).toBeDisabled();
+
+  await bulk.getByRole("button", { name: "Next page" }).click();
+  await expect(resultsList.locator(":scope > .list-row")).toHaveCount(50);
+  await expect(resultsList.getByText(targets[0]!)).toHaveCount(0);
+  await expect(resultsList.getByText(targets[50]!)).toBeVisible();
+  await expect(bulk.getByText("Showing 51–100 of 101 results")).toBeVisible();
+
+  await bulk.getByRole("button", { name: "Next page" }).click();
+  await expect(resultsList.locator(":scope > .list-row")).toHaveCount(1);
+  await expect(resultsList.getByText(targets[100]!)).toBeVisible();
+  await expect(bulk.getByText("Showing 101–101 of 101 results")).toBeVisible();
+  await expect(bulk.getByRole("button", { name: "Next page" })).toBeDisabled();
+
+  await bulk.getByRole("button", { name: "Previous page" }).click();
+  await expect(resultsList.locator(":scope > .list-row")).toHaveCount(50);
+  await expect(resultsList.getByText(targets[50]!)).toBeVisible();
+  await bulk.getByRole("button", { name: "Previous page" }).click();
+  await expect(resultsList.getByText(targets[0]!)).toBeVisible();
+  await expect(resultsList.getByText(targets[50]!)).toHaveCount(0);
+});
+
+test("bulk rejects malformed success without exporting unsafe result fields", async ({ page }) => {
+  let call = 0;
+  await page.route("**/api/vnu/cross-lookup/bulk", async (route) => {
+    call += 1;
+    if (call === 1) {
+      await fulfillBulkSuccess(route, []);
+      return;
+    }
+    const body = route.request().postDataJSON() as { targets: string[] };
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: { items: body.targets.map((target) => ({ target, status: "ok", result: { studentCode: 99000199, unsafe: "must-not-export" } })) }, error: null }),
+    });
+  });
+  await openMockedLookup(page);
+  const bulk = page.getByTestId("bulk-lookup");
+  const targets = Array.from({ length: 6 }, (_, index) => `9900000070${index + 1}`);
+  await bulk.getByLabel("Targets, one per line").fill(targets.join("\n"));
+  await bulk.getByRole("button", { name: "Run bulk lookup" }).click();
+  await expect(bulk.getByText("The lookup returned an invalid result. Retry the remaining targets.")).toBeVisible();
+  const partial = await downloadJsonExport(bulk);
+  expect(partial.run).toEqual({ status: "partial", mode: "stdid-to-code", processedCount: 5, totalCount: 6 });
+  expect(JSON.stringify(partial)).not.toContain("unsafe");
 });
 
 test("lookup successful single results export JSON without refetch and clear stale actions", async ({ page }) => {

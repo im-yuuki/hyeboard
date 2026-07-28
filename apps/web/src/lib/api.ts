@@ -170,8 +170,17 @@ export function clearSessionToken(): void {
   else window.dispatchEvent(new CustomEvent(SESSION_CLEARED_EVENT));
 }
 
+type RequestAccountSnapshot = Pick<StoredAccount, "id" | "universityId" | "token"> | undefined;
+
+function isRequestAccountCurrent(snapshot: RequestAccountSnapshot): boolean {
+  const current = getActiveAccount();
+  if (!snapshot) return current === undefined;
+  return current?.id === snapshot.id && current.token === snapshot.token;
+}
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const token = getSessionToken();
+  const initiatingAccount = getActiveAccount();
+  const token = initiatingAccount?.token;
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...init,
     headers: {
@@ -195,10 +204,10 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     // surfacing a dead-end error - but it never clears the session on its
     // own, because the Hyeboard session itself is still valid.
     const refreshNeedsCaptcha = code === "STUDENTHUB_CAPTCHA_REQUIRED";
-    if (sessionDied || refreshNeedsCaptcha) {
+    if ((sessionDied || refreshNeedsCaptcha) && isRequestAccountCurrent(initiatingAccount)) {
       // A recoverable UET session death shows the inline re-auth dialog
       // (see components/reauth.tsx) instead of signing the user out.
-      if (canReauthenticateInline(getActiveAccount()?.universityId)) requestInlineReauth();
+      if (canReauthenticateInline(initiatingAccount?.universityId)) requestInlineReauth();
       else if (sessionDied) clearSessionToken();
     }
     throw new ApiError(payload.error?.message ?? `Request failed: ${response.status}`, code, response.status);
@@ -207,7 +216,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   // credential through Google automation or the parent direct CAPTCHA API,
   // then return a fresh encrypted token via meta.refreshedToken.
   const refreshedToken = payload.meta?.refreshedToken;
-  if (typeof refreshedToken === "string" && refreshedToken) setSessionToken(refreshedToken);
+  if (typeof refreshedToken === "string" && refreshedToken && isRequestAccountCurrent(initiatingAccount)) setSessionToken(refreshedToken);
   return payload.data as T;
 }
 

@@ -1,7 +1,7 @@
 import type { VnuExamCatalogRow, VnuExamTermInfo, VnuProfile, VnuTranscriptRow } from "@hyeboard/university-adapters/src/vnu/types";
 import { VNU_EXAM_TERMS } from "@hyeboard/university-adapters/src/vnu/exam-terms";
 import { useQuery } from "@tanstack/react-query";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ExportMenu } from "@/components/export-menu";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -12,10 +12,10 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { Progress } from "@/components/ui/progress";
 import { Empty, FeatureFrame, SummaryStat, SummaryStrip } from "@/components/shared";
-import { api, ApiError, type VnuBulkLookupItem, type VnuBulkLookupMode, type VnuCrossTranscriptInput } from "@/lib/api";
-import { deriveBulkLookupViewState, executeBulkLookup, parseBulkTargets, type BulkLookupProgress } from "@/lib/bulk-lookup";
+import { ACCOUNT_SWITCHED_EVENT, api, ApiError, type VnuBulkLookupItem, type VnuBulkLookupMode, type VnuCrossTranscript, type VnuCrossTranscriptInput } from "@/lib/api";
+import { deriveBulkLookupViewState, executeBulkLookup, parseBulkLookupItems, parseBulkLookupMode, parseBulkTargets, type BulkLookupProgress } from "@/lib/bulk-lookup";
 import { deriveCrossTranscriptInput, deriveCrossTranscriptView } from "@/lib/cross-transcript-view";
-import { createClassLookupExport, createResolverLookupExport, createTranscriptExport, type ExportDerivedTerm, type ExportDocument } from "@/lib/data-export";
+import { createBulkExport, createClassLookupExport, createResolverLookupExport, createTranscriptExport, type ExportBulkItem, type ExportDerivedTerm, type ExportDocument, type ExportSurface } from "@/lib/data-export";
 import { useLocale } from "@/lib/i18n";
 import { formatTermLabel } from "@/lib/presentation";
 import { calculateTermAcademicSummaries, newestAcademicTermsFirst, type AcademicTermSummary } from "@/lib/term-academic-summary";
@@ -514,6 +514,19 @@ function crossTranscriptExportTerm(summary: AcademicTermSummary<VnuTranscriptRow
   };
 }
 
+function transcriptAcademicSummaries(transcript?: VnuCrossTranscript): AcademicTermSummary<VnuTranscriptRow>[] {
+  if (!transcript) return [];
+  return newestAcademicTermsFirst(calculateTermAcademicSummaries(
+    transcript.terms.flatMap((term) => term.rows.map((row) => ({
+      termKey: term.maHK,
+      credits: row.credits,
+      point4: row.grade4,
+      course: row,
+    }))),
+    "vnu",
+  ));
+}
+
 function CrossTranscriptTerm({ summary }: { summary: AcademicTermSummary<VnuTranscriptRow> }) {
   const { t } = useLocale();
   const label = formatTermLabel(summary.termKey, "vnu", t.terms);
@@ -577,15 +590,7 @@ function CrossTranscriptSection({ profile }: { profile: VnuProfile }) {
     },
     enabled: Boolean(submitted),
   });
-  const derivedTerms = useMemo(() => newestAcademicTermsFirst(calculateTermAcademicSummaries(
-    (transcriptQuery.data?.terms ?? []).flatMap((term) => term.rows.map((row) => ({
-      termKey: term.maHK,
-      credits: row.credits,
-      point4: row.grade4,
-      course: row,
-    }))),
-    "vnu",
-  )), [transcriptQuery.data]);
+  const derivedTerms = useMemo(() => transcriptAcademicSummaries(transcriptQuery.data), [transcriptQuery.data]);
 
   const submit = () => {
     if (!inputState.target) return;
@@ -747,8 +752,75 @@ function BulkLookupResultRow({ item, mode }: { item: VnuBulkLookupItem; mode: Vn
   );
 }
 
-function BulkLookupSection() {
-  const { t } = useLocale();
+const BULK_EXPORT_SURFACE: Record<VnuBulkLookupMode, Extract<ExportSurface, `bulk-${string}`>> = {
+  "stdid-to-code": "bulk-id-to-code",
+  "code-to-stdid": "bulk-code-to-id",
+  "stdid-to-transcript": "bulk-id-to-transcript",
+};
+
+function bulkExportItem(item: VnuBulkLookupItem, mode: VnuBulkLookupMode, termLabel: (termCode: string) => string): ExportBulkItem {
+  if (item.status === "error") return { target: item.target, status: "error", errorCode: item.errorCode };
+
+  if (mode === "stdid-to-code") {
+    const result = item.result;
+    if (!("studentCode" in result) || typeof result.studentCode !== "string") throw new Error("Invalid bulk lookup response");
+    return {
+      target: item.target,
+      status: "ok",
+      result: { identity: { studentCode: result.studentCode, internalStudentId: item.target, studentName: result.studentName, managingClass: result.className } },
+    };
+  }
+
+  if (mode === "code-to-stdid") {
+    const result = item.result;
+    if (!("stdCode" in result) || !("stdId" in result) || !("probes" in result) || typeof result.stdCode !== "string" || typeof result.stdId !== "string" || typeof result.probes !== "number" || !Number.isFinite(result.probes)) {
+      throw new Error("Invalid bulk lookup response");
+    }
+    return {
+      target: item.target,
+      status: "ok",
+      result: { resolver: { resolvedStudentCode: result.stdCode, resolvedInternalStudentId: result.stdId, probes: result.probes } },
+    };
+  }
+
+  const transcript = item.result;
+  if (!("header" in transcript) || !("totals" in transcript) || !("terms" in transcript)) throw new Error("Invalid bulk lookup response");
+  return {
+    target: item.target,
+    status: "ok",
+    result: {
+      identity: {
+        studentCode: transcript.header.studentCode,
+        internalStudentId: item.target,
+        studentName: transcript.header.studentName,
+        managingClass: transcript.header.className,
+      },
+      reported: {
+        cumulativeGpa4: transcript.totals.gpa4,
+        totalCredits: transcript.totals.totalCredits,
+        accumulatedCredits: transcript.totals.accumulatedCredits,
+      },
+      derivedTerms: transcriptAcademicSummaries(transcript).map((summary) => crossTranscriptExportTerm(summary, termLabel(summary.termKey))),
+    },
+  };
+}
+
+function createdBulkExportItems(model: ExportDocument): ExportBulkItem[] {
+  if (!model.results) throw new Error("Bulk export model omitted results");
+  return model.results.map((item) => {
+    if (!("target" in item) || !("status" in item) || typeof item.target !== "string") throw new Error("Bulk export model contained an invalid result");
+    if (item.status === "error" && "errorCode" in item && typeof item.errorCode === "string") {
+      return { target: item.target, status: "error", errorCode: item.errorCode };
+    }
+    if (item.status === "ok" && "result" in item) return { target: item.target, status: "ok", result: item.result };
+    throw new Error("Bulk export model contained an invalid result");
+  });
+}
+
+const BULK_RESULTS_PAGE_SIZE = 50;
+
+function BulkLookupSection({ maximum, freshnessKey }: { maximum: number; freshnessKey: string }) {
+  const { locale, t } = useLocale();
   const state = useHyeboard();
   const [mode, setMode] = useState<VnuBulkLookupMode>("stdid-to-code");
   const [rawTargets, setRawTargets] = useState("");
@@ -756,74 +828,179 @@ function BulkLookupSection() {
   const [progress, setProgress] = useState<BulkLookupProgress>({ processed: 0, total: 0, items: [] });
   const [remainingTargets, setRemainingTargets] = useState<string[]>([]);
   const [requestError, setRequestError] = useState<string | undefined>();
+  const [exportModel, setExportModel] = useState<ExportDocument | undefined>();
+  const [resultPageStart, setResultPageStart] = useState(0);
   const abortController = useRef<AbortController | null>(null);
-  const parsed = parseBulkTargets(rawTargets);
+  const generation = useRef(0);
+  const processedItemCount = useRef(0);
+  const progressSnapshot = useRef<BulkLookupProgress>({ processed: 0, total: 0, items: [] });
+  const exportItems = useRef<ExportBulkItem[]>([]);
+  const termDictionary = useRef(t.terms);
+  termDictionary.current = t.terms;
+  const parsed = useMemo(() => parseBulkTargets(rawTargets, maximum), [rawTargets, maximum]);
   const viewState = deriveBulkLookupViewState(parsed, active, progress.processed);
+  const lastPageStart = Math.floor(Math.max(0, progress.items.length - 1) / BULK_RESULTS_PAGE_SIZE) * BULK_RESULTS_PAGE_SIZE;
+  const effectivePageStart = Math.min(resultPageStart, lastPageStart);
+  const visibleItems = progress.items.slice(effectivePageStart, effectivePageStart + BULK_RESULTS_PAGE_SIZE);
+  const visibleRangeStart = progress.items.length > 0 ? effectivePageStart + 1 : 0;
+  const visibleRangeEnd = effectivePageStart + visibleItems.length;
 
-  const reset = () => {
-    abortController.current?.abort();
+  const invalidateRun = () => {
+    generation.current += 1;
+    const controller = abortController.current;
     abortController.current = null;
+    controller?.abort();
+  };
+
+  const clearLookupState = (clearInput: boolean) => {
+    invalidateRun();
     setActive(false);
-    setRawTargets("");
+    if (clearInput) setRawTargets("");
+    const emptyProgress = { processed: 0, total: 0, items: [] };
+    progressSnapshot.current = emptyProgress;
+    processedItemCount.current = 0;
+    exportItems.current = [];
     setProgress({ processed: 0, total: 0, items: [] });
     setRemainingTargets([]);
     setRequestError(undefined);
+    setExportModel(undefined);
+    setResultPageStart(0);
   };
+
+  useEffect(() => {
+    const invalidateForAccountSwitch = () => invalidateRun();
+    window.addEventListener(ACCOUNT_SWITCHED_EVENT, invalidateForAccountSwitch);
+    return () => {
+      window.removeEventListener(ACCOUNT_SWITCHED_EVENT, invalidateForAccountSwitch);
+      invalidateRun();
+    };
+  }, [freshnessKey]);
+
+  useEffect(() => {
+    if (exportItems.current.length === 0) return;
+    const rebuilt = createBulkExport({
+      surface: BULK_EXPORT_SURFACE[mode],
+      universityId: state.universityId,
+      mode,
+      total: progressSnapshot.current.total,
+      items: progressSnapshot.current.items.map((item) => bulkExportItem(item, mode, (termCode) => formatTermLabel(termCode, "vnu", termDictionary.current))),
+    });
+    exportItems.current = createdBulkExportItems(rebuilt);
+    setExportModel((current) => current ? { ...rebuilt, run: { ...rebuilt.run!, status: current.run?.status ?? "partial" } } : undefined);
+  }, [locale]);
+
+  useEffect(() => {
+    if (resultPageStart > lastPageStart) setResultPageStart(lastPageStart);
+  }, [lastPageStart, resultPageStart]);
+
+  const appendExportItems = (items: VnuBulkLookupItem[], total: number, runGeneration: number, controller: AbortController) => {
+    if (generation.current !== runGeneration || abortController.current !== controller) return;
+    const projectedItems = items.map((item) => bulkExportItem(item, mode, (termCode) => formatTermLabel(termCode, "vnu", termDictionary.current)));
+    const chunkModel = createBulkExport({ surface: BULK_EXPORT_SURFACE[mode], universityId: state.universityId, mode, total: projectedItems.length, items: projectedItems });
+    exportItems.current.push(...createdBulkExportItems(chunkModel));
+    setExportModel({
+      ...chunkModel,
+      run: { status: "partial", mode, processedCount: exportItems.current.length, totalCount: total },
+      results: exportItems.current,
+    });
+  };
+
+  const reset = () => clearLookupState(true);
 
   const run = async () => {
     if (parsed.error) return;
+    invalidateRun();
     const controller = new AbortController();
+    const runGeneration = generation.current;
     abortController.current = controller;
     setActive(true);
     setRequestError(undefined);
     const retrying = remainingTargets.length > 0;
     const pendingTargets = retrying ? remainingTargets : parsed.targets;
     const initialProgress = retrying ? progress : { processed: 0, total: parsed.targets.length, items: [] };
+    if (!retrying) {
+      exportItems.current = [];
+      setExportModel(undefined);
+      setResultPageStart(0);
+    } else {
+      setExportModel((current) => current?.run ? { ...current, run: { ...current.run, status: "partial" } } : current);
+    }
+    processedItemCount.current = initialProgress.items.length;
+    progressSnapshot.current = initialProgress;
     setProgress(initialProgress);
     try {
       await state.ensureSession();
+      if (generation.current !== runGeneration || abortController.current !== controller) return;
       const execution = await executeBulkLookup({
         mode,
         targets: pendingTargets,
         signal: controller.signal,
         initialProgress,
-        requestChunk: api.vnuCrossLookupBulk,
-        onProgress: setProgress,
+        requestChunk: async (requestMode, targets, signal) => {
+          if (generation.current !== runGeneration || abortController.current !== controller) throw new Error("Stale bulk lookup run");
+          return parseBulkLookupItems(requestMode, await api.vnuCrossLookupBulk(requestMode, targets, signal));
+        },
+        onProgress: (nextProgress) => {
+          if (generation.current !== runGeneration || abortController.current !== controller) return;
+          const newItems = nextProgress.items.slice(processedItemCount.current);
+          processedItemCount.current = nextProgress.items.length;
+          progressSnapshot.current = nextProgress;
+          appendExportItems(newItems, nextProgress.total, runGeneration, controller);
+          setProgress(nextProgress);
+        },
       });
+      if (generation.current !== runGeneration || abortController.current !== controller) return;
+      progressSnapshot.current = execution.progress;
       setProgress(execution.progress);
       setRemainingTargets(execution.remainingTargets);
-      if (execution.error) setRequestError(execution.error instanceof ApiError ? execution.error.code : "VNU_CROSS_LOOKUP_FAILED");
+      const errorCode = execution.error instanceof ApiError
+        ? execution.error.code
+        : execution.error instanceof Error && execution.error.message === "Invalid bulk lookup response"
+          ? "VNU_CROSS_LOOKUP_INVALID_RESPONSE"
+          : execution.error
+            ? "VNU_CROSS_LOOKUP_FAILED"
+            : undefined;
+      if (errorCode) setRequestError(errorCode);
+      const complete = !execution.aborted && !execution.error && execution.progress.processed === execution.progress.total && execution.remainingTargets.length === 0;
+      setExportModel((current) => current?.run ? { ...current, run: { ...current.run, status: complete ? "complete" : "partial" } } : current);
     } catch (error) {
-      if (!controller.signal.aborted) {
+      if (generation.current === runGeneration && abortController.current === controller && !controller.signal.aborted) {
         setRemainingTargets(pendingTargets);
         setRequestError(error instanceof ApiError ? error.code : "VNU_CROSS_LOOKUP_FAILED");
       }
     } finally {
-      if (abortController.current === controller) abortController.current = null;
-      setActive(false);
+      if (generation.current === runGeneration && abortController.current === controller) {
+        abortController.current = null;
+        setActive(false);
+      }
     }
   };
 
   const validationMessage = parsed.error === "tooMany"
-    ? t.lookup.bulkTooMany
+    ? t.lookup.bulkTooMany(maximum)
     : t.lookup.bulkEmpty;
   const requestErrorMessage = requestError === "VNU_RATE_LIMITED"
     ? t.lookup.bulkRateLimited
     : requestError === "VNU_PROBE_BUDGET_UNAVAILABLE"
       ? t.lookup.bulkUnavailable
-      : t.lookup.bulkRequestFailed;
+      : requestError === "VNU_CROSS_LOOKUP_INVALID_RESPONSE"
+        ? t.lookup.bulkInvalidResponse
+        : t.lookup.bulkRequestFailed;
 
   return (
     <Card data-testid="bulk-lookup" aria-busy={active}>
       <CardHeader>
-        <CardTitle className="text-base">{t.lookup.bulkTitle}</CardTitle>
-        <CardDescription>{t.lookup.bulkDescription}</CardDescription>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <CardTitle className="text-base">{t.lookup.bulkTitle}</CardTitle>
+          {exportModel ? <ExportMenu model={exportModel} /> : null}
+        </div>
+        <CardDescription>{t.lookup.bulkDescription(maximum)}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="grid gap-3 sm:grid-cols-[minmax(12rem,0.45fr)_1fr]">
           <div className="space-y-1.5">
             <label className="text-sm font-medium" htmlFor="bulk-lookup-mode">{t.lookup.bulkModeLabel}</label>
-            <Select value={mode} onValueChange={(value) => { setMode(value as VnuBulkLookupMode); setProgress({ processed: 0, total: 0, items: [] }); setRemainingTargets([]); setRequestError(undefined); }} disabled={active}>
+            <Select value={mode} onValueChange={(value) => { const nextMode = parseBulkLookupMode(value); clearLookupState(false); setMode(nextMode); }} disabled={active}>
               <SelectTrigger id="bulk-lookup-mode" className="min-h-11"><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="stdid-to-code">{t.lookup.bulkModeIdToCode}</SelectItem>
@@ -834,7 +1011,7 @@ function BulkLookupSection() {
           </div>
           <div className="space-y-1.5">
             <label className="text-sm font-medium" htmlFor="bulk-lookup-targets">{t.lookup.bulkTargetsLabel}</label>
-            <Textarea id="bulk-lookup-targets" className="min-h-32 font-mono" value={rawTargets} disabled={active} onChange={(event) => { setRawTargets(event.target.value); setProgress({ processed: 0, total: 0, items: [] }); setRemainingTargets([]); setRequestError(undefined); }} placeholder={t.lookup.bulkTargetsPlaceholder} aria-invalid={parsed.error === "tooMany"} />
+            <Textarea id="bulk-lookup-targets" className="min-h-32 font-mono" value={rawTargets} disabled={active} onChange={(event) => { clearLookupState(false); setRawTargets(event.target.value); }} placeholder={t.lookup.bulkTargetsPlaceholder} aria-invalid={parsed.error === "tooMany"} />
           </div>
         </div>
         <div className="grid gap-2 sm:flex sm:flex-wrap">
@@ -852,7 +1029,14 @@ function BulkLookupSection() {
         {progress.items.length > 0 ? (
           <div aria-live="polite" className="max-h-[32rem] overflow-auto">
             <div className="flex items-center justify-between border-b border-border pb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground"><span>{t.lookup.bulkTargetColumn}</span><span>{viewState === "completed" ? t.lookup.bulkCompleted(progress.processed) : t.lookup.bulkProgress(progress.processed, progress.total)}</span></div>
-            <div className="divide-y divide-border">{progress.items.map((item, index) => <BulkLookupResultRow key={`${item.target}-${index}`} item={item} mode={mode} />)}</div>
+            <div data-testid="bulk-results-list" className="divide-y divide-border">{visibleItems.map((item, index) => <BulkLookupResultRow key={`${item.target}-${index}`} item={item} mode={mode} />)}</div>
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-3">
+              <p className="text-sm text-muted-foreground">{t.lookup.bulkShowingRange(visibleRangeStart, visibleRangeEnd, progress.items.length)}</p>
+              <div className="flex flex-wrap gap-2">
+                <Button type="button" variant="outline" className="min-h-11" disabled={effectivePageStart === 0} onClick={() => setResultPageStart((start) => Math.max(0, start - BULK_RESULTS_PAGE_SIZE))}>{t.lookup.bulkPreviousPage}</Button>
+                <Button type="button" variant="outline" className="min-h-11" disabled={visibleRangeEnd >= progress.items.length} onClick={() => setResultPageStart((start) => Math.min(lastPageStart, start + BULK_RESULTS_PAGE_SIZE))}>{t.lookup.bulkNextPage}</Button>
+              </div>
+            </div>
           </div>
         ) : null}
       </CardContent>
@@ -870,7 +1054,11 @@ export function LookupPage() {
   // Fail-closed while the universities list is still loading: the section
   // only renders once the active university's capabilities affirmatively
   // claim crossLookup (vnu only — see the adapter honesty rule).
-  const crossLookupEnabled = state.universities.data?.find((university) => university.id === state.universityId)?.capabilities.crossLookup === true;
+  const activeUniversity = state.universities.data?.find((university) => university.id === state.universityId);
+  const crossLookupEnabled = activeUniversity?.capabilities.crossLookup === true;
+  const bulkMaximum = activeUniversity?.limits?.crossLookup?.bulkMaxTargets;
+  const bulkLookupEnabled = crossLookupEnabled && Number.isSafeInteger(bulkMaximum) && bulkMaximum! > 0;
+  const bulkFreshnessKey = `${state.universityId}:${state.sessionNonce}:${state.activeAccountId ?? "no-account"}`;
 
   return (
     <FeatureFrame title={t.lookup.title} description={t.lookup.description} query={profileQuery}>
@@ -878,7 +1066,7 @@ export function LookupPage() {
         <div className="space-y-6">
           <ClassIdentifierTools />
           <StudentRecordTools profile={profile} crossLookupEnabled={crossLookupEnabled} />
-          {crossLookupEnabled ? <BulkLookupSection /> : null}
+          {bulkLookupEnabled ? <BulkLookupSection key={bulkFreshnessKey} maximum={bulkMaximum!} freshnessKey={bulkFreshnessKey} /> : null}
         </div>
       )}
     </FeatureFrame>
