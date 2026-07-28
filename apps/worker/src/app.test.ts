@@ -32,6 +32,29 @@ const SENTINELS = [
   "RAW_BODY_SENTINEL",
 ];
 
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+function toBase64Url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+}
+
+async function encryptRawLegacySessionFixture(payload: unknown): Promise<string> {
+  const encoder = new TextEncoder();
+  const digest = await crypto.subtle.digest("SHA-256", encoder.encode(SESSION_SECRET));
+  const key = await crypto.subtle.importKey("raw", digest, "AES-GCM", false, ["encrypt"]);
+  const iv = new Uint8Array(12).fill(0x62);
+  const encrypted = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: toArrayBuffer(iv) },
+    key,
+    toArrayBuffer(encoder.encode(JSON.stringify(payload))),
+  );
+  return `${toBase64Url(iv)}.${toBase64Url(new Uint8Array(encrypted))}`;
+}
+
 function parentSession(): EncryptedSessionPayload {
   return {
     version: 1,
@@ -810,7 +833,7 @@ describe("VNU import session cache", () => {
 
   it.each([
     ["malformed seed", async () => "not-an-encrypted-session"],
-    ["wrong token version", async () => encryptSession({ ...normalizedVnuSession(), version: 2 } as unknown as EncryptedSessionPayload, SESSION_SECRET)],
+    ["wrong token version", async () => encryptRawLegacySessionFixture({ ...normalizedVnuSession(), version: 2 })],
     ["failed authentication tag", async () => encryptSession(normalizedVnuSession(), "different-synthetic-secret-32-bytes")],
     ["expired seed", async () => encryptSession(normalizedVnuSession("2000-01-01T00:00:00.000Z"), SESSION_SECRET)],
     ["non-VNU seed", async () => encryptSession({ ...normalizedVnuSession(), universityId: "uet", vnu: undefined }, SESSION_SECRET)],
