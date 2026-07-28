@@ -1,5 +1,6 @@
-import { configureLogger, decryptSession, encryptSession, HyeboardError, type EncryptedSessionPayload } from "@hyeboard/core";
+import { configureLogger, decryptSession, decryptVnuRefreshGrant, encryptSession, HyeboardError, type EncryptedSessionPayload } from "@hyeboard/core";
 import { DaotaoClient } from "@hyeboard/university-adapters";
+import { authResultSchema } from "@hyeboard/schemas";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const adapterMocks = vi.hoisted(() => ({
@@ -12,10 +13,22 @@ vi.mock("@hyeboard/university-adapters", async (importOriginal) => {
   return { ...actual, getAdapter: adapterMocks.getAdapter };
 });
 
-import { createApp, createCaptchaRelayToken, requestLogPath, resolveSession, setCaptchaRelayCoordinator, setRuntimeConfig, setVnuProbeBudgetCoordinator, type RuntimeConfig } from "./app";
+import { createApp, createCaptchaRelayToken, requestLogPath, resolveSession, setCaptchaRelayCoordinator, setRuntimeConfig, setVnuProbeBudgetCoordinator, setVnuRefreshControlCoordinator, type RuntimeConfig } from "./app";
 import { LocalCaptchaRelayCoordinator, type CaptchaRelayCoordinator } from "./captcha-relay";
 import { selfHostedRuntimeConfig } from "./start";
 import type { VnuProbeBudgetCoordinator } from "./vnu-probe-budget";
+import {
+  checkAccessAuthoritatively,
+  DurableObjectVnuRefreshControlCoordinator,
+  type AccessCheckResult,
+  type AccessDescriptorRef,
+  type LinkedPair,
+  type VnuRefreshControlCoordinator,
+  type VnuRefreshControlNamespace,
+  type VnuRefreshControlState,
+  type VnuRefreshControlStorage,
+  type VnuRefreshControlStub,
+} from "./vnu-refresh-control";
 
 const SESSION_SECRET = "worker-test-secret-worker-test-secret";
 const VNU_STUDENT_CODE = "SYNTHETIC-STUDENT-001";
@@ -66,8 +79,9 @@ function parentSession(): EncryptedSessionPayload {
   };
 }
 
-type VnuImportResponse = {
+type CoordinatorVnuImportResponse = {
   token: string;
+  refreshGrant: string;
   session: {
     universityId: string;
     studentCode?: string;
@@ -75,6 +89,151 @@ type VnuImportResponse = {
     authenticated: true;
   };
 };
+
+type AccessOnlyVnuImportResponse = Omit<CoordinatorVnuImportResponse, "refreshGrant">;
+
+type CoordinatorFailureMode = "outage" | "corrupted" | "storage" | "rpc";
+
+class TestVnuImportRefreshControl implements VnuRefreshControlCoordinator {
+  readonly activations: Array<{ principalKey: string; pair: LinkedPair }> = [];
+  readonly checks: Array<{ principalKey: string; pair: AccessDescriptorRef }> = [];
+  accessResult?: AccessCheckResult;
+  readonly activePairs = new Map<string, LinkedPair>();
+  readonly revokedPairs = new Map<string, LinkedPair[]>();
+  readonly revocationAttempts: Array<{ principalKey: string; pair: AccessDescriptorRef }> = [];
+  failureMode?: CoordinatorFailureMode;
+  mutationCount = 0;
+  cleanupWriteCount = 0;
+  alarmUpdateCount = 0;
+  staleCleanupPending = false;
+
+  private throwIfUnavailable(): void {
+    if (!this.failureMode) return;
+    throw new Error(`SYNTHETIC_${this.failureMode.toUpperCase()}_SENTINEL`);
+  }
+
+  async activatePair(principalKey: string, pair: LinkedPair): Promise<void> {
+    this.throwIfUnavailable();
+    const previous = this.activePairs.get(principalKey);
+    if (previous && JSON.stringify(previous) !== JSON.stringify(pair)) {
+      this.revokedPairs.set(principalKey, [...(this.revokedPairs.get(principalKey) ?? []), previous]);
+    }
+    this.activations.push({ principalKey, pair });
+    this.activePairs.set(principalKey, pair);
+    this.mutationCount += 1;
+  }
+
+  async checkAccess(principalKey: string, pair: AccessDescriptorRef): Promise<AccessCheckResult> {
+    this.throwIfUnavailable();
+    this.checks.push({ principalKey, pair });
+    if (this.staleCleanupPending) {
+      this.staleCleanupPending = false;
+      this.cleanupWriteCount += 1;
+      this.alarmUpdateCount += 1;
+      this.mutationCount += 1;
+    }
+    if (this.accessResult) return this.accessResult;
+    return JSON.stringify(this.activePairs.get(principalKey)) === JSON.stringify(pair) ? { kind: "active" } : { kind: "revoked" };
+  }
+
+  async beginRefresh(): Promise<never> { throw new Error("not used"); }
+  async completeRefresh(): Promise<never> { throw new Error("not used"); }
+  async abortRefresh(): Promise<never> { throw new Error("not used"); }
+  async revokeLinkedPairByAccess(principalKey: string, pair: AccessDescriptorRef): Promise<"revoked" | "mismatch" | "expired"> {
+    this.throwIfUnavailable();
+    this.revocationAttempts.push({ principalKey, pair });
+    const active = this.activePairs.get(principalKey);
+    if (JSON.stringify(active) === JSON.stringify(pair)) {
+      this.activePairs.delete(principalKey);
+      this.revokedPairs.set(principalKey, [...(this.revokedPairs.get(principalKey) ?? []), pair]);
+      this.mutationCount += 1;
+      return "revoked";
+    }
+    if ((this.revokedPairs.get(principalKey) ?? []).some((revoked) => JSON.stringify(revoked) === JSON.stringify(pair))) return "revoked";
+    return "mismatch";
+  }
+  async revokeExactLinkedPair(): Promise<never> { throw new Error("not used"); }
+}
+
+class InstrumentedVnuRefreshStorage implements VnuRefreshControlStorage {
+  getCount = 0;
+  transactionCount = 0;
+  putCount = 0;
+  deleteCount = 0;
+  alarmUpdateCount = 0;
+  getFailure?: Error;
+  transactionFailure?: Error;
+
+  constructor(public stored: unknown) {}
+
+  async get(): Promise<unknown> {
+    this.getCount += 1;
+    if (this.getFailure) throw this.getFailure;
+    return this.stored;
+  }
+
+  async transaction<T>(body: (
+    stored: unknown,
+    put: (state: VnuRefreshControlState) => Promise<void>,
+    deleteState: () => Promise<void>,
+    setAlarm: (at: number | undefined) => Promise<void>,
+  ) => Promise<T>): Promise<T> {
+    this.transactionCount += 1;
+    if (this.transactionFailure) throw this.transactionFailure;
+    return body(
+      this.stored,
+      async (state) => { this.putCount += 1; this.stored = state; },
+      async () => { this.deleteCount += 1; this.stored = undefined; },
+      async () => { this.alarmUpdateCount += 1; },
+    );
+  }
+}
+
+type ProductionAuthorityHarness = {
+  coordinator: DurableObjectVnuRefreshControlCoordinator;
+  storage: InstrumentedVnuRefreshStorage;
+  objectNames: string[];
+  checkInputs: AccessDescriptorRef[];
+};
+
+function activeAuthorityState(pair: LinkedPair, staleAccessId?: string): VnuRefreshControlState {
+  return {
+    active: pair,
+    revokedAccess: staleAccessId ? { [staleAccessId]: 1 } : {},
+    revokedGrants: {},
+    window: { count: 0, resetAt: Date.now() + 60_000 },
+  };
+}
+
+function emptyAuthorityState(): VnuRefreshControlState {
+  return { revokedAccess: {}, revokedGrants: {}, window: { count: 0, resetAt: Date.now() + 60_000 } };
+}
+
+function productionAuthorityHarness(stored: unknown, options: { rpcFailure?: Error; expectedPrincipal?: string } = {}): ProductionAuthorityHarness {
+  const storage = new InstrumentedVnuRefreshStorage(stored);
+  const unrelatedStorage = new InstrumentedVnuRefreshStorage(emptyAuthorityState());
+  const objectNames: string[] = [];
+  const checkInputs: AccessDescriptorRef[] = [];
+  const unsupported = async (): Promise<never> => { throw new Error("not used"); };
+  const stubFor = (stubStorage: InstrumentedVnuRefreshStorage): VnuRefreshControlStub => ({
+    activatePair: unsupported,
+    async checkAccess(access) {
+      checkInputs.push(access);
+      if (options.rpcFailure) throw options.rpcFailure;
+      return checkAccessAuthoritatively(stubStorage, access, Date.now());
+    },
+    beginRefresh: unsupported,
+    completeRefresh: unsupported,
+    abortRefresh: unsupported,
+    revokeLinkedPairByAccess: unsupported,
+    revokeExactLinkedPair: unsupported,
+  });
+  const expectedPrincipal = options.expectedPrincipal ?? "a".repeat(64);
+  const namespace: VnuRefreshControlNamespace = {
+    getByName(name) { objectNames.push(name); return stubFor(name === expectedPrincipal ? storage : unrelatedStorage); },
+  };
+  return { coordinator: new DurableObjectVnuRefreshControlCoordinator(namespace), storage, objectNames, checkInputs };
+}
 
 class TestCache {
   readonly store = new Map<string, { response: Response; expiresAt: number }>();
@@ -109,6 +268,10 @@ class TestCache {
     return [...this.store.keys()].filter((key) => key.startsWith("https://hyeboard.internal/cache/vnu/raw/"));
   }
 
+  revocationUrls(): string[] {
+    return [...this.store.keys()].filter((key) => key.includes("/cache/revoked-token/"));
+  }
+
   importUrl(): string {
     const url = [...this.store.keys()].find((key) => key.includes("/cache/vnu/import/"));
     if (!url) throw new Error("VNU import cache entry was not written");
@@ -117,11 +280,11 @@ class TestCache {
 
   async importEntry(): Promise<{
     seed: string;
-    session: VnuImportResponse["session"];
+    session: CoordinatorVnuImportResponse["session"];
   }> {
     return await this.store.get(this.importUrl())!.response.clone().json() as {
       seed: string;
-      session: VnuImportResponse["session"];
+      session: CoordinatorVnuImportResponse["session"];
     };
   }
 
@@ -227,14 +390,26 @@ describe("request-log privacy", () => {
   });
 });
 
-async function importVnu(app: ReturnType<typeof createApp>): Promise<VnuImportResponse> {
+async function importVnu(app: ReturnType<typeof createApp>): Promise<CoordinatorVnuImportResponse> {
   const response = await requestVnuImport(app);
   expect(response.status).toBe(200);
-  const body = await response.json() as { data: VnuImportResponse; error: null };
+  const body = await response.json() as { data: CoordinatorVnuImportResponse; error: null };
   expect(body.error).toBeNull();
-  expect(Object.keys(body.data).sort()).toEqual(["session", "token"]);
+  expect(Object.keys(body.data).sort()).toEqual(["refreshGrant", "session", "token"]);
   expect(Object.keys(body.data.session).sort()).toEqual(["authenticated", "expiresAt", "studentCode", "universityId"]);
   return body.data;
+}
+
+async function expectIssuedVnuAccess(token: string, expected: EncryptedSessionPayload): Promise<EncryptedSessionPayload> {
+  const payload = await decryptSession(token, SESSION_SECRET);
+  const { vnuRefresh, ...ordinary } = payload;
+  expect(ordinary).toEqual(expected);
+  expect(vnuRefresh).toMatchObject({
+    version: 1,
+    purpose: "vnu-refresh-access",
+    accessExpiresAt: expected.expiresAt,
+  });
+  return payload;
 }
 
 async function getVnuSession(app: ReturnType<typeof createApp>, token: string): Promise<Response> {
@@ -248,6 +423,392 @@ async function getVnuRawPage(app: ReturnType<typeof createApp>, token: string, p
     headers: { Authorization: `Bearer ${token}` },
   }));
 }
+
+function descriptorVnuSession(overrides: Partial<NonNullable<EncryptedSessionPayload["vnuRefresh"]>> = {}): EncryptedSessionPayload {
+  const expiresAt = "2099-01-01T00:00:00.000Z";
+  return {
+    ...normalizedVnuSession(expiresAt),
+    vnuRefresh: {
+      version: 1,
+      purpose: "vnu-refresh-access",
+      principalKey: "a".repeat(64),
+      accessTokenId: "A".repeat(22),
+      grantId: `${"B".repeat(21)}A`,
+      accessExpiresAt: expiresAt,
+      grantExpiresAt: "2099-01-01T08:00:00.000Z",
+      ...overrides,
+    },
+  };
+}
+
+function descriptorPairFixture(session: EncryptedSessionPayload): LinkedPair {
+  const descriptor = session.vnuRefresh!;
+  return {
+    accessTokenId: descriptor.accessTokenId,
+    accessExpiresAt: Date.parse(descriptor.accessExpiresAt),
+    grantId: descriptor.grantId,
+    grantExpiresAt: Date.parse(descriptor.grantExpiresAt),
+  };
+}
+
+describe("VNU access authority", () => {
+  let authoritySession: EncryptedSessionPayload;
+  let authority: ProductionAuthorityHarness;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET });
+    authoritySession = descriptorVnuSession();
+    authority = productionAuthorityHarness(activeAuthorityState(descriptorPairFixture(authoritySession)));
+    setVnuRefreshControlCoordinator(authority.coordinator);
+  });
+
+  afterEach(() => setVnuRefreshControlCoordinator(undefined));
+
+  it("checks the exact descriptor authority before accepting an ordinary session", async () => {
+    const session = descriptorVnuSession();
+    const token = await encryptSession(session, SESSION_SECRET);
+
+    await expect(resolveSession({ Authorization: `Bearer ${token}` })).resolves.toEqual({ session });
+    expect(authority.objectNames).toEqual([session.vnuRefresh!.principalKey]);
+    expect(authority.checkInputs).toEqual([descriptorPairFixture(session)]);
+    expect(authority.storage.getCount).toBe(1);
+  });
+
+  it("performs exact read-only authority checks on three repeated active requests before upstream", async () => {
+    const session = descriptorVnuSession();
+    const pair = descriptorPairFixture(session);
+    const getStudentProfile = vi.fn(async () => ({ id: "SYNTHETIC_PROFILE", fullName: "SYNTHETIC PROFILE", universityId: "vnu" }));
+    adapterMocks.getAdapter.mockReturnValue({ getStudentProfile });
+    const app = createApp(undefined);
+    const token = await encryptSession(session, SESSION_SECRET);
+
+    const responses = await Promise.all(Array.from({ length: 3 }, () => app.handle(new Request("http://localhost/api/vnu/me", {
+      headers: { Authorization: `Bearer ${token}` },
+    }))));
+
+    expect(responses.map((response) => response.status)).toEqual([200, 200, 200]);
+    expect(authority.objectNames).toEqual(Array.from({ length: 3 }, () => session.vnuRefresh!.principalKey));
+    expect(authority.checkInputs).toEqual(Array.from({ length: 3 }, () => pair));
+    expect(getStudentProfile).toHaveBeenCalledTimes(3);
+    expect(authority.storage.getCount).toBe(3);
+    expect(authority.storage.transactionCount).toBe(0);
+    expect(authority.storage.putCount).toBe(0);
+    expect(authority.storage.deleteCount).toBe(0);
+    expect(authority.storage.alarmUpdateCount).toBe(0);
+  });
+
+  it("applies stale authority cleanup once and keeps later checks read-only", async () => {
+    const session = descriptorVnuSession();
+    const pair = descriptorPairFixture(session);
+    authority = productionAuthorityHarness(activeAuthorityState(pair, `${"Z".repeat(21)}A`));
+    setVnuRefreshControlCoordinator(authority.coordinator);
+    const getStudentProfile = vi.fn(async () => ({ id: "SYNTHETIC_PROFILE", fullName: "SYNTHETIC PROFILE", universityId: "vnu" }));
+    adapterMocks.getAdapter.mockReturnValue({ getStudentProfile });
+    const app = createApp(undefined);
+    const token = await encryptSession(session, SESSION_SECRET);
+
+    const first = await app.handle(new Request("http://localhost/api/vnu/me", { headers: { Authorization: `Bearer ${token}` } }));
+    expect(first.status).toBe(200);
+    expect(authority.storage.getCount).toBe(1);
+    expect(authority.storage.transactionCount).toBe(1);
+    expect(authority.storage.putCount).toBe(1);
+    expect(authority.storage.alarmUpdateCount).toBe(1);
+    const second = await app.handle(new Request("http://localhost/api/vnu/me", { headers: { Authorization: `Bearer ${token}` } }));
+    expect(second.status).toBe(200);
+    expect(authority.storage.getCount).toBe(2);
+    expect(authority.storage.transactionCount).toBe(1);
+    expect(authority.storage.putCount).toBe(1);
+    expect(authority.storage.alarmUpdateCount).toBe(1);
+    expect(getStudentProfile).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["wrong namespace", { purpose: "other-purpose" }],
+    ["malformed identifier", { accessTokenId: "NOT_CANONICAL" }],
+    ["broken access-expiry link", { accessExpiresAt: "2099-01-01T00:00:01.000Z" }],
+  ])("rejects a %s descriptor before coordinator access", async (_label, descriptorPatch) => {
+    const malformed = descriptorVnuSession(descriptorPatch as never);
+    const token = await encryptRawLegacySessionFixture(malformed);
+
+    await expect(resolveSession({ Authorization: `Bearer ${token}` })).rejects.toMatchObject({ code: "INVALID_SESSION", status: 401 });
+    expect(authority.checkInputs).toEqual([]);
+  });
+
+  it("rejects revoked descriptor authority without upstream access", async () => {
+    authority = productionAuthorityHarness(emptyAuthorityState());
+    setVnuRefreshControlCoordinator(authority.coordinator);
+    const profileSpy = vi.spyOn(DaotaoClient.prototype, "getProfileHtml");
+    const token = await encryptSession(descriptorVnuSession(), SESSION_SECRET);
+
+    await expect(resolveSession({ Authorization: `Bearer ${token}` })).rejects.toMatchObject({ code: "SESSION_EXPIRED", status: 401 });
+    expect(profileSpy).not.toHaveBeenCalled();
+    profileSpy.mockRestore();
+  });
+
+  it.each([
+    ["principal namespace", (_session: EncryptedSessionPayload) => descriptorVnuSession({ principalKey: "b".repeat(64) })],
+    ["access ID", (_session: EncryptedSessionPayload) => descriptorVnuSession({ accessTokenId: `${"C".repeat(21)}A` })],
+    ["grant ID/link", (_session: EncryptedSessionPayload) => descriptorVnuSession({ grantId: `${"D".repeat(21)}A` })],
+    ["access expiry", (_session: EncryptedSessionPayload) => {
+      const expiresAt = "2099-01-01T00:00:01.000Z";
+      return { ...descriptorVnuSession({ accessExpiresAt: expiresAt }), expiresAt };
+    }],
+    ["grant expiry", (_session: EncryptedSessionPayload) => descriptorVnuSession({ grantExpiresAt: "2099-01-01T08:00:01.000Z" })],
+  ])("rejects wrong %s authority without upstream or mutation", async (_label, alterSession) => {
+    const activeSession = descriptorVnuSession();
+    const getStudentProfile = vi.fn();
+    adapterMocks.getAdapter.mockReturnValue({ getStudentProfile });
+    const app = createApp(undefined);
+    const token = await encryptSession(alterSession(activeSession), SESSION_SECRET);
+
+    const response = await app.handle(new Request("http://localhost/api/vnu/me", {
+      headers: { Authorization: `Bearer ${token}` },
+    }));
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({ data: null, error: { code: "SESSION_EXPIRED", message: "Session expired" } });
+    expect(getStudentProfile).not.toHaveBeenCalled();
+    expect(authority.storage.transactionCount).toBe(0);
+    expect(authority.storage.putCount).toBe(0);
+  });
+
+  it.each(["corrupted", "get", "transaction", "rpc"] as const)("sanitizes production %s authority failure without upstream", async (failureMode) => {
+    const sentinels = [
+      `SYNTHETIC_${failureMode.toUpperCase()}_SENTINEL`,
+      "UPSTREAM_PROSE_SENTINEL",
+      "TOKEN_SENTINEL",
+      "GRANT_SENTINEL",
+      "PRINCIPAL_SENTINEL",
+      "USERNAME_SENTINEL",
+      "STUDENT_CODE_SENTINEL",
+      "PROFILE_SENTINEL",
+      "COOKIE_SENTINEL",
+    ];
+    const lines: string[] = [];
+    configureLogger({ level: "error", mode: "node", destination: { write: (line) => lines.push(line) } });
+    const pair = descriptorPairFixture(authoritySession);
+    if (failureMode === "corrupted") authority = productionAuthorityHarness({ privateState: "SYNTHETIC_CORRUPTED_SENTINEL" });
+    if (failureMode === "get") {
+      authority = productionAuthorityHarness(activeAuthorityState(pair));
+      authority.storage.getFailure = new Error("SYNTHETIC_GET_SENTINEL");
+    }
+    if (failureMode === "transaction") {
+      authority = productionAuthorityHarness(activeAuthorityState(pair, `${"Z".repeat(21)}A`));
+      authority.storage.transactionFailure = new Error("SYNTHETIC_TRANSACTION_SENTINEL");
+    }
+    if (failureMode === "rpc") {
+      authority = productionAuthorityHarness(activeAuthorityState(pair), { rpcFailure: new Error("SYNTHETIC_RPC_SENTINEL") });
+    }
+    setVnuRefreshControlCoordinator(authority.coordinator);
+    const getStudentProfile = vi.fn();
+    adapterMocks.getAdapter.mockReturnValue({ getStudentProfile });
+    const app = createApp(undefined);
+    const token = await encryptSession(descriptorVnuSession(), SESSION_SECRET);
+
+    const response = await app.handle(new Request("http://localhost/api/vnu/me", {
+      headers: { Authorization: `Bearer ${token}` },
+    }));
+    const payloadText = await response.text();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const logText = lines.join("\n");
+
+    expect(response.status).toBe(503);
+    expect(JSON.parse(payloadText)).toEqual({
+      data: null,
+      error: {
+        code: "VNU_REFRESH_UNAVAILABLE",
+        message: "VNU reconnect is temporarily unavailable. Try again.",
+        details: { retryAfterSeconds: 5 },
+      },
+    });
+    expect(getStudentProfile).not.toHaveBeenCalled();
+    expect(authority.storage.putCount).toBe(0);
+    expect(authority.storage.deleteCount).toBe(0);
+    expect(authority.storage.alarmUpdateCount).toBe(0);
+    for (const sentinel of sentinels) {
+      expect(payloadText).not.toContain(sentinel);
+      expect(logText).not.toContain(sentinel);
+    }
+    expect(logText).not.toContain('"stack"');
+    expect(logText).not.toContain('"reqId"');
+    configureLogger({ level: "silent", mode: "node" });
+  });
+
+  it("never calls descriptor authority for a legacy VNU token", async () => {
+    const session = normalizedVnuSession();
+    const token = await encryptSession(session, SESSION_SECRET);
+
+    await expect(resolveSession({ Authorization: `Bearer ${token}` })).resolves.toEqual({ session });
+    expect(authority.checkInputs).toEqual([]);
+  });
+
+  it("keeps descriptorless VNU tokens on the existing raw cache path without refresh eligibility", async () => {
+    const cache = new TestCache(() => Date.now());
+    vi.stubGlobal("caches", { default: cache });
+    const gradesSpy = vi.spyOn(DaotaoClient.prototype, "getGradesHtml").mockResolvedValue("<html>SYNTHETIC_LEGACY_GRADES</html>");
+    const session = normalizedVnuSession();
+    const token = await encryptSession(session, SESSION_SECRET);
+    const app = createApp(undefined);
+
+    const first = await getVnuRawPage(app, token);
+    const second = await getVnuRawPage(app, token);
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    await expect(second.json()).resolves.toEqual({ data: { html: "<html>SYNTHETIC_LEGACY_GRADES</html>" }, error: null });
+    expect(gradesSpy).toHaveBeenCalledTimes(1);
+    expect(authority.checkInputs).toEqual([]);
+    expect(authority.storage.getCount).toBe(0);
+    expect(session.vnuRefresh).toBeUndefined();
+    gradesSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("fails descriptor-bearing self-hosted sessions closed", async () => {
+    setVnuRefreshControlCoordinator(undefined);
+    const token = await encryptSession(descriptorVnuSession(), SESSION_SECRET);
+
+    await expect(resolveSession({ Authorization: `Bearer ${token}` })).rejects.toMatchObject({ code: "VNU_REFRESH_UNAVAILABLE", status: 503 });
+  });
+});
+
+describe("JSON error detail boundary", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET });
+  });
+
+  async function rejectedImport(details: unknown): Promise<Record<string, unknown>> {
+    adapterMocks.importSession.mockRejectedValue(new HyeboardError("SYNTHETIC_REJECTION", "Safe synthetic rejection", 429, details));
+    adapterMocks.getAdapter.mockReturnValue({ importSession: adapterMocks.importSession });
+    const response = await createApp(undefined).handle(new Request("http://localhost/api/mock/auth/import-session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    }));
+    expect(response.status).toBe(429);
+    const payload = await response.json() as Record<string, unknown>;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return payload;
+  }
+
+  it("includes only a fully valid allow-listed detail object", async () => {
+    await expect(rejectedImport({ retryAfterSeconds: 5, limit: 5, windowSeconds: 900 })).resolves.toMatchObject({
+      error: { details: { retryAfterSeconds: 5, limit: 5, windowSeconds: 900 } },
+    });
+  });
+
+  it.each([
+    { retryAfterSeconds: 5, privateCredential: "PRIVATE_SENTINEL" },
+    { reason: "OTHER_REASON" },
+    "NONOBJECT_SENTINEL",
+  ])("omits mixed, unknown, and nonobject details atomically", async (details) => {
+    const payload = await rejectedImport(details);
+    expect(payload).toMatchObject({ error: { code: "SYNTHETIC_REJECTION" } });
+    expect((payload.error as Record<string, unknown>).details).toBeUndefined();
+    expect(JSON.stringify(payload)).not.toContain("PRIVATE_SENTINEL");
+  });
+
+  it("omits circular details instead of failing serialization", async () => {
+    const details: Record<string, unknown> = { retryAfterSeconds: 5 };
+    details.circular = details;
+
+    const payload = await rejectedImport(details);
+    expect((payload.error as Record<string, unknown>).details).toBeUndefined();
+  });
+
+  it("rejects empty access-token and refresh-grant wire values", () => {
+    const session = { universityId: "vnu", studentCode: VNU_STUDENT_CODE, expiresAt: "2099-01-01T00:00:00.000Z", authenticated: true };
+
+    expect(authResultSchema.safeParse({ token: "", session }).success).toBe(false);
+    expect(authResultSchema.safeParse({ token: "SYNTHETIC_TOKEN", refreshGrant: "", session }).success).toBe(false);
+    expect(authResultSchema.safeParse({ token: "SYNTHETIC_TOKEN", refreshGrant: "SYNTHETIC_GRANT", session }).success).toBe(true);
+  });
+});
+
+describe("VNU recoverability classification", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET });
+  });
+
+  afterEach(() => configureLogger({ level: "silent", mode: "node" }));
+
+  it("marks only a missing VNU credential with the recoverable reason", async () => {
+    const token = await encryptSession({ ...normalizedVnuSession(), vnu: undefined }, SESSION_SECRET);
+    const response = await getVnuRawPage(createApp(undefined), token);
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({
+      data: null,
+      error: {
+        code: "VNU_LOGIN_REQUIRED",
+        message: "VNU data needs an active university portal credential.",
+        details: { reason: "MISSING_VNU_CREDENTIAL" },
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+  it.each([
+    ["Hyeboard", new HyeboardError("SYNTHETIC_VNU_FAILURE", "UPSTREAM_PROSE_SENTINEL TOKEN_SENTINEL GRANT_SENTINEL", 502)],
+    ["unexpected", new Error("UPSTREAM_PROSE_SENTINEL TOKEN_SENTINEL GRANT_SENTINEL PRINCIPAL_SENTINEL USERNAME_SENTINEL STUDENT_CODE_SENTINEL PROFILE_SENTINEL COOKIE_SENTINEL")],
+  ])("uses constant private-free VNU logging for %s route failures", async (_label, routeFailure) => {
+    const lines: string[] = [];
+    configureLogger({ level: "error", mode: "node", destination: { write: (line) => lines.push(line) } });
+    adapterMocks.getAdapter.mockReturnValue({ getStudentProfile: vi.fn(async () => { throw routeFailure; }) });
+    const app = createApp(undefined);
+    const token = await encryptSession(normalizedVnuSession(), SESSION_SECRET);
+
+    const response = await app.handle(new Request("http://localhost/api/vnu/me", {
+      headers: { Authorization: `Bearer ${token}` },
+    }));
+    await response.text();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const output = lines.join("\n");
+    expect(output).toContain('"operation":"route"');
+    expect(output).toContain('"msg":"VNU request failed"');
+    expect(output).not.toContain('"reqId"');
+    expect(output).not.toContain('"stack"');
+    for (const sentinel of ["UPSTREAM_PROSE_SENTINEL", "TOKEN_SENTINEL", "GRANT_SENTINEL", "PRINCIPAL_SENTINEL", "USERNAME_SENTINEL", "STUDENT_CODE_SENTINEL", "PROFILE_SENTINEL", "COOKIE_SENTINEL"]) {
+      expect(output).not.toContain(sentinel);
+    }
+    for (const line of lines) {
+      const { level: _level, time: _time, pid: _pid, hostname: _hostname, ...stable } = JSON.parse(line) as Record<string, unknown>;
+      expect(stable).toEqual(expect.objectContaining({ operation: "route", msg: "VNU request failed" }));
+      expect(Object.keys(stable).sort()).toEqual(["code", "msg", "operation", "status"]);
+    }
+  });
+
+  it("replaces an untrusted status-bearing error code at the VNU boundary", async () => {
+    const privateCode = "PRIVATE_CODE_SENTINEL";
+    const privateMessage = "PRIVATE_MESSAGE_SENTINEL";
+    const routeFailure = Object.assign(new Error(privateMessage), { status: 422, code: privateCode, details: { privateId: "PRIVATE_ID_SENTINEL" } });
+    const lines: string[] = [];
+    configureLogger({ level: "warn", mode: "node", destination: { write: (line) => lines.push(line) } });
+    adapterMocks.getAdapter.mockReturnValue({ getStudentProfile: vi.fn(async () => { throw routeFailure; }) });
+    const app = createApp(undefined);
+    const token = await encryptSession(normalizedVnuSession(), SESSION_SECRET);
+
+    const response = await app.handle(new Request("http://localhost/api/vnu/me", { headers: { Authorization: `Bearer ${token}` } }));
+    const responseText = await response.text();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const logText = lines.join("\n");
+
+    expect(response.status).toBe(500);
+    expect(JSON.parse(responseText)).toEqual({
+      data: null,
+      error: { code: "INTERNAL_ERROR", message: "Unexpected API error" },
+    });
+    for (const privateValue of [privateCode, privateMessage, "PRIVATE_ID_SENTINEL"]) {
+      expect(responseText).not.toContain(privateValue);
+      expect(logText).not.toContain(privateValue);
+    }
+    expect(JSON.parse(lines[0]!)).toMatchObject({ operation: "route", code: "INTERNAL_ERROR", status: 500, msg: "VNU request failed" });
+  });
+});
 
 describe("lazy parent session refresh", () => {
   let logOutput: string[];
@@ -448,6 +1009,7 @@ describe("VNU import session cache", () => {
   let dateNowSpy: ReturnType<typeof vi.spyOn>;
   let profileSpy: ReturnType<typeof vi.spyOn>;
   let gradesSpy: ReturnType<typeof vi.spyOn> | undefined;
+  let refreshControl: TestVnuImportRefreshControl;
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -460,6 +1022,8 @@ describe("VNU import session cache", () => {
     vi.stubGlobal("caches", { default: cache });
     adapterMocks.getAdapter.mockReturnValue({ importSession: adapterMocks.importSession });
     adapterMocks.importSession.mockResolvedValue(importedVnu());
+    refreshControl = new TestVnuImportRefreshControl();
+    setVnuRefreshControlCoordinator(refreshControl);
     profileSpy = vi.spyOn(DaotaoClient.prototype, "getProfileHtml").mockResolvedValue(vnuProfileHtml());
     gradesSpy = undefined;
     app = createApp(undefined);
@@ -470,6 +1034,272 @@ describe("VNU import session cache", () => {
     profileSpy.mockRestore();
     dateNowSpy.mockRestore();
     vi.unstubAllGlobals();
+    setVnuRefreshControlCoordinator(undefined);
+  });
+
+  it("normalizes the username and activates a linked access/grant pair before returning artifacts", async () => {
+    const response = await app.handle(new Request("http://localhost/api/vnu/auth/import-session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ vnuUsername: "  SYNTHETIC-VNU-USER  ", vnuPassword: "SYNTHETIC-PASSWORD-BYTES" }),
+    }));
+    const body = await response.json() as { data: CoordinatorVnuImportResponse; error: null };
+
+    expect(response.status).toBe(200);
+    expect(adapterMocks.importSession).toHaveBeenCalledWith({
+      vnuUsername: "synthetic-vnu-user",
+      vnuPassword: "SYNTHETIC-PASSWORD-BYTES",
+    });
+    const access = await decryptSession(body.data.token, SESSION_SECRET);
+    const grant = await decryptVnuRefreshGrant(body.data.refreshGrant!, SESSION_SECRET, syntheticTime);
+    expect(grant).toMatchObject({
+      username: "synthetic-vnu-user",
+      password: "SYNTHETIC-PASSWORD-BYTES",
+      expectedStudentCode: VNU_STUDENT_CODE,
+    });
+    expect(Date.parse(grant.expiresAt) - Date.parse(grant.issuedAt)).toBe(8 * 60 * 60 * 1000);
+    expect(access.vnuRefresh).toMatchObject({ grantId: grant.grantId, grantExpiresAt: grant.expiresAt });
+    expect(refreshControl.activations).toEqual([{
+      principalKey: access.vnuRefresh!.principalKey,
+      pair: {
+        accessTokenId: access.vnuRefresh!.accessTokenId,
+        accessExpiresAt: Date.parse(access.vnuRefresh!.accessExpiresAt),
+        grantId: grant.grantId,
+        grantExpiresAt: Date.parse(grant.expiresAt),
+      },
+    }]);
+  });
+
+  it("uses submitted request-local credentials after a live verified cache hit", async () => {
+    const first = await importVnu(app);
+    const second = await importVnu(app);
+    const secondGrant = await decryptVnuRefreshGrant(second.refreshGrant, SESSION_SECRET, syntheticTime);
+    const firstAccess = await decryptSession(first.token, SESSION_SECRET);
+    const secondAccess = await decryptSession(second.token, SESSION_SECRET);
+
+    expect(adapterMocks.importSession).toHaveBeenCalledTimes(1);
+    expect(profileSpy).toHaveBeenCalledTimes(1);
+    expect(secondGrant).toMatchObject({
+      username: "synthetic_vnu_user",
+      password: "SYNTHETIC_VNU_PASSWORD",
+      expectedStudentCode: VNU_STUDENT_CODE,
+    });
+    expect(refreshControl.activations).toHaveLength(2);
+    expect(refreshControl.activePairs.get(secondAccess.vnuRefresh!.principalKey)).toEqual(descriptorPairFixture(secondAccess));
+    expect(refreshControl.revokedPairs.get(firstAccess.vnuRefresh!.principalKey)).toContainEqual(descriptorPairFixture(firstAccess));
+
+    gradesSpy = vi.spyOn(DaotaoClient.prototype, "getGradesHtml").mockResolvedValue("<html>SYNTHETIC_ACTIVE_GRADES</html>");
+    const oldResponse = await getVnuRawPage(app, first.token);
+    const newResponse = await getVnuRawPage(app, second.token);
+    expect(oldResponse.status).toBe(401);
+    expect(newResponse.status).toBe(200);
+    expect(gradesSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns no access or grant artifact when pair activation fails", async () => {
+    const active = await importVnu(app);
+    const activePayload = await decryptSession(active.token, SESSION_SECRET);
+    const activePair = descriptorPairFixture(activePayload);
+    const revokedBefore = structuredClone(refreshControl.revokedPairs.get(activePayload.vnuRefresh!.principalKey) ?? []);
+    const mutationCountBefore = refreshControl.mutationCount;
+    refreshControl.failureMode = "outage";
+
+    const response = await requestVnuImport(app);
+    const text = await response.text();
+
+    expect(response.status).toBe(503);
+    expect(JSON.parse(text)).toEqual({
+      data: null,
+      error: {
+        code: "VNU_REFRESH_UNAVAILABLE",
+        message: "VNU reconnect is temporarily unavailable. Try again.",
+        details: { retryAfterSeconds: 5 },
+      },
+    });
+    expect(refreshControl.activePairs.get(activePayload.vnuRefresh!.principalKey)).toEqual(activePair);
+    expect(refreshControl.revokedPairs.get(activePayload.vnuRefresh!.principalKey) ?? []).toEqual(revokedBefore);
+    expect(refreshControl.mutationCount).toBe(mutationCountBefore);
+    for (const privateValue of ["token", "refreshGrant", "session", "SYNTHETIC_VNU_COOKIE", "SYNTHETIC_VNU_USER", "SYNTHETIC_VNU_PASSWORD"]) {
+      expect(text).not.toContain(privateValue);
+    }
+  });
+
+  it("authoritatively revokes the current descriptor pair before successful logout", async () => {
+    const imported = await importVnu(app);
+    const access = await decryptSession(imported.token, SESSION_SECRET);
+    const principalKey = access.vnuRefresh!.principalKey;
+    const pair = descriptorPairFixture(access);
+
+    const logout = await app.handle(new Request("http://localhost/api/vnu/auth/logout", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${imported.token}` },
+    }));
+
+    expect(logout.status).toBe(200);
+    await expect(logout.json()).resolves.toEqual({ data: { authenticated: false }, error: null });
+    expect(refreshControl.activePairs.has(principalKey)).toBe(false);
+    expect(refreshControl.revokedPairs.get(principalKey)).toContainEqual(pair);
+    expect(cache.revocationUrls()).toHaveLength(1);
+
+    const repeatedLogout = await app.handle(new Request("http://localhost/api/vnu/auth/logout", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${imported.token}` },
+    }));
+    expect(repeatedLogout.status).toBe(200);
+    expect(refreshControl.revokedPairs.get(principalKey)).toEqual([pair]);
+
+    gradesSpy = vi.spyOn(DaotaoClient.prototype, "getGradesHtml").mockResolvedValue("<html>UPSTREAM_SHOULD_NOT_RUN</html>");
+    const rejected = await getVnuRawPage(app, imported.token);
+    expect(rejected.status).toBe(401);
+    await expect(rejected.json()).resolves.toEqual({ data: null, error: { code: "SESSION_EXPIRED", message: "Session expired" } });
+    expect(gradesSpy).not.toHaveBeenCalled();
+  });
+
+  it("fails logout atomically when authoritative pair revocation is unavailable", async () => {
+    const imported = await importVnu(app);
+    const access = await decryptSession(imported.token, SESSION_SECRET);
+    const principalKey = access.vnuRefresh!.principalKey;
+    const pair = descriptorPairFixture(access);
+    const mutationCountBefore = refreshControl.mutationCount;
+    refreshControl.failureMode = "outage";
+
+    const logout = await app.handle(new Request("http://localhost/api/vnu/auth/logout", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${imported.token}` },
+    }));
+
+    expect(logout.status).toBe(503);
+    await expect(logout.json()).resolves.toEqual({
+      data: null,
+      error: {
+        code: "VNU_REFRESH_UNAVAILABLE",
+        message: "VNU reconnect is temporarily unavailable. Try again.",
+        details: { retryAfterSeconds: 5 },
+      },
+    });
+    expect(refreshControl.activePairs.get(principalKey)).toEqual(pair);
+    expect(refreshControl.revokedPairs.get(principalKey) ?? []).not.toContainEqual(pair);
+    expect(refreshControl.mutationCount).toBe(mutationCountBefore);
+    expect(cache.revocationUrls()).toEqual([]);
+  });
+
+  it("fails a descriptor-pair mismatch before writing legacy token revocation", async () => {
+    const imported = await importVnu(app);
+    const access = await decryptSession(imported.token, SESSION_SECRET);
+    const principalKey = access.vnuRefresh!.principalKey;
+    const pair = descriptorPairFixture(access);
+    refreshControl.activePairs.set(principalKey, { ...pair, grantId: `${"Z".repeat(21)}A` });
+
+    const logout = await app.handle(new Request("http://localhost/api/vnu/auth/logout", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${imported.token}` },
+    }));
+
+    expect(logout.status).toBe(401);
+    await expect(logout.json()).resolves.toEqual({ data: null, error: { code: "SESSION_EXPIRED", message: "Session expired" } });
+    expect(cache.revocationUrls()).toEqual([]);
+
+    refreshControl.activePairs.set(principalKey, pair);
+    gradesSpy = vi.spyOn(DaotaoClient.prototype, "getGradesHtml").mockResolvedValue("<html>SYNTHETIC_ACTIVE_AFTER_MISMATCH</html>");
+    const stillActive = await getVnuRawPage(app, imported.token);
+    expect(stillActive.status).toBe(200);
+    expect(gradesSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves legacy descriptorless VNU logout revocation without coordinator access", async () => {
+    const legacySession = normalizedVnuSession();
+    const legacyToken = await encryptSession(legacySession, SESSION_SECRET);
+
+    const logout = await app.handle(new Request("http://localhost/api/vnu/auth/logout", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${legacyToken}` },
+    }));
+
+    expect(logout.status).toBe(200);
+    await expect(logout.json()).resolves.toEqual({ data: { authenticated: false }, error: null });
+    expect(cache.revocationUrls()).toHaveLength(1);
+    expect(refreshControl.revocationAttempts).toEqual([]);
+    expect(refreshControl.checks).toEqual([]);
+
+    gradesSpy = vi.spyOn(DaotaoClient.prototype, "getGradesHtml").mockResolvedValue("<html>LEGACY_UPSTREAM_SHOULD_NOT_RUN</html>");
+    const rejected = await getVnuRawPage(app, legacyToken);
+    expect(rejected.status).toBe(401);
+    await expect(rejected.json()).resolves.toEqual({ data: null, error: { code: "SESSION_EXPIRED", message: "Session expired" } });
+    expect(gradesSpy).not.toHaveBeenCalled();
+    expect(refreshControl.revocationAttempts).toEqual([]);
+    expect(refreshControl.checks).toEqual([]);
+  });
+
+  it("preserves an access-only response when no coordinator is installed", async () => {
+    setVnuRefreshControlCoordinator(undefined);
+
+    const response = await requestVnuImport(app);
+    const body = await response.json() as { data: AccessOnlyVnuImportResponse; error: null };
+
+    expect(response.status).toBe(200);
+    expect(Object.keys(body.data).sort()).toEqual(["session", "token"]);
+    await expect(decryptSession(body.data.token, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession());
+  });
+
+  it.each([
+    ["missing internal student ID", `<select name="UnivID"><option value="77" selected>SYNTHETIC FACULTY</option></select>`],
+    ["malformed internal university ID", `<input name="hidStdID" value="99000000001"><select name="UnivID"><option value="MALFORMED" selected>SYNTHETIC FACULTY</option></select>`],
+  ])("returns profile incomplete for %s without exam upstream access", async (_label, profileHtml) => {
+    const imported = await importVnu(app);
+    profileSpy.mockResolvedValueOnce(profileHtml);
+    const examSpy = vi.spyOn(DaotaoClient.prototype, "getExamsHtml");
+
+    const response = await app.handle(new Request("http://localhost/api/vnu/raw/exams?vTermID=SYNTHETIC_TERM", {
+      headers: { Authorization: `Bearer ${imported.token}` },
+    }));
+    const responseText = await response.text();
+
+    expect(response.status).toBe(500);
+    expect(JSON.parse(responseText)).toEqual({
+      data: null,
+      error: { code: "VNU_PROFILE_INCOMPLETE", message: "The university portal profile is incomplete." },
+    });
+    for (const privateValue of ["99000000001", "MALFORMED", "SYNTHETIC FACULTY", "77"]) expect(responseText).not.toContain(privateValue);
+    expect(examSpy).not.toHaveBeenCalled();
+    examSpy.mockRestore();
+  });
+
+  it("returns the exact profile-incomplete envelope for point detail without an own internal ID", async () => {
+    const imported = await importVnu(app);
+    profileSpy.mockResolvedValueOnce(`<input name="StdCode" value="PRIVATE_STUDENT_CODE_SENTINEL">`);
+    const pointSpy = vi.spyOn(DaotaoClient.prototype, "getPointDetailHtml");
+
+    const response = await app.handle(new Request("http://localhost/api/vnu/raw/point-detail?id=PRIVATE_CLASS_ID_SENTINEL&Term=1", {
+      headers: { Authorization: `Bearer ${imported.token}` },
+    }));
+    const responseText = await response.text();
+
+    expect(response.status).toBe(500);
+    expect(JSON.parse(responseText)).toEqual({ data: null, error: { code: "VNU_PROFILE_INCOMPLETE", message: "The university portal profile is incomplete." } });
+    for (const privateValue of ["PRIVATE_STUDENT_CODE_SENTINEL", "PRIVATE_CLASS_ID_SENTINEL"]) expect(responseText).not.toContain(privateValue);
+    expect(pointSpy).not.toHaveBeenCalled();
+    pointSpy.mockRestore();
+  });
+
+  it("returns the exact profile-incomplete envelope when verified import identity is missing", async () => {
+    adapterMocks.importSession.mockResolvedValue({
+      universityId: "vnu",
+      studentCode: undefined,
+      expiresAt: vnuSession().expiresAt,
+      session: vnuSession(),
+    });
+
+    const response = await requestVnuImport(app);
+    const responseText = await response.text();
+
+    expect(response.status).toBe(500);
+    expect(JSON.parse(responseText)).toEqual({
+      data: null,
+      error: { code: "VNU_PROFILE_INCOMPLETE", message: "The university portal profile is incomplete." },
+    });
+    for (const privateValue of [VNU_STUDENT_CODE, "SYNTHETIC_VNU_USER", "SYNTHETIC_VNU_PASSWORD", "SYNTHETIC_VNU_COOKIE"]) {
+      expect(responseText).not.toContain(privateValue);
+    }
   });
 
   it("expires cached responses at their deterministic max-age boundary", async () => {
@@ -491,7 +1321,7 @@ describe("VNU import session cache", () => {
     const first = await importVnu(app);
     const cacheUrl = cache.importUrl();
     expect(cache.store.get(cacheUrl)?.response.headers.get("Cache-Control")).toBe("public, max-age=2");
-    await expect(decryptSession(first.token, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession(expiresAt));
+    await expectIssuedVnuAccess(first.token, normalizedVnuSession(expiresAt));
 
     syntheticTime += 1_999;
     await importVnu(app);
@@ -512,7 +1342,7 @@ describe("VNU import session cache", () => {
 
     expect(cache.store.size).toBe(0);
     expect(adapterMocks.importSession).toHaveBeenCalledTimes(1);
-    await expect(decryptSession(outward.token, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession(expiresAt));
+    await expectIssuedVnuAccess(outward.token, normalizedVnuSession(expiresAt));
   });
 
   it("normalizes verified VNU identity before caching and reuses it on the next import", async () => {
@@ -527,12 +1357,13 @@ describe("VNU import session cache", () => {
     expect(imported.session.studentCode).toBeUndefined();
     expect(firstSession.studentCode).toBe(VNU_STUDENT_CODE);
     expect(cached.session.studentCode).toBe(firstSession.studentCode);
-    await expect(decryptSession(cached.seed, SESSION_SECRET)).resolves.toEqual(firstSession);
+    await expect(decryptSession(cached.seed, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession());
 
     const second = await importVnu(app);
     expect(adapterMocks.importSession).toHaveBeenCalledTimes(1);
     expect(second.session).toEqual(cached.session);
-    await expect(decryptSession(second.token, SESSION_SECRET)).resolves.toEqual(firstSession);
+    const secondSession = await expectIssuedVnuAccess(second.token, normalizedVnuSession());
+    expect(secondSession.vnuRefresh).not.toEqual(firstSession.vnuRefresh);
   });
 
   it("caches an opaque seed and returns a distinct valid token on a cache miss", async () => {
@@ -544,7 +1375,7 @@ describe("VNU import session cache", () => {
     expect(cached.seed).not.toBe(outward.token);
     expect(cached.session).toEqual(outward.session);
     await expect(decryptSession(cached.seed, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession());
-    await expect(decryptSession(outward.token, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession());
+    await expectIssuedVnuAccess(outward.token, normalizedVnuSession());
     expect(Object.keys(cached).sort()).toEqual(["seed", "session"]);
   });
 
@@ -566,7 +1397,8 @@ describe("VNU import session cache", () => {
     expect(second.session).toEqual(cached.session);
     const firstPayload = await decryptSession(first.token, SESSION_SECRET);
     const secondPayload = await decryptSession(second.token, SESSION_SECRET);
-    expect(secondPayload).toEqual(firstPayload);
+    expect(secondPayload).toMatchObject(normalizedVnuSession());
+    expect(secondPayload.vnuRefresh).not.toEqual(firstPayload.vnuRefresh);
     expect(secondPayload.expiresAt).toBe("2099-01-01T00:00:00.000Z");
     expect(await cache.store.get(cacheUrl)!.response.clone().text()).toBe(bytesBefore);
     expect(cache.store.get(cacheUrl)!.expiresAt).toBe(storedBefore.expiresAt);
@@ -598,11 +1430,11 @@ describe("VNU import session cache", () => {
     expect(repaired.token).not.toBe(replacement.seed);
     expect(cachedRelogin.token).not.toBe(replacement.seed);
     expect(cachedRelogin.token).not.toBe(repaired.token);
-    await expect(decryptSession(first.token, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession());
+    await expectIssuedVnuAccess(first.token, normalizedVnuSession());
     const normalizedRepaired = { ...repairedSession, studentCode: VNU_STUDENT_CODE };
-    await expect(decryptSession(repaired.token, SESSION_SECRET)).resolves.toEqual(normalizedRepaired);
+    await expectIssuedVnuAccess(repaired.token, normalizedRepaired);
     await expect(decryptSession(replacement.seed, SESSION_SECRET)).resolves.toEqual(normalizedRepaired);
-    await expect(decryptSession(cachedRelogin.token, SESSION_SECRET)).resolves.toEqual(normalizedRepaired);
+    await expectIssuedVnuAccess(cachedRelogin.token, normalizedRepaired);
   });
 
   it("repairs a cache hit when the real profile client receives a standalone HTTP 200 expiry notice", async () => {
@@ -625,7 +1457,7 @@ describe("VNU import session cache", () => {
 
     const response = await requestVnuImport(app);
     const responseText = await response.text();
-    const payload = JSON.parse(responseText) as { data: VnuImportResponse; error: null };
+    const payload = JSON.parse(responseText) as { data: CoordinatorVnuImportResponse; error: null };
     const replacement = await cache.importEntry();
 
     expect(response.status).toBe(200);
@@ -638,7 +1470,7 @@ describe("VNU import session cache", () => {
     expect(adapterMocks.importSession).toHaveBeenCalledTimes(2);
     expect(replacement.seed).not.toBe(oldCached.seed);
     const normalizedRepaired = { ...repairedSession, studentCode: VNU_STUDENT_CODE };
-    await expect(decryptSession(payload.data.token, SESSION_SECRET)).resolves.toEqual(normalizedRepaired);
+    await expectIssuedVnuAccess(payload.data.token, normalizedRepaired);
     await expect(decryptSession(replacement.seed, SESSION_SECRET)).resolves.toEqual(normalizedRepaired);
     expect(replacement.session).toEqual(payload.data.session);
     expect(responseText).not.toContain(expiryNoticeSentinel);
@@ -703,7 +1535,7 @@ describe("VNU import session cache", () => {
     expect(gradesSpy).not.toHaveBeenCalled();
   });
 
-  it("uses separate raw-cache keys for old and repaired VNU cookies", async () => {
+  it("rejects the replaced access pair before raw-cache or upstream access", async () => {
     const repairedSession: EncryptedSessionPayload = {
       ...vnuSession(),
       vnu: { kind: "cookie", value: "REPAIRED_SYNTHETIC_VNU_COOKIE", expiresAt: "2099-01-01T00:00:00.000Z" },
@@ -725,11 +1557,10 @@ describe("VNU import session cache", () => {
     expect(oldPayload.vnu?.value).toBe("SYNTHETIC_VNU_COOKIE");
     expect(repairedPayload.vnu?.value).toBe("REPAIRED_SYNTHETIC_VNU_COOKIE");
     expect(oldPayload.vnu?.value).not.toBe(repairedPayload.vnu?.value);
-    expect(oldResponse.status).toBe(200);
+    expect(oldResponse.status).toBe(401);
     expect(repairedResponse.status).toBe(200);
-    expect(rawUrls).toHaveLength(2);
-    expect(new Set(rawUrls).size).toBe(2);
-    expect(gradesSpy).toHaveBeenCalledTimes(2);
+    expect(rawUrls).toHaveLength(1);
+    expect(gradesSpy).toHaveBeenCalledTimes(1);
   });
 
   it.each([
@@ -752,7 +1583,7 @@ describe("VNU import session cache", () => {
     expect(adapterMocks.importSession).toHaveBeenCalledTimes(2);
     expect(replacement.seed).not.toBe(oldCached.seed);
     const normalizedRepaired = { ...repairedSession, studentCode: VNU_STUDENT_CODE };
-    await expect(decryptSession(recovered.token, SESSION_SECRET)).resolves.toEqual(normalizedRepaired);
+    await expectIssuedVnuAccess(recovered.token, normalizedRepaired);
     await expect(decryptSession(replacement.seed, SESSION_SECRET)).resolves.toEqual(normalizedRepaired);
   });
 
@@ -849,7 +1680,7 @@ describe("VNU import session cache", () => {
     const recovered = await importVnu(app);
 
     expect(adapterMocks.importSession).toHaveBeenCalledTimes(1);
-    await expect(decryptSession(recovered.token, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession());
+    await expectIssuedVnuAccess(recovered.token, normalizedVnuSession());
     const replacement = await cache.importEntry();
     expect(Object.keys(replacement).sort()).toEqual(["seed", "session"]);
     expect(replacement.session).toEqual(recovered.session);
@@ -860,7 +1691,7 @@ describe("VNU import session cache", () => {
     expect(cachedRelogin.token).not.toBe(recovered.token);
     expect(cachedRelogin.token).not.toBe(replacement.seed);
     expect(cachedRelogin.session).toEqual(recovered.session);
-    await expect(decryptSession(cachedRelogin.token, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession());
+    await expectIssuedVnuAccess(cachedRelogin.token, normalizedVnuSession());
   });
 
   it.each([
@@ -888,7 +1719,7 @@ describe("VNU import session cache", () => {
     expect(cachedRelogin.token).not.toBe(recovered.token);
     expect(cachedRelogin.token).not.toBe(replacement.seed);
     expect(cachedRelogin.session).toEqual(recovered.session);
-    await expect(decryptSession(cachedRelogin.token, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession());
+    await expectIssuedVnuAccess(cachedRelogin.token, normalizedVnuSession());
   });
 
   it("falls back to upstream login when the cache read fails", async () => {
@@ -897,7 +1728,7 @@ describe("VNU import session cache", () => {
     const outward = await importVnu(app);
 
     expect(adapterMocks.importSession).toHaveBeenCalledTimes(1);
-    await expect(decryptSession(outward.token, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession());
+    await expectIssuedVnuAccess(outward.token, normalizedVnuSession());
   });
 
   it("returns the normal response when the cache write fails", async () => {
@@ -906,7 +1737,7 @@ describe("VNU import session cache", () => {
     const outward = await importVnu(app);
 
     expect(adapterMocks.importSession).toHaveBeenCalledTimes(1);
-    await expect(decryptSession(outward.token, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession());
+    await expectIssuedVnuAccess(outward.token, normalizedVnuSession());
     expect(cache.store.size).toBe(0);
   });
 });
@@ -1050,10 +1881,12 @@ describe("VNU cross-transcript route", () => {
     profileSpy.mockResolvedValue(`<input name="hidStdID" value="not-a-number"><input name="StdCode" value="20000000">`);
 
     const response = await authorizedRequest(query, route);
+    const responseText = await response.text();
 
-    expect(response.status).toBe(401);
+    expect(response.status).toBe(500);
     expect(response.headers.get("Cache-Control")).toBe("no-store");
-    await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_LOGIN_REQUIRED" } });
+    expect(JSON.parse(responseText)).toEqual({ data: null, error: { code: "VNU_PROFILE_INCOMPLETE", message: "The university portal profile is incomplete." } });
+    for (const privateValue of ["not-a-number", "20000000"]) expect(responseText).not.toContain(privateValue);
     expect(probeBudget.count).toBe(0);
     expect(transcriptSpy).not.toHaveBeenCalled();
   });
@@ -1062,9 +1895,37 @@ describe("VNU cross-transcript route", () => {
     profileSpy.mockResolvedValue(`<input name="hidStdID" value="not-a-number"><input name="StdCode" value="20000000">`);
 
     const response = await bulkRequest({ mode: "stdid-to-code", targets: ["1002"], allowCrossLookup: true });
+    const responseText = await response.text();
 
-    expect(response.status).toBe(401);
-    await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_LOGIN_REQUIRED" } });
+    expect(response.status).toBe(500);
+    expect(JSON.parse(responseText)).toEqual({ data: null, error: { code: "VNU_PROFILE_INCOMPLETE", message: "The university portal profile is incomplete." } });
+    for (const privateValue of ["not-a-number", "20000000"]) expect(responseText).not.toContain(privateValue);
+    expect(probeBudget.count).toBe(0);
+    expect(transcriptSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns profile incomplete when a required own student code is missing", async () => {
+    profileSpy.mockResolvedValue(`<input name="hidStdID" value="1000">`);
+
+    const response = await authorizedRequest("stdCode=20000001&allowCrossLookup=true", "student-id");
+    const responseText = await response.text();
+
+    expect(response.status).toBe(500);
+    expect(JSON.parse(responseText)).toEqual({ data: null, error: { code: "VNU_PROFILE_INCOMPLETE", message: "The university portal profile is incomplete." } });
+    for (const privateValue of ["1000", "20000001"]) expect(responseText).not.toContain(privateValue);
+    expect(probeBudget.count).toBe(0);
+    expect(transcriptSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns the exact profile-incomplete envelope when bulk mode requires a missing own student code", async () => {
+    profileSpy.mockResolvedValue(`<input name="hidStdID" value="1000">`);
+
+    const response = await bulkRequest({ mode: "code-to-stdid", targets: ["20000001"], allowCrossLookup: true });
+    const responseText = await response.text();
+
+    expect(response.status).toBe(500);
+    expect(JSON.parse(responseText)).toEqual({ data: null, error: { code: "VNU_PROFILE_INCOMPLETE", message: "The university portal profile is incomplete." } });
+    for (const privateValue of ["1000", "20000001"]) expect(responseText).not.toContain(privateValue);
     expect(probeBudget.count).toBe(0);
     expect(transcriptSpy).not.toHaveBeenCalled();
   });
@@ -1351,7 +2212,7 @@ describe("VNU cross-transcript route", () => {
 
       profileSpy.mockResolvedValueOnce("<html>no profile identity</html>");
       const noProfile = await bulkRequest({ mode: "stdid-to-code", targets: ["1001"], allowCrossLookup: true });
-      expect(noProfile.status).toBe(401);
+      expect(noProfile.status).toBe(500);
       expect(transcriptSpy).not.toHaveBeenCalled();
       expect(probeBudget.count).toBe(0);
     });

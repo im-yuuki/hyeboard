@@ -43,6 +43,10 @@ const university: University = {
   },
 };
 
+function incompleteVnuProfile(): HyeboardError {
+  return new HyeboardError("VNU_PROFILE_INCOMPLETE", "The university portal profile is incomplete.", 500);
+}
+
 function client(request: AdapterRequest): DaotaoClient {
   return new DaotaoClient(request.session);
 }
@@ -59,10 +63,11 @@ export function createVnuAdapter(): UniversityAdapter {
   return {
     university,
     async importSession(input: LoginImportInput): Promise<ImportedSession> {
-      if (!input.vnuUsername || !input.vnuPassword) {
+      const normalizedUsername = input.vnuUsername?.trim().toLowerCase();
+      if (!normalizedUsername || !input.vnuPassword) {
         throw new HyeboardError("MISSING_UPSTREAM_CREDENTIAL", "Provide your university portal username and password.", 400);
       }
-      const cookie = await new DaotaoClient().login(input.vnuUsername, input.vnuPassword);
+      const cookie = await new DaotaoClient().login(normalizedUsername, input.vnuPassword);
       const expiresAt = addHours(8);
       const session: EncryptedSessionPayload = {
         version: 1,
@@ -81,7 +86,7 @@ export function createVnuAdapter(): UniversityAdapter {
         throw new HyeboardError("INVALID_VNU_CREDENTIAL", "daotao.vnu.edu.vn rejected this username or password, or the returned session expired immediately.", 401);
       }
       if (!profile.studentCode) {
-        throw new HyeboardError("INVALID_VNU_CREDENTIAL", "daotao.vnu.edu.vn accepted the request but did not return a student profile. Check the credentials and try again.", 401);
+        throw incompleteVnuProfile();
       }
       return { universityId: "vnu", studentCode: profile.studentCode, expiresAt, session };
     },
@@ -139,8 +144,8 @@ export function createVnuAdapter(): UniversityAdapter {
     async getExams(request) {
       const daotao = client(request);
       const profile = parseProfileHtml(await daotao.getProfileHtml());
-      if (!profile.internalStudentId || !profile.internalUnivId) {
-        throw new HyeboardError("VNU_PROFILE_INCOMPLETE", "The university portal did not return enough profile data to look up exams.", 500);
+      if (!/^\d{1,11}$/.test(profile.internalStudentId ?? "") || !/^\d+$/.test(profile.internalUnivId ?? "")) {
+        throw incompleteVnuProfile();
       }
       const baseHtml = await daotao.getExamBaseHtml();
       const termOptions = parseExamTermOptions(baseHtml);
@@ -149,7 +154,7 @@ export function createVnuAdapter(): UniversityAdapter {
         ? termOptions.find((o) => o.label.startsWith(`${requestedTerm}.`))
         : (termOptions.find((o) => o.selected) ?? termOptions[0]);
       if (!option) return [];
-      const html = await daotao.getExamsHtml({ selUniv: profile.internalUnivId, selStd: profile.internalStudentId, vTermID: option.value });
+      const html = await daotao.getExamsHtml({ selUniv: profile.internalUnivId!, selStd: profile.internalStudentId!, vTermID: option.value });
       return parseExamsHtml(html).map(mapExamRow);
     },
     async getAttendance() {

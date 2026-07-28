@@ -241,10 +241,23 @@ export const authSessionSchema = z.object({
   authenticated: z.boolean(),
 });
 
+export const apiErrorDetailsSchema = z.object({
+  reason: z.literal("MISSING_VNU_CREDENTIAL").optional(),
+  retryAfterSeconds: z.number().int().positive().optional(),
+  limit: z.number().int().positive().optional(),
+  windowSeconds: z.number().int().positive().optional(),
+}).strict();
+
+export const authResultSchema = z.object({
+  token: z.string().min(1),
+  refreshGrant: z.string().min(1).optional(),
+  session: authSessionSchema,
+}).strict();
+
 export const apiErrorSchema = z.object({
   code: z.string(),
   message: z.string(),
-  details: z.unknown().optional(),
+  details: apiErrorDetailsSchema.optional(),
 });
 
 export const apiResponseSchema = <T extends z.ZodType>(data: T) =>
@@ -272,5 +285,9 @@ export type TrainingPoint = z.infer<typeof trainingPointSchema>;
 export type ServiceRequest = z.infer<typeof serviceRequestSchema>;
 export type DashboardSummary = z.infer<typeof dashboardSummarySchema>;
 export type AuthSession = z.infer<typeof authSessionSchema>;
-export type ApiError = z.infer<typeof apiErrorSchema>;
+export type ApiErrorDetails = z.infer<typeof apiErrorDetailsSchema>;
+export type AuthResult = z.infer<typeof authResultSchema>;
+// Internal errors intentionally retain unknown details. JSON boundaries parse
+// the full value through apiErrorDetailsSchema before exposing it on the wire.
+export type ApiError = { code: string; message: string; details?: unknown };
 export type ApiResponse<T> = { data: T | null; error: ApiError | null; meta?: Record<string, unknown> };

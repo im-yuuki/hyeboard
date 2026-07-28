@@ -1,5 +1,6 @@
 import { cors } from "@elysiajs/cors";
-import { decryptSession, encryptSession, fail, getLogger, HyeboardError, isExpired, ok, parseBearerToken, type EncryptedSessionPayload } from "@hyeboard/core";
+import { createVnuRefreshAccessDescriptor, createVnuRefreshGrant, decryptSession, encryptSession, encryptVnuRefreshGrant, fail, getLogger, HyeboardError, isExpired, ok, parseBearerToken, type EncryptedSessionPayload, type VnuRefreshAccessDescriptor } from "@hyeboard/core";
+import { apiErrorDetailsSchema, type AuthResult } from "@hyeboard/schemas";
 import { DaotaoClient, getAdapter, isDaotaoSessionExpired, listUniversities, parseProfileHtml, parseTranscriptHeader, parseTranscriptHtml, type BrowserBinding, type BrowserConnection, type VnuTranscript } from "@hyeboard/university-adapters";
 import { Elysia, t } from "elysia";
 import { LocalCaptchaRelayCoordinator, captchaRelayCancelled, captchaRelayNotFound, type CaptchaRelayCoordinator, type PreparedCaptchaRelay } from "./captcha-relay";
@@ -150,11 +151,23 @@ async function getSession(headers: Headers | Record<string, string | undefined>)
   const h = headers instanceof Headers ? headers : new Headers(headers as Record<string, string>);
   const token = parseBearerToken(h.get("Authorization"));
   if (!token) throw new HyeboardError("MISSING_SESSION", "Missing Authorization bearer token", 401);
-  if (await isTokenRevoked(token)) throw new HyeboardError("SESSION_EXPIRED", "Session expired", 401);
-  return decryptSession(token, getSessionSecret());
+  return resolveOrdinaryAccessToken(token);
 }
 
 type ResolvedSession = { session: EncryptedSessionPayload; refreshedToken?: string };
+
+function missingVnuCredential(): HyeboardError {
+  return new HyeboardError(
+    "VNU_LOGIN_REQUIRED",
+    "VNU data needs an active university portal credential.",
+    401,
+    { reason: "MISSING_VNU_CREDENTIAL" },
+  );
+}
+
+function incompleteVnuProfile(): HyeboardError {
+  return new HyeboardError("VNU_PROFILE_INCOMPLETE", "The university portal profile is incomplete.", 500);
+}
 
 // Lazy, per-request refresh (no background jobs/Durable Object alarms — see
 // spec's "lazy on next API call" decision). Only uet sessions created via
@@ -166,8 +179,7 @@ export async function resolveSession(headers: Headers | Record<string, string | 
   const h = headers instanceof Headers ? headers : new Headers(headers as Record<string, string>);
   const token = parseBearerToken(h.get("Authorization"));
   if (!token) throw new HyeboardError("MISSING_SESSION", "Missing Authorization bearer token", 401);
-  if (await isTokenRevoked(token)) throw new HyeboardError("SESSION_EXPIRED", "Session expired", 401);
-  const session = await decryptSession(token, getSessionSecret());
+  const session = await resolveOrdinaryAccessToken(token);
 
   if (session.universityId !== "uet" || (!session.uetGoogleCredential && !session.uetParentCredential)) return { session };
   const studenthubExpiresAt = session.studenthub?.expiresAt;
@@ -214,6 +226,36 @@ export async function resolveSession(headers: Headers | Record<string, string | 
   }
 }
 
+function descriptorPair(descriptor: VnuRefreshAccessDescriptor) {
+  return {
+    accessTokenId: descriptor.accessTokenId,
+    accessExpiresAt: Date.parse(descriptor.accessExpiresAt),
+    grantId: descriptor.grantId,
+    grantExpiresAt: Date.parse(descriptor.grantExpiresAt),
+  };
+}
+
+async function resolveOrdinaryAccessToken(token: string): Promise<EncryptedSessionPayload> {
+  const session = await decryptSession(token, getSessionSecret());
+  if (session.universityId === "vnu" && !session.vnu?.value) throw missingVnuCredential();
+  const descriptor = session.vnuRefresh;
+  if (!descriptor) {
+    if (await isTokenRevoked(token)) throw new HyeboardError("SESSION_EXPIRED", "Session expired", 401);
+    return session;
+  }
+
+  try {
+    const result = await requireVnuRefreshControlCoordinator().checkAccess(descriptor.principalKey, descriptorPair(descriptor));
+    if (result.kind === "revoked") throw new HyeboardError("SESSION_EXPIRED", "Session expired", 401);
+    return session;
+  } catch (error) {
+    if (error instanceof HyeboardError && error.code === "SESSION_EXPIRED") throw error;
+    const unavailable = vnuRefreshUnavailable();
+    getLogger().error({ operation: "access-authority", code: unavailable.code, status: unavailable.status }, "VNU session authority check failed");
+    throw unavailable;
+  }
+}
+
 // ─── Error handling ───────────────────────────────────────────
 
 // Shared with the SSE import-session branch below, which can't rely on
@@ -233,11 +275,31 @@ function routeError(error: unknown, requestId?: string, requestUrl?: string) {
   const id = requestId ?? "-";
   const log = getLogger();
   const headers = new Headers({ "Content-Type": "application/json" });
-  if (requestUrl && new URL(requestUrl).pathname.startsWith("/api/vnu/cross-lookup/")) headers.set("Cache-Control", "no-store");
+  const requestPath = requestUrl ? new URL(requestUrl).pathname : undefined;
+  const isVnuRoute = requestPath?.startsWith("/api/vnu/") ?? false;
+  if (requestPath?.startsWith("/api/vnu/cross-lookup/")) headers.set("Cache-Control", "no-store");
   if (error instanceof HyeboardError) {
     const level = error.status >= 500 ? "error" : "warn";
-    log[level]({ reqId: id, code: error.code, status: error.status }, error.message);
-    return new Response(JSON.stringify(fail(error.code, error.message, error.details)), { status: error.status, headers });
+    if (isVnuRoute) log[level]({ operation: "route", code: error.code, status: error.status }, "VNU request failed");
+    else log[level]({ reqId: id, code: error.code, status: error.status }, error.message);
+    const parsedDetails = apiErrorDetailsSchema.safeParse(error.details);
+    return new Response(JSON.stringify(fail(error.code, error.message, parsedDetails.success ? parsedDetails.data : undefined)), { status: error.status, headers });
+  }
+  if (isVnuRoute) {
+    const trustedFrameworkErrors = new Map<string, number>([["VALIDATION", 422], ["PARSE", 400], ["NOT_FOUND", 404]]);
+    const candidateCode = error instanceof Error && "code" in error && typeof (error as { code?: unknown }).code === "string"
+      ? (error as { code: string }).code
+      : undefined;
+    const candidateStatus = error instanceof Error && "status" in error && typeof (error as { status?: unknown }).status === "number"
+      ? (error as { status: number }).status
+      : undefined;
+    const trustedFrameworkError = candidateCode !== undefined && trustedFrameworkErrors.get(candidateCode) === candidateStatus;
+    const status = trustedFrameworkError ? candidateStatus! : 500;
+    const code = trustedFrameworkError ? candidateCode! : "INTERNAL_ERROR";
+    const level = status >= 500 ? "error" : "warn";
+    log[level]({ operation: "route", code, status }, "VNU request failed");
+    const message = status < 500 ? "The request was invalid. Check the fields you submitted and try again." : "Unexpected API error";
+    return new Response(JSON.stringify(fail(code, message)), { status, headers });
   }
   // Elysia's own error classes (ValidationError, ParseError, NotFoundError,
   // InternalServerError) are plain Errors with .code/.status, not
@@ -342,31 +404,31 @@ type VnuOwnIdentity = { ownStdId: number; ownCode?: number };
 // Parse, don't validate: the session owner's portal identity is parsed into
 // trusted positive integers exactly once, at this boundary, and every cross
 // route below consumes only that result. A malformed profile value fails
-// closed here with VNU_LOGIN_REQUIRED instead of slipping past a self-target
+// closed here with VNU_PROFILE_INCOMPLETE instead of slipping past a self-target
 // guard through NaN semantics — Number(garbage) is NaN, NaN === NaN is false,
 // so a raw Number() comparison can never be trusted as a guard.
 function parseVnuOwnIdentity(
   profile: { internalStudentId?: string; studentCode?: string },
-  options: { requireStudentCode: true; errorMessage: string },
+  options: { requireStudentCode: true },
 ): { ownStdId: number; ownCode: number };
 function parseVnuOwnIdentity(
   profile: { internalStudentId?: string; studentCode?: string },
-  options: { requireStudentCode: boolean; errorMessage: string },
+  options: { requireStudentCode: boolean },
 ): VnuOwnIdentity;
 function parseVnuOwnIdentity(
   profile: { internalStudentId?: string; studentCode?: string },
-  options: { requireStudentCode: boolean; errorMessage: string },
+  options: { requireStudentCode: boolean },
 ): VnuOwnIdentity {
   const stdIdText = profile.internalStudentId ?? "";
   const ownStdId = Number(stdIdText);
   const stdIdValid = VNU_PORTAL_STD_ID_PATTERN.test(stdIdText) && Number.isSafeInteger(ownStdId) && ownStdId > 0;
-  if (!stdIdValid) throw new HyeboardError("VNU_LOGIN_REQUIRED", options.errorMessage, 401);
+  if (!stdIdValid) throw incompleteVnuProfile();
 
   const codeText = profile.studentCode ?? "";
   const ownCode = Number(codeText);
   const codeValid = VNU_PORTAL_STUDENT_CODE_PATTERN.test(codeText) && Number.isSafeInteger(ownCode) && ownCode > 0;
   if (codeValid) return { ownStdId, ownCode };
-  if (options.requireStudentCode) throw new HyeboardError("VNU_LOGIN_REQUIRED", options.errorMessage, 401);
+  if (options.requireStudentCode) throw incompleteVnuProfile();
   return { ownStdId };
 }
 
@@ -609,7 +671,7 @@ function requireVnuRefreshControlCoordinator(): VnuRefreshControlCoordinator {
 }
 
 async function vnuProbeBudgetKey(session: EncryptedSessionPayload): Promise<string> {
-  if (session.universityId !== "vnu" || !session.vnu?.value) throw new HyeboardError("VNU_LOGIN_REQUIRED", "VNU lookup probes need an active daotao.vnu.edu.vn session. Sign in again.", 401);
+  if (session.universityId !== "vnu" || !session.vnu?.value) throw missingVnuCredential();
   return hmacHex(`${session.vnu.value}\n${session.expiresAt}`);
 }
 
@@ -626,7 +688,7 @@ async function reserveVnuOracleProbes(session: EncryptedSessionPayload, amount: 
 }
 
 async function vnuImportCacheKey(username: string, password: string): Promise<string> {
-  return `vnu/import/${await hmacHex(`${username.trim()}\n${password}`)}`;
+  return `vnu/import/${await hmacHex(`${username}\n${password}`)}`;
 }
 
 type AuthenticatedSessionMetadata = {
@@ -687,6 +749,42 @@ async function restoreCachedVnuImport(value: unknown, secret: string): Promise<R
   }
 }
 
+async function issueVnuAuthResult(input: {
+  username: string;
+  password: string;
+  payload: EncryptedSessionPayload;
+  session: AuthenticatedSessionMetadata;
+  secret: string;
+}): Promise<AuthResult> {
+  const coordinator = vnuRefreshControlCoordinator;
+  if (!coordinator) return { token: await encryptSession(input.payload, input.secret), session: input.session };
+
+  const expectedStudentCode = input.payload.studentCode;
+  if (!expectedStudentCode) throw incompleteVnuProfile();
+
+  const grant = createVnuRefreshGrant({ username: input.username, password: input.password, expectedStudentCode });
+  const descriptor = await createVnuRefreshAccessDescriptor({
+    username: input.username,
+    grantId: grant.grantId,
+    accessExpiresAt: input.payload.expiresAt,
+    grantExpiresAt: grant.expiresAt,
+    secret: input.secret,
+  });
+  const [token, refreshGrant] = await Promise.all([
+    encryptSession({ ...input.payload, vnuRefresh: descriptor }, input.secret),
+    encryptVnuRefreshGrant(grant, input.secret),
+  ]);
+
+  try {
+    await coordinator.activatePair(descriptor.principalKey, descriptorPair(descriptor));
+  } catch {
+    const unavailable = vnuRefreshUnavailable();
+    getLogger().error({ operation: "manual-import-activation", code: unavailable.code, status: unavailable.status }, "VNU refresh pair activation failed");
+    throw unavailable;
+  }
+  return { token, refreshGrant, session: input.session };
+}
+
 // ── Google-login rate limiting + token revocation ───────────────────────
 
 const GOOGLE_LOGIN_RATE_LIMIT = 5;
@@ -728,7 +826,7 @@ async function vnuRawCacheKey(session: EncryptedSessionPayload, page: string, pa
 }
 
 async function vnuRawHtml(session: EncryptedSessionPayload, page: string, params: { selUniv?: string; selStd?: string; vTermID?: string; id?: string; val?: string; Term?: string }): Promise<string> {
-  if (!session.vnu?.value) throw new HyeboardError("VNU_LOGIN_REQUIRED", "VNU (daotao) data needs a saved daotao.vnu.edu.vn session. Sign in again.", 401);
+  if (!session.vnu?.value) throw missingVnuCredential();
   // Client-supplied selStd/selUniv are never trusted for any key: per-student
   // branches below derive both ids from the session's own profile. Strip them
   // before cache keying too, so a smuggled value cannot even fragment this
@@ -762,8 +860,8 @@ async function vnuRawHtml(session: EncryptedSessionPayload, page: string, params
     // lives only on the gated cross-lookup routes. The profile read reuses
     // this same cached path, keyed per session cookie.
     const ownProfile = parseProfileHtml(await vnuRawHtml(session, "profile", {}));
-    if (!ownProfile.internalStudentId || !ownProfile.internalUnivId) throw new HyeboardError("VNU_LOGIN_REQUIRED", "VNU (daotao) exam lookup needs your own portal student id, which this session could not provide. Sign in again.", 401);
-    html = await client.getExamsHtml({ selUniv: ownProfile.internalUnivId, selStd: ownProfile.internalStudentId, vTermID: trustedParams.vTermID });
+    if (!VNU_PORTAL_STD_ID_PATTERN.test(ownProfile.internalStudentId ?? "") || !/^\d+$/.test(ownProfile.internalUnivId ?? "")) throw incompleteVnuProfile();
+    html = await client.getExamsHtml({ selUniv: ownProfile.internalUnivId!, selStd: ownProfile.internalStudentId!, vTermID: trustedParams.vTermID });
   } else if (page === "point-detail") {
     if (!trustedParams.id || !trustedParams.Term) throw new HyeboardError("VNU_POINT_DETAIL_QUERY_INCOMPLETE", "Point detail needs a class id and a term ordinal.", 400);
     // The StdID sent upstream is ALWAYS the session owner's own internal id,
@@ -773,8 +871,8 @@ async function vnuRawHtml(session: EncryptedSessionPayload, page: string, params
     // allow (see har-notes.md). The profile read reuses this same cached
     // path, keyed per session cookie.
     const ownProfile = parseProfileHtml(await vnuRawHtml(session, "profile", {}));
-    if (!ownProfile.internalStudentId) throw new HyeboardError("VNU_LOGIN_REQUIRED", "VNU (daotao) point detail needs your own portal student id, which this session could not provide. Sign in again.", 401);
-    html = await client.getPointDetailHtml({ id: trustedParams.id, stdId: ownProfile.internalStudentId, term: trustedParams.Term, val: trustedParams.val });
+    if (!VNU_PORTAL_STD_ID_PATTERN.test(ownProfile.internalStudentId ?? "")) throw incompleteVnuProfile();
+    html = await client.getPointDetailHtml({ id: trustedParams.id, stdId: ownProfile.internalStudentId!, term: trustedParams.Term, val: trustedParams.val });
   } else {
     throw new HyeboardError("VNU_RAW_PAGE_UNKNOWN", `Unknown VNU raw page: ${page}`, 404);
   }
@@ -949,19 +1047,22 @@ export function createApp(adapter: any) {
         });
       }
       if (params.universityId === "vnu" && body.vnuUsername && body.vnuPassword) {
-        const cacheKey = await vnuImportCacheKey(body.vnuUsername, body.vnuPassword);
+        const username = body.vnuUsername.trim().toLowerCase();
+        const password = body.vnuPassword;
+        const normalizedBody = { ...body, vnuUsername: username, vnuPassword: password };
+        const cacheKey = await vnuImportCacheKey(username, password);
         const secret = getSessionSecret();
         const loginAndCache = async () => {
-          const imported = await adapterInstance.importSession(body);
+          const imported = await adapterInstance.importSession(normalizedBody);
           const normalizedSession: EncryptedSessionPayload = {
             ...imported.session,
             studentCode: imported.studentCode ?? imported.session.studentCode,
           };
+          if (!normalizedSession.studentCode) throw incompleteVnuProfile();
           const seed = await encryptSession(normalizedSession, secret);
-          const token = await encryptSession(normalizedSession, secret);
-          const payload = { token, session: { universityId: normalizedSession.universityId, studentCode: normalizedSession.studentCode, expiresAt: normalizedSession.expiresAt, authenticated: true as const } };
-          await cachePut(cacheKey, { seed, session: payload.session }, Math.floor((Date.parse(normalizedSession.expiresAt) - Date.now()) / 1000));
-          return ok(payload);
+          const session = { universityId: normalizedSession.universityId, studentCode: normalizedSession.studentCode, expiresAt: normalizedSession.expiresAt, authenticated: true as const };
+          await cachePut(cacheKey, { seed, session }, Math.floor((Date.parse(normalizedSession.expiresAt) - Date.now()) / 1000));
+          return ok(await issueVnuAuthResult({ username, password, payload: normalizedSession, session, secret }));
         };
 
         const cached = await restoreCachedVnuImport(await cacheGet<unknown>(cacheKey), secret);
@@ -977,8 +1078,7 @@ export function createApp(adapter: any) {
 
         if (!liveStudentCode || liveStudentCode !== cached.payload.studentCode || liveStudentCode !== cached.session.studentCode) return loginAndCache();
 
-        const token = await encryptSession(cached.payload, secret);
-        return ok({ token, session: cached.session });
+        return ok(await issueVnuAuthResult({ username, password, payload: cached.payload, session: cached.session, secret }));
       }
       const imported = await adapterInstance.importSession(body);
       const token = await encryptSession(imported.session, getSessionSecret());
@@ -1003,14 +1103,33 @@ export function createApp(adapter: any) {
     .post("/api/:universityId/auth/logout", async ({ headers }) => {
       const h = headers instanceof Headers ? headers : new Headers(headers as Record<string, string>);
       const token = parseBearerToken(h.get("Authorization"));
-      if (token) {
-        try {
-          const session = await decryptSession(token, getSessionSecret());
-          await revokeToken(token, session.expiresAt);
-        } catch {
-          // Already invalid/expired token — nothing to revoke.
-        }
+      if (!token) return ok({ authenticated: false });
+
+      let session: EncryptedSessionPayload;
+      try {
+        session = await decryptSession(token, getSessionSecret());
+      } catch {
+        // Already invalid/expired token — nothing to revoke. Expired
+        // descriptor handling belongs to the dedicated Task4 logout contract.
+        return ok({ authenticated: false });
       }
+
+      if (session.vnuRefresh) {
+        const descriptor = session.vnuRefresh;
+        let result: "revoked" | "mismatch" | "expired";
+        try {
+          result = await requireVnuRefreshControlCoordinator().revokeLinkedPairByAccess(
+            descriptor.principalKey,
+            descriptorPair(descriptor),
+          );
+        } catch (error) {
+          if (error instanceof HyeboardError && error.code === "VNU_REFRESH_UNAVAILABLE") throw error;
+          throw vnuRefreshUnavailable();
+        }
+        if (result !== "revoked") throw new HyeboardError("SESSION_EXPIRED", "Session expired", 401);
+      }
+
+      await revokeToken(token, session.expiresAt);
       return ok({ authenticated: false });
     })
     .get("/api/vnu/raw/:page", async ({ headers, params, query }) => {
@@ -1041,7 +1160,6 @@ export function createApp(adapter: any) {
       // unverified (see parseVnuOwnIdentity).
       const ownIdentity = parseVnuOwnIdentity(parseProfileHtml(await vnuRawHtml(session, "profile", {})), {
         requireStudentCode: false,
-        errorMessage: "VNU (daotao) cross-lookup needs your own portal student id, which this session could not provide. Sign in again.",
       });
       if (isOwnStdId(ownIdentity, query.stdId)) throw new HyeboardError("VNU_CROSS_LOOKUP_SELF_TARGET", "That is your own student id. Your own ID mapping is on the Lookup page; cross-lookup is only for other students.", 400);
       await reserveVnuOracleProbes(session, 1);
@@ -1066,7 +1184,6 @@ export function createApp(adapter: any) {
       if (!query.stdCode || !/^\d{8}$/.test(query.stdCode)) throw new HyeboardError("VNU_CROSS_LOOKUP_QUERY_INCOMPLETE", "Cross-student student-id lookup needs a target 8-digit student code.", 400);
       const ownIdentity = parseVnuOwnIdentity(parseProfileHtml(await vnuRawHtml(session, "profile", {})), {
         requireStudentCode: true,
-        errorMessage: "VNU (daotao) cross-lookup needs your own portal student id and code, which this session could not provide. Sign in again.",
       });
       if (isOwnStudentCode(ownIdentity, query.stdCode)) throw new HyeboardError("VNU_CROSS_LOOKUP_SELF_TARGET", "That is your own student code. Your own ID mapping is on the Lookup page; cross-lookup is only for other students.", 400);
 
@@ -1100,7 +1217,6 @@ export function createApp(adapter: any) {
 
       const ownIdentity = parseVnuOwnIdentity(parseProfileHtml(await vnuRawHtml(session, "profile", {})), {
         requireStudentCode: true,
-        errorMessage: "VNU (daotao) cross-lookup needs your own portal student id and code, which this session could not provide. Sign in again.",
       });
       if (hasStdId && isOwnStdId(ownIdentity, query.stdId!)) throw new HyeboardError("VNU_CROSS_LOOKUP_SELF_TARGET", "That is your own student id. Your own transcript is on the Grades page; cross-lookup is only for other students.", 400);
       if (hasStdCode && isOwnStudentCode(ownIdentity, query.stdCode!)) throw new HyeboardError("VNU_CROSS_LOOKUP_SELF_TARGET", "That is your own student code. Your own transcript is on the Grades page; cross-lookup is only for other students.", 400);
@@ -1138,7 +1254,6 @@ export function createApp(adapter: any) {
       const needsOwnCode = body.mode === "code-to-stdid";
       const ownIdentity = parseVnuOwnIdentity(parseProfileHtml(await vnuRawHtml(session, "profile", {})), {
         requireStudentCode: needsOwnCode,
-        errorMessage: "VNU (daotao) bulk cross-lookup needs your own portal identifiers, which this session could not provide. Sign in again.",
       });
 
       const reservedUnits = vnuBulkReservationUnits(body);

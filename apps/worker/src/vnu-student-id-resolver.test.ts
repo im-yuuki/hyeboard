@@ -414,7 +414,7 @@ describe("resolveVnuStudentId", () => {
   });
 
   it.each([
-    "VNU_LOGIN_REQUIRED",
+    "VNU_PROFILE_INCOMPLETE",
     "VNU_SESSION_EXPIRED",
     "VNU_RATE_LIMITED",
     "VNU_UPSTREAM_UNAVAILABLE",
