@@ -18,15 +18,21 @@ import type {
   VnuTranscript,
   VnuTranscriptHeader,
 } from "./types";
+import { collapseVnuCourseCodeDisplay } from "./course-code";
 
 const DAOTAO_ORIGIN = "https://daotao.vnu.edu.vn";
 const DAOTAO_LOGIN_PATH = "/dkmh/login.asp";
 const DAOTAO_SESSION_ENDED_SENTENCE = "Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.";
 const HTML_ENTITY_RE = /&(?:nbsp|amp|lt|gt|quot|#[^;&\s]*);/gi;
+const VNU_COURSE_CODE_SOURCE = "[A-Za-zĐđ]{2,6} ?\\d{3,4}[A-Za-zĐđ]*";
+const VNU_COURSE_CODE_RE = new RegExp(`^${VNU_COURSE_CODE_SOURCE}$`);
+const VNU_EXAM_COMPOSITE_RE = new RegExp(
+  `^(\\d{3})-(${VNU_COURSE_CODE_SOURCE})(?:[ -]+(\\d+|[A-Za-zĐđ]+\\d+))?$`,
+);
 
 function decodeEntities(text: string): string {
-  return text
-    .replace(HTML_ENTITY_RE, (entity) => {
+  return collapseVnuCourseCodeDisplay(
+    text.replace(HTML_ENTITY_RE, (entity) => {
       const token = entity.slice(1, -1).toLowerCase();
       if (token === "nbsp") return " ";
       if (token === "amp") return "&";
@@ -40,9 +46,8 @@ function decodeEntities(text: string): string {
       const codePoint = Number.parseInt(numericMatch[2] ?? numericMatch[3], numericMatch[1] ? 16 : 10);
       if (codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) return entity;
       return String.fromCodePoint(codePoint);
-    })
-    .replace(/\s+/g, " ")
-    .trim();
+    }),
+  );
 }
 
 function stripTags(html: string): string {
@@ -139,12 +144,12 @@ export function parseGradesHtml(html: string): VnuGradesResult {
     const termHeaderMatch = joined.match(/MÃ HỌC KỲ\s*(\d+)/i);
     if (termHeaderMatch && cells.length <= 2) {
       currentTermCode = termHeaderMatch[1];
-      currentTermLabel = joined.replace(/\s+/g, " ").trim();
+      currentTermLabel = collapseVnuCourseCodeDisplay(joined);
       currentTerm = { termCode: currentTermCode, termLabel: currentTermLabel || undefined, rows: [] };
       terms.push(currentTerm);
       continue;
     }
-    if (cells.length >= 7 && /^[A-Za-zĐ]{2,6}\d{3,4}/.test(cells[1] ?? "")) {
+    if (cells.length >= 7 && VNU_COURSE_CODE_RE.test(cells[1] ?? "")) {
       const credits = parseOptionalNumber(cells[3]);
       const point10 = parseOptionalNumber(cells[4]);
       const point4 = parseOptionalNumber(cells[6]);
@@ -258,17 +263,13 @@ export function parseExamsHtml(html: string): VnuExamRow[] {
   while ((match = trRe.exec(html))) {
     const cells = tdCells(match[1]);
     if (cells.length < 8) continue;
-    const examCode = (cells[1] ?? "").trim();
-    // Groups 1-2 (maHK + course code) are byte-identical to the pattern this
-    // parser shipped with — the optional third group only skims the class
-    // number off the remainder (e.g. "252-PHI1002 6" -> "6") without changing
-    // how the course code itself was already being captured.
-    const codeMatch = examCode.match(/^(\d+)-([A-Za-zĐ]{2,6}\d{3,4})(?:[\s-]+(.*))?/);
+    const examCode = collapseVnuCourseCodeDisplay(cells[1] ?? "");
+    const codeMatch = parseExamCompositeCode(examCode);
     const sessionMatch = cells[4]?.match(/(\d+)\(([\d:]+)\)/);
     rows.push({
-      termCode: codeMatch?.[1],
-      courseCode: codeMatch?.[2] ?? examCode,
-      classNo: codeMatch?.[3]?.trim() || undefined,
+      termCode: codeMatch?.termCode,
+      courseCode: codeMatch?.courseCode ?? examCode,
+      classNo: codeMatch?.classNo,
       courseName: (cells[2] ?? "").trim(),
       examDate: (cells[3] ?? "").trim(),
       session: sessionMatch ? Number.parseInt(sessionMatch[1], 10) : undefined,
@@ -281,17 +282,20 @@ export function parseExamsHtml(html: string): VnuExamRow[] {
   return rows;
 }
 
-// Splits the exam-schedule "Mã KT" cell (e.g. "252-PHI1002 6",
-// "241-FLF1107-01", "252-THL1057 CN7") into its maHK/course-code/class-number
-// parts. classNo has no single consistent shape across courses (plain
-// digits, zero-padded, or alphanumeric group codes), so once the maHK and
-// course-code prefix are recognized, whatever text remains is trusted as the
-// class number as-is rather than re-validated against a stricter pattern.
+type VnuExamCompositeCode = { termCode: string; courseCode: string; classNo?: string };
+
+function parseExamCompositeCode(raw: string): VnuExamCompositeCode | undefined {
+  const match = VNU_EXAM_COMPOSITE_RE.exec(raw);
+  if (!match) return undefined;
+
+  const [, termCode, courseCode, classNo] = match;
+  return { termCode, courseCode, classNo };
+}
+
 function parseCatalogCode(raw: string): { termCode?: string; courseCode: string; classNo?: string } {
-  const strict = raw.match(/^(\d{3})-([A-Za-zĐ]{2,6}\d{3,4}[A-Za-zĐ]?)[\s-]+(.*)$/);
+  const strict = parseExamCompositeCode(raw);
   if (strict) {
-    const [, termCode, courseCode, rest] = strict;
-    return { termCode, courseCode, classNo: rest.trim() || undefined };
+    return strict;
   }
   // Fallback for shapes that don't fit the common pattern: still split off a
   // recognizable "NNN-" term prefix if present, and never throw on an odd row.
@@ -354,7 +358,7 @@ export function parseSyllabusHtml(html: string): VnuSyllabusRow[] {
     const cellsHtml = [...match[1].matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/gi)].map((m) => m[1]);
     if (cellsHtml.length < 7) continue;
     const codeText = stripTags(cellsHtml[1] ?? "");
-    if (!/^[A-Za-zĐ]{2,6}\d{3,4}/.test(codeText)) continue;
+    if (!VNU_COURSE_CODE_RE.test(codeText)) continue;
     const nameText = stripTags(cellsHtml[2] ?? "");
     const creditsText = stripTags(cellsHtml[3] ?? "");
     const fileHrefMatch = (cellsHtml[4] ?? "").match(/href="([^"]+\.pdf)"/i);

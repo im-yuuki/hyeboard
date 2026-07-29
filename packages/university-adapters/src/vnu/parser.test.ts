@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { isDaotaoSessionExpired, parseGradesHtml, parsePortalNotice, parseTranscriptHtml } from "./parser";
+import {
+  isDaotaoSessionExpired,
+  parseExamCatalogHtml,
+  parseExamsHtml,
+  parseGradesHtml,
+  parsePortalNotice,
+  parseSyllabusHtml,
+  parseTranscriptHtml,
+} from "./parser";
 import {
   loginFormHtml,
   mixedAttributeLoginFormHtml,
@@ -21,6 +29,120 @@ const transcriptHtml = `
   <div>Tổng tín chỉ tích lũy: 4</div>
   <div>Điểm trung bình tích lũy hệ 4: 3.25</div>
 `;
+
+function gradeRow(courseCodeHtml: string): string {
+  return `<tr><td>1</td><td>${courseCodeHtml}</td><td>Synthetic Course</td><td>3</td><td>8</td><td>B</td><td>3</td></tr>`;
+}
+
+function syllabusRow(courseCodeHtml: string): string {
+  return `<tr><td>1</td><td>${courseCodeHtml}</td><td>Synthetic Course</td><td>3</td><td><a href="synthetic.pdf">PDF</a></td><td>-</td><td>1 KB</td><td>01/01/2000</td></tr>`;
+}
+
+function examRow(compositeCodeHtml: string, classId?: string): string {
+  const hiddenClassId = classId ? `<input type="hidden" name="hidCrdID" value="${classId}">` : "";
+  return `<tr id="1"><td>${hiddenClassId}1</td><td>${compositeCodeHtml}</td><td>Synthetic Course</td><td>01/01/2000</td><td>1(08:00)</td><td>Written</td><td>R-SYNTHETIC</td><td>S-SYNTHETIC</td></tr>`;
+}
+
+describe("VNU course-code cells", () => {
+  it.each([
+    ["plain internal space", "INT 3103", "INT 3103"],
+    ["named NBSP", "INT&nbsp;3103", "INT 3103"],
+    ["decimal NBSP", "INT&#160;3103A", "INT 3103A"],
+    ["hex NBSP", "đt&#xA0;3103b", "đt 3103b"],
+    ["multi-letter suffix", "INT 3103AB", "INT 3103AB"],
+    ["repeated spaces", "INT   3103", "INT 3103"],
+    ["tabs and newlines", "INT\t\n3103Z", "INT 3103Z"],
+    ["intervening tags", "INT<span></span>3103", "INT 3103"],
+  ])("preserves normalized display for %s in grades, term groups, transcript, and syllabus", (_case, source, display) => {
+    const gradesHtml = `<table><tr><td>HỌC KỲ. MÃ HỌC KỲ 252</td></tr>${gradeRow(source)}</table>`;
+    const grades = parseGradesHtml(gradesHtml);
+    const transcript = parseTranscriptHtml(gradesHtml);
+    const syllabus = parseSyllabusHtml(`<table>${syllabusRow(source)}</table>`);
+
+    expect(grades.rows.map((row) => row.courseCode)).toEqual([display]);
+    expect(grades.terms[0]?.rows.map((row) => row.courseCode)).toEqual([display]);
+    expect(transcript.terms[0]?.rows.map((row) => row.courseCode)).toEqual([display]);
+    expect(syllabus.map((row) => row.courseCode)).toEqual([display]);
+  });
+
+  it.each([
+    ["one-letter prefix", "I 3103"],
+    ["seven-letter prefix", "ABCDEFG 3103"],
+    ["two-digit number", "INT 31"],
+    ["five-digit number", "INT 31035"],
+    ["malformed internal split", "IN T 3103"],
+    ["trailing prose", "INT 3103 synthetic prose"],
+    ["punctuation", "INT-3103"],
+  ])("skips malformed %s grade and syllabus rows", (_case, source) => {
+    expect(parseGradesHtml(`<table>${gradeRow(source)}</table>`).rows).toEqual([]);
+    expect(parseSyllabusHtml(`<table>${syllabusRow(source)}</table>`)).toEqual([]);
+  });
+});
+
+describe("VNU exam composite codes", () => {
+  it.each([
+    ["252-INT 3103 6", { termCode: "252", courseCode: "INT 3103", classNo: "6" }],
+    ["241-FLF1107-01", { termCode: "241", courseCode: "FLF1107", classNo: "01" }],
+    ["252-INT 3103A CN7", { termCode: "252", courseCode: "INT 3103A", classNo: "CN7" }],
+    ["252-INT 3103A", { termCode: "252", courseCode: "INT 3103A", classNo: undefined }],
+    ["252-INT 3103AB CN7", { termCode: "252", courseCode: "INT 3103AB", classNo: "CN7" }],
+    ["252-INT 3103 - CN7", { termCode: "252", courseCode: "INT 3103", classNo: "CN7" }],
+    ["252-INT 3103--71", { termCode: "252", courseCode: "INT 3103", classNo: "71" }],
+    ["252-đt&nbsp;3103Z-CN07", { termCode: "252", courseCode: "đt 3103Z", classNo: "CN07" }],
+    ["252-INT<span></span>3103A\tCN7", { termCode: "252", courseCode: "INT 3103A", classNo: "CN7" }],
+  ])("parses %s identically for schedules and catalogs", (source, expected) => {
+    expect(parseExamsHtml(`<table>${examRow(source)}</table>`)[0]).toMatchObject(expected);
+    expect(parseExamCatalogHtml(`<table>${examRow(source, "CLASS-SYNTHETIC")}</table>`)[0]).toMatchObject({
+      classId: "CLASS-SYNTHETIC",
+      ...expected,
+    });
+  });
+
+  it.each([
+    ["two-digit term", "25-INT 3103 6"],
+    ["four-digit term", "2521-INT 3103 6"],
+    ["missing prefix separator", "252 INT 3103 6"],
+    ["two-digit course number", "252-INT 31 6"],
+    ["five-digit course number", "252-INT 31035 6"],
+    ["invalid class token", "252-INT 3103 CN"],
+    ["trailing prose", "252-INT 3103 CN7 synthetic prose"],
+  ])("keeps malformed %s schedules whole and applies only catalog term-prefix fallback", (_case, source) => {
+    expect(parseExamsHtml(`<table>${examRow(source)}</table>`)[0]).toMatchObject({
+      courseCode: source,
+      termCode: undefined,
+      classNo: undefined,
+    });
+
+    const catalog = parseExamCatalogHtml(`<table>${examRow(source, "CLASS-SYNTHETIC")}</table>`)[0];
+    const prefixed = /^(\d{3})-(.+)$/.exec(source);
+    expect(catalog).toMatchObject(prefixed
+      ? { termCode: prefixed[1], courseCode: prefixed[2], classNo: undefined }
+      : { courseCode: source, termCode: undefined, classNo: undefined });
+  });
+
+  it("normalizes malformed fallback display without inventing a class number", () => {
+    const source = "252-INT&nbsp;<span></span>31\t\nsynthetic prose";
+    const normalizedComposite = "252-INT 31 synthetic prose";
+
+    expect(parseExamsHtml(`<table>${examRow(source)}</table>`)[0]).toMatchObject({
+      courseCode: normalizedComposite,
+      termCode: undefined,
+      classNo: undefined,
+    });
+    expect(parseExamCatalogHtml(`<table>${examRow(source, "CLASS-SYNTHETIC")}</table>`)[0]).toMatchObject({
+      courseCode: "INT 31 synthetic prose",
+      termCode: "252",
+      classNo: undefined,
+    });
+  });
+
+  it("requires both hidden course identity and eight-column evidence for catalog rows", () => {
+    const withoutIdentity = examRow("252-INT 3103 6");
+    const sevenColumns = examRow("252-INT 3103 6", "CLASS-SYNTHETIC").replace("<td>S-SYNTHETIC</td>", "");
+
+    expect(parseExamCatalogHtml(`<table>${withoutIdentity}${sevenColumns}</table>`)).toEqual([]);
+  });
+});
 
 describe("parseTranscriptHtml", () => {
   it("reuses the own-grades rows and groups a full transcript by maHK", () => {
