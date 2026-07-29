@@ -1671,13 +1671,20 @@ test("bulk keeps complete exports ordered for all modes and fixed chunks", async
 test("bulk exports prior five results after later 429 and while retrying", async ({ page }) => {
   const apiRequestCount = trackApiRequestCounts(page);
   let call = 0;
+  let markRetryStarted!: () => void;
+  const retryStarted = new Promise<void>((resolve) => { markRetryStarted = resolve; });
+  let releaseRetry!: () => void;
+  const retryGate = new Promise<void>((resolve) => { releaseRetry = resolve; });
   await page.route("**/api/vnu/cross-lookup/bulk", async (route) => {
     call += 1;
     if (call === 2) {
       await route.fulfill({ status: 429, contentType: "application/json", body: JSON.stringify({ data: null, error: { code: "VNU_RATE_LIMITED", message: "Synthetic 99 limit" } }) });
       return;
     }
-    if (call === 3) await new Promise((resolve) => setTimeout(resolve, 500));
+    if (call === 3) {
+      markRetryStarted();
+      await retryGate;
+    }
     await fulfillBulkSuccess(route, []);
   });
   await openMockedLookup(page);
@@ -1694,34 +1701,267 @@ test("bulk exports prior five results after later 429 and while retrying", async
   expect((partial.results as Array<{ target: string }>).map((item) => item.target)).toEqual(targets.slice(0, 5));
 
   await bulk.getByRole("button", { name: "Retry remaining" }).click();
+  await retryStarted;
   await expect(bulk.getByRole("button", { name: "Export" })).toBeVisible();
+  releaseRetry();
   await expect(bulk.getByText("6 completed")).toBeVisible();
 });
 
 test("bulk keeps prior export during and after cancellation of second chunk", async ({ page }) => {
   const apiRequestCount = trackApiRequestCounts(page);
   let call = 0;
+  let markSecondStarted!: () => void;
+  const secondStarted = new Promise<void>((resolve) => { markSecondStarted = resolve; });
+  let releaseSecond!: () => void;
+  const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve; });
+  let markSecondHandled!: () => void;
+  const secondHandled = new Promise<void>((resolve) => { markSecondHandled = resolve; });
   await page.route("**/api/vnu/cross-lookup/bulk", async (route) => {
     call += 1;
-    if (call === 2) await new Promise((resolve) => setTimeout(resolve, 750));
-    await fulfillBulkSuccess(route, []);
+    if (call === 2) {
+      markSecondStarted();
+      await secondGate;
+    }
+    try {
+      await fulfillBulkSuccess(route, []);
+    } finally {
+      if (call === 2) markSecondHandled();
+    }
   });
   await openMockedLookup(page);
   const bulk = page.getByTestId("bulk-lookup");
   const targets = Array.from({ length: 6 }, (_, index) => `9900000040${index + 1}`);
   await bulk.getByLabel("Targets, one per line").fill(targets.join("\n"));
   await bulk.getByRole("button", { name: "Run bulk lookup" }).click();
+  await secondStarted;
   await expect(bulk.locator("#bulk-lookup-progress-label")).toHaveText("5 of 6 processed");
   await expect(bulk.getByRole("button", { name: "Export" })).toBeVisible();
   await bulk.getByRole("button", { name: "Cancel" }).click();
   await expect(bulk.getByRole("button", { name: "Retry remaining" })).toBeVisible();
   await expect(bulk.getByRole("button", { name: "Export" })).toBeVisible();
+  await expect(bulk.getByText(targets[0]!, { exact: true })).toBeVisible();
   const partial = await expectExportFormats(page, "bulk-id-to-code", apiRequestCount, {
     sourcePath: "/api/vnu/cross-lookup/bulk",
     assertCsv: expectBulkCsvMatchesJson,
   });
   expect(partial.run).toEqual({ status: "partial", mode: "stdid-to-code", processedCount: 5, totalCount: 6 });
   expect(partial.results?.map((item) => item.target)).toEqual(targets.slice(0, 5));
+  releaseSecond();
+  await secondHandled;
+});
+
+test("bulk preserves partial export through VNU refresh and retries only remaining targets", async ({ page }) => {
+  const apiRequestCount = trackApiRequestCounts(page);
+  const initialToken = "synthetic-expiring-bulk-token";
+  const rotatedToken = "synthetic-rotated-bulk-token";
+  const targets = Array.from({ length: 6 }, (_, index) => `990000010${index + 1}`);
+  let bulkPosts = 0;
+  let refreshPosts = 0;
+  const bulkAuthorizations: Array<string | null> = [];
+  let markRefreshEntered!: () => void;
+  const refreshEntered = new Promise<void>((resolve) => { markRefreshEntered = resolve; });
+  let markSecondStarted!: () => void;
+  const secondStarted = new Promise<void>((resolve) => { markSecondStarted = resolve; });
+  let releaseRefresh!: () => void;
+  const refreshReleased = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+
+  await page.route("**/api/vnu/cross-lookup/bulk", async (route) => {
+    bulkPosts += 1;
+    bulkAuthorizations.push(route.request().headers()["authorization"] ?? null);
+    const body = route.request().postDataJSON() as { targets: string[] };
+    if (bulkPosts === 2) markSecondStarted();
+    if (bulkPosts === 2) {
+      await route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ data: null, error: { code: "VNU_SESSION_EXPIRED", message: "Synthetic expiry" } }) });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: { items: body.targets.map((target) => ({ target, status: "ok", result: { studentCode: `CODE-${target}` } })) }, error: null }),
+    });
+  });
+  await page.route("**/api/vnu/auth/refresh", async (route) => {
+    refreshPosts += 1;
+    markRefreshEntered();
+    await refreshReleased;
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: {
+      token: rotatedToken,
+      refreshGrant: "synthetic-rotated-bulk-grant",
+      session: { universityId: "vnu", studentCode: "SYNTHETIC-STUDENT", expiresAt: "2099-01-01T00:00:00.000Z", authenticated: true },
+    }, error: null }) });
+  });
+
+  await openMockedVnuLookup(page);
+  await page.evaluate(({ token }) => {
+    const accounts = JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<Record<string, unknown>>;
+    const activeId = localStorage.getItem("hyeboard.activeAccountId");
+    localStorage.setItem("hyeboard.accounts", JSON.stringify(accounts.map((account) => account.id === activeId ? { ...account, token } : account)));
+    const activeAccount = accounts.find((account) => account.id === activeId);
+    if (activeId) sessionStorage.setItem(`hyeboard.vnu.refreshGrant.${activeId}`, "synthetic-bulk-grant");
+    if (!activeAccount) throw new Error("Synthetic active account missing");
+  }, { token: initialToken });
+  await page.reload();
+  const bulk = page.getByTestId("bulk-lookup");
+  await bulk.getByLabel("Targets, one per line").fill(targets.join("\n"));
+  await bulk.getByRole("button", { name: "Run bulk lookup" }).click();
+  await secondStarted;
+  await refreshEntered;
+  await expect(bulk.locator("#bulk-lookup-progress-label")).toHaveText("5 of 6 processed");
+  await expect(bulk.getByText(targets[0]!, { exact: true })).toBeVisible();
+  await expect(bulk.getByRole("button", { name: "Export" })).toBeVisible();
+  expect(bulkPosts).toBe(2);
+  const partialBeforeRefresh = await expectExportFormats(page, "bulk-id-to-code", apiRequestCount, {
+    sourcePath: "/api/vnu/cross-lookup/bulk",
+    assertCsv: expectBulkCsvMatchesJson,
+  });
+  expect(partialBeforeRefresh.run).toEqual({ status: "partial", mode: "stdid-to-code", processedCount: 5, totalCount: 6 });
+  expect(partialBeforeRefresh.results?.map((item) => item.target)).toEqual(targets.slice(0, 5));
+  releaseRefresh();
+
+  await expect(bulk.getByRole("button", { name: "Retry remaining" })).toBeVisible();
+  await expect(bulk.getByRole("button", { name: "Export" })).toBeVisible();
+  expect(bulkPosts).toBe(2);
+  expect(refreshPosts).toBe(1);
+  expect(bulkAuthorizations).toEqual([`Bearer ${initialToken}`, `Bearer ${initialToken}`]);
+  await expect(bulk.getByText("VNU reconnected. Review the saved results, then retry the remaining targets.")).toBeVisible();
+  await bulk.getByRole("button", { name: "Retry remaining" }).click();
+  await expect(bulk.getByText("6 completed")).toBeVisible();
+  expect(bulkPosts).toBe(3);
+  expect(bulkAuthorizations).toEqual([`Bearer ${initialToken}`, `Bearer ${initialToken}`, `Bearer ${rotatedToken}`]);
+  expect(await page.evaluate(() => (JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ token: string }>)[0]?.token)).toBe(rotatedToken);
+});
+
+test("bulk and safe VNU lookup cancel one shared refresh without late mutations", async ({ page }) => {
+  const initialToken = "synthetic-cancel-bulk-token";
+  const targets = Array.from({ length: 6 }, (_, index) => `990000020${index + 1}`);
+  let bulkPosts = 0;
+  let refreshPosts = 0;
+  let markSecondStarted!: () => void;
+  const secondStarted = new Promise<void>((resolve) => { markSecondStarted = resolve; });
+  let markRefreshEntered!: () => void;
+  const refreshEntered = new Promise<void>((resolve) => { markRefreshEntered = resolve; });
+  let releaseLate!: () => void;
+  const lateReleased = new Promise<void>((resolve) => { releaseLate = resolve; });
+  let markRefreshHandled!: () => void;
+  const refreshHandled = new Promise<void>((resolve) => { markRefreshHandled = resolve; });
+  let refreshAborted = 0;
+  let markRefreshAbort!: () => void;
+  const refreshAbortObserved = new Promise<void>((resolve) => { markRefreshAbort = resolve; });
+  const bulkAuthorizations: Array<string | null> = [];
+  let markSafeGetJoined!: () => void;
+  const safeGetJoined = new Promise<void>((resolve) => { markSafeGetJoined = resolve; });
+  await page.exposeFunction("__markTask7SafeGetJoined", markSafeGetJoined);
+
+  page.on("requestfailed", (request) => {
+    if (!request.url().includes("/api/vnu/auth/refresh")) return;
+    refreshAborted += 1;
+    markRefreshAbort();
+  });
+
+  await openMockedVnuLookup(page);
+
+  await page.route("**/api/vnu/cross-lookup/bulk", async (route) => {
+    bulkPosts += 1;
+    bulkAuthorizations.push(route.request().headers()["authorization"] ?? null);
+    const body = route.request().postDataJSON() as { targets: string[] };
+    if (bulkPosts === 2) {
+      markSecondStarted();
+      await route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ data: null, error: { code: "VNU_SESSION_EXPIRED", message: "Synthetic expiry" } }) });
+      return;
+    }
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: {
+      items: body.targets.map((target) => ({ target, status: "ok", result: { studentCode: `CODE-${target}` } })),
+    }, error: null }) });
+  });
+  await page.route("**/api/vnu/raw/exams**", async (route) => {
+    await route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ data: null, error: { code: "VNU_SESSION_EXPIRED", message: "Synthetic expiry" } }) });
+  });
+  await page.route("**/api/vnu/auth/refresh", async (route) => {
+    refreshPosts += 1;
+    markRefreshEntered();
+    await lateReleased;
+    try {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: {
+        token: "synthetic-late-cancel-token",
+        refreshGrant: "synthetic-late-cancel-grant",
+        session: { universityId: "vnu", studentCode: "SYNTHETIC-STUDENT", expiresAt: "2099-01-01T00:00:00.000Z", authenticated: true },
+      }, error: null }) });
+    } catch {
+      // Browser cancellation intentionally makes the late response inert.
+    } finally {
+      markRefreshHandled();
+    }
+  });
+
+  await page.evaluate(({ token }) => {
+    const accounts = JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<Record<string, unknown>>;
+    const activeId = localStorage.getItem("hyeboard.activeAccountId");
+    localStorage.setItem("hyeboard.accounts", JSON.stringify(accounts.map((account) => account.id === activeId ? { ...account, token } : account)));
+    if (activeId) sessionStorage.setItem(`hyeboard.vnu.refreshGrant.${activeId}`, "synthetic-cancel-grant");
+  }, { token: initialToken });
+  await page.reload();
+  await page.evaluate(async () => {
+    const events = { committed: 0, statuses: [] as string[] };
+    window.addEventListener("hyeboard:vnu-refresh-committed", () => { events.committed += 1; });
+    window.addEventListener("hyeboard:vnu-refresh-status", (event) => {
+      const state = (event as CustomEvent<{ state?: string }>).detail.state;
+      if (state) events.statuses.push(state);
+    });
+    Object.defineProperty(window, "__task7RefreshEvents", { value: events, configurable: true });
+    const loadApi = new Function("return import('/src/lib/api.ts')") as () => Promise<{
+      installRequestTestObserver(observer: { onRefreshWaiterRegistered(event: { path: string; joinedExistingFlight: boolean }): void }): () => void;
+    }>;
+    const apiModule = await loadApi();
+    const restoreObserver = apiModule.installRequestTestObserver({
+      onRefreshWaiterRegistered: ({ path, joinedExistingFlight }) => {
+        if (!path.startsWith("/api/vnu/raw/exams") || !joinedExistingFlight) return;
+        (window as unknown as { __markTask7SafeGetJoined(): void }).__markTask7SafeGetJoined();
+      },
+    });
+    Object.defineProperty(window, "__restoreTask7RequestObserver", { value: restoreObserver, configurable: true });
+  });
+
+  const bulk = page.getByTestId("bulk-lookup");
+  await bulk.getByLabel("Targets, one per line").fill(targets.join("\n"));
+  await bulk.getByRole("button", { name: "Run bulk lookup" }).click();
+  await secondStarted;
+  await refreshEntered;
+  await expect(bulk.getByText(targets[0]!, { exact: true })).toBeVisible();
+  await expect(bulk.getByRole("button", { name: "Export" })).toBeVisible();
+
+  const term = page.getByRole("combobox", { name: "Term" });
+  await term.click();
+  await page.getByRole("option").first().click();
+  await safeGetJoined;
+  await page.getByRole("button", { name: "Class ID to course" }).click();
+  await bulk.getByRole("button", { name: "Cancel" }).click();
+  await refreshAbortObserved;
+  expect(refreshPosts).toBe(1);
+  expect(refreshAborted).toBe(1);
+  expect(bulkPosts).toBe(2);
+  expect(bulkAuthorizations).toEqual([`Bearer ${initialToken}`, `Bearer ${initialToken}`]);
+  const beforeLate = await page.evaluate(() => ({
+    account: localStorage.getItem("hyeboard.accounts"),
+    grants: Object.entries(sessionStorage).filter(([key]) => key.startsWith("hyeboard.vnu.refreshGrant.")),
+    events: (window as unknown as { __task7RefreshEvents: { committed: number; statuses: string[] } }).__task7RefreshEvents,
+  }));
+  await expect(bulk.getByRole("button", { name: "Retry remaining" })).toBeVisible();
+  await expect(bulk.getByRole("button", { name: "Export" })).toBeVisible();
+  await expect(bulk.getByText(targets[0]!, { exact: true })).toBeVisible();
+
+  releaseLate();
+  await refreshHandled;
+  const afterLate = await page.evaluate(() => ({
+    account: localStorage.getItem("hyeboard.accounts"),
+    grants: Object.entries(sessionStorage).filter(([key]) => key.startsWith("hyeboard.vnu.refreshGrant.")),
+    events: (window as unknown as { __task7RefreshEvents: { committed: number; statuses: string[] } }).__task7RefreshEvents,
+  }));
+  expect(afterLate).toEqual(beforeLate);
+  expect(bulkPosts).toBe(2);
+  expect(refreshPosts).toBe(1);
+  expect(refreshAborted).toBe(1);
+  expect(bulkAuthorizations).toEqual([`Bearer ${initialToken}`, `Bearer ${initialToken}`]);
+  await page.evaluate(() => (window as unknown as { __restoreTask7RequestObserver(): void }).__restoreTask7RequestObserver());
 });
 
 test("bulk resets without stale resurrection while second chunk is gated", async ({ page }) => {
@@ -1731,7 +1971,15 @@ test("bulk resets without stale resurrection while second chunk is gated", async
   const secondStarted = new Promise<void>((resolve) => { markSecondStarted = resolve; });
   const chunks: string[][] = [];
   let failedRequests = 0;
-  page.on("requestfailed", (request) => { if (request.url().includes("/api/vnu/cross-lookup/bulk")) failedRequests += 1; });
+  let markFailedRequest!: () => void;
+  const failedRequest = new Promise<void>((resolve) => { markFailedRequest = resolve; });
+  let markSecondHandled!: () => void;
+  const secondHandled = new Promise<void>((resolve) => { markSecondHandled = resolve; });
+  page.on("requestfailed", (request) => {
+    if (!request.url().includes("/api/vnu/cross-lookup/bulk")) return;
+    failedRequests += 1;
+    markFailedRequest();
+  });
   await page.route("**/api/vnu/cross-lookup/bulk", async (route) => {
     const body = route.request().postDataJSON() as { targets: string[] };
     chunks.push(body.targets);
@@ -1740,6 +1988,7 @@ test("bulk resets without stale resurrection while second chunk is gated", async
       await secondGate;
     }
     try { await fulfillBulkSuccess(route, []); } catch { /* Request was invalidated by reset. */ }
+    finally { if (chunks.length === 2) markSecondHandled(); }
   });
   await openMockedLookup(page);
   const bulk = page.getByTestId("bulk-lookup");
@@ -1748,12 +1997,13 @@ test("bulk resets without stale resurrection while second chunk is gated", async
   await bulk.getByRole("button", { name: "Run bulk lookup" }).click();
   await secondStarted;
   await bulk.getByRole("button", { name: "Reset" }).click();
-  await expect.poll(() => failedRequests).toBe(1);
+  await failedRequest;
+  expect(failedRequests).toBe(1);
   await expect(bulk.getByRole("button", { name: "Export" })).toHaveCount(0);
   await expect(bulk.getByText(targets[0]!)).toHaveCount(0);
   await expect(bulk.locator("#bulk-lookup-progress-label")).toHaveCount(0);
   releaseSecond();
-  await page.waitForTimeout(100);
+  await secondHandled;
   expect(chunks).toHaveLength(2);
   await expect(bulk.getByRole("button", { name: "Export" })).toHaveCount(0);
   await expect(bulk.getByText(targets[0]!)).toHaveCount(0);
@@ -1766,7 +2016,15 @@ test("bulk clears account results and aborts gated work on session freshness cha
   const secondStarted = new Promise<void>((resolve) => { markSecondStarted = resolve; });
   const chunks: string[][] = [];
   let failedRequests = 0;
-  page.on("requestfailed", (request) => { if (request.url().includes("/api/vnu/cross-lookup/bulk")) failedRequests += 1; });
+  let markFailedRequest!: () => void;
+  const failedRequest = new Promise<void>((resolve) => { markFailedRequest = resolve; });
+  let markSecondHandled!: () => void;
+  const secondHandled = new Promise<void>((resolve) => { markSecondHandled = resolve; });
+  page.on("requestfailed", (request) => {
+    if (!request.url().includes("/api/vnu/cross-lookup/bulk")) return;
+    failedRequests += 1;
+    markFailedRequest();
+  });
   await page.route("**/api/vnu/cross-lookup/bulk", async (route) => {
     const body = route.request().postDataJSON() as { targets: string[] };
     chunks.push(body.targets);
@@ -1775,6 +2033,7 @@ test("bulk clears account results and aborts gated work on session freshness cha
       await secondGate;
     }
     try { await fulfillBulkSuccess(route, []); } catch { /* Request was invalidated by account switch. */ }
+    finally { if (chunks.length === 2) markSecondHandled(); }
   });
   await openMockedLookup(page);
   const bulk = page.getByTestId("bulk-lookup");
@@ -1791,11 +2050,12 @@ test("bulk clears account results and aborts gated work on session freshness cha
     localStorage.setItem("hyeboard.activeAccountId", "synthetic-account-99");
     window.dispatchEvent(new CustomEvent("hyeboard:account-switched"));
   });
-  await expect.poll(() => failedRequests).toBe(1);
+  await failedRequest;
+  expect(failedRequests).toBe(1);
   await expect(page.getByTestId("bulk-lookup").getByRole("button", { name: "Export" })).toHaveCount(0);
   await expect(page.getByTestId("bulk-lookup").getByText(targets[0]!)).toHaveCount(0);
   releaseSecond();
-  await page.waitForTimeout(100);
+  await secondHandled;
   expect(chunks).toHaveLength(2);
   await expect(page.getByTestId("bulk-lookup").getByRole("button", { name: "Export" })).toHaveCount(0);
   await expect(page.getByTestId("bulk-lookup").getByText(targets[0]!)).toHaveCount(0);

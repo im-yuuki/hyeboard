@@ -1,4 +1,6 @@
 import type { VnuBulkLookupItem, VnuBulkLookupMode, VnuCrossStudentCode, VnuCrossStudentId, VnuCrossTranscript } from "./api";
+import { ApiError } from "./api";
+import { VNU_REQUEST_NOT_REPLAYED } from "./vnu-refresh";
 
 export type BulkTargetError = "disabled" | "empty" | "tooMany";
 
@@ -20,6 +22,7 @@ export type BulkLookupExecution = {
   remainingTargets: string[];
   error?: unknown;
   aborted: boolean;
+  restoredWithoutReplay: boolean;
 };
 
 export type ExecuteBulkLookupOptions = {
@@ -149,21 +152,24 @@ export async function executeBulkLookup(options: ExecuteBulkLookupOptions): Prom
   let completedTargets = 0;
 
   for (const chunk of chunkBulkTargets(options.mode, options.targets)) {
-    if (options.signal.aborted) return { progress, remainingTargets: options.targets.slice(completedTargets), aborted: true };
+    if (options.signal.aborted) return { progress, remainingTargets: options.targets.slice(completedTargets), aborted: true, restoredWithoutReplay: false };
 
     let items: VnuBulkLookupItem[];
     try {
       items = await options.requestChunk(options.mode, chunk, options.signal);
     } catch (error) {
+      const aborted = options.signal.aborted;
+      const restoredWithoutReplay = !aborted && error instanceof ApiError && error.code === VNU_REQUEST_NOT_REPLAYED;
       return {
         progress,
         remainingTargets: options.targets.slice(completedTargets),
-        error: options.signal.aborted ? undefined : error,
-        aborted: options.signal.aborted,
+        error: aborted || restoredWithoutReplay ? undefined : error,
+        aborted,
+        restoredWithoutReplay,
       };
     }
 
-    if (options.signal.aborted) return { progress, remainingTargets: options.targets.slice(completedTargets), aborted: true };
+    if (options.signal.aborted) return { progress, remainingTargets: options.targets.slice(completedTargets), aborted: true, restoredWithoutReplay: false };
     const targetsMatch = items.length === chunk.length && items.every((item, index) => item.target === chunk[index]);
     if (!targetsMatch) {
       return {
@@ -171,6 +177,7 @@ export async function executeBulkLookup(options: ExecuteBulkLookupOptions): Prom
         remainingTargets: options.targets.slice(completedTargets),
         error: new Error("Invalid bulk lookup response"),
         aborted: false,
+        restoredWithoutReplay: false,
       };
     }
 
@@ -182,7 +189,7 @@ export async function executeBulkLookup(options: ExecuteBulkLookupOptions): Prom
     options.onProgress?.(progress);
   }
 
-  return { progress, remainingTargets: [], aborted: false };
+  return { progress, remainingTargets: [], aborted: false, restoredWithoutReplay: false };
 }
 
 export function deriveBulkLookupViewState(input: ParsedBulkTargets, active: boolean, processed: number): BulkLookupViewState {

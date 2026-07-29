@@ -129,6 +129,70 @@ describe("VNU refresh single-flight", () => {
     expect(deps.commit).not.toHaveBeenCalled();
   });
 
+  it("makes an all-waiter-cancelled late success inert and allows a fresh flight", async () => {
+    const lateAuth = {
+      token: "obsolete-rotated-token",
+      refreshGrant: "obsolete-rotated-grant",
+      session: { universityId: "vnu", studentCode: ACCOUNT.studentCode, expiresAt: "2036-01-01T08:00:00.000Z", authenticated: true as const },
+    };
+    const freshAuth = {
+      token: "fresh-rotated-token",
+      refreshGrant: "fresh-rotated-grant",
+      session: { universityId: "vnu", studentCode: ACCOUNT.studentCode, expiresAt: "2036-01-01T08:00:00.000Z", authenticated: true as const },
+    };
+    let releaseLate!: () => void;
+    const lateReleased = new Promise<void>((resolve) => { releaseLate = resolve; });
+    let markOldSettled!: () => void;
+    const oldSettled = new Promise<void>((resolve) => { markOldSettled = resolve; });
+    const refreshAbort = vi.fn();
+    const fetchRefresh = vi.fn()
+      .mockImplementationOnce(async (_account: StoredAccount, _grant: string, signal: AbortSignal) => {
+        signal.addEventListener("abort", refreshAbort, { once: true });
+        await lateReleased;
+        return lateAuth;
+      })
+      .mockResolvedValueOnce(freshAuth);
+    const deps = {
+      getAccount: () => ACCOUNT,
+      getActiveAccountId: () => ACCOUNT.id,
+      fetchRefresh,
+      commit: vi.fn(() => true),
+      terminal: vi.fn(),
+      invalidate: vi.fn(),
+      status: vi.fn(),
+      onFlightSettled: markOldSettled,
+    };
+    storeVnuRefreshGrant(ACCOUNT.id, "opaque-grant-alpha");
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+    const first = runVnuRefresh(ACCOUNT, firstController.signal, deps);
+    const second = runVnuRefresh(ACCOUNT, secondController.signal, deps);
+
+    firstController.abort(new DOMException("first cancelled", "AbortError"));
+    secondController.abort(new DOMException("second cancelled", "AbortError"));
+    await expect(first).rejects.toMatchObject({ name: "AbortError" });
+    await expect(second).rejects.toMatchObject({ name: "AbortError" });
+    expect(refreshAbort).toHaveBeenCalledTimes(1);
+    deps.commit.mockClear();
+    deps.terminal.mockClear();
+    deps.invalidate.mockClear();
+    deps.status.mockClear();
+
+    releaseLate();
+    await oldSettled;
+    expect(deps.commit).not.toHaveBeenCalled();
+    expect(deps.terminal).not.toHaveBeenCalled();
+    expect(deps.invalidate).not.toHaveBeenCalled();
+    expect(deps.status).not.toHaveBeenCalled();
+    expect(readVnuRefreshGrant(ACCOUNT.id)).toBe("opaque-grant-alpha");
+
+    const fresh = runVnuRefresh(ACCOUNT, undefined, { ...deps, onFlightSettled: undefined });
+    await expect(fresh).resolves.toEqual({ kind: "committed", auth: freshAuth });
+    expect(fetchRefresh).toHaveBeenCalledTimes(2);
+    expect(deps.commit).toHaveBeenCalledTimes(1);
+    expect(deps.invalidate).toHaveBeenCalledTimes(1);
+  });
+
   it("retires an all-cancelled generation before a fresh caller arrives", async () => {
     const oldAuth = {
       token: "obsolete-rotated-token",

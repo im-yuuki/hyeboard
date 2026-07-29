@@ -258,6 +258,32 @@ type InternalRequestOptions = {
   tokenOverride?: string;
 };
 
+type RequestTestObserver = {
+  onRefreshWaiterRegistered?(event: { path: string; joinedExistingFlight: boolean }): void;
+};
+
+type RequestTestObserverEntry = { observer: RequestTestObserver };
+const requestTestObservers: RequestTestObserverEntry[] = [];
+
+export function installRequestTestObserver(observer: RequestTestObserver): () => void {
+  const entry = { observer };
+  requestTestObservers.push(entry);
+  return () => {
+    const index = requestTestObservers.indexOf(entry);
+    if (index >= 0) requestTestObservers.splice(index, 1);
+  };
+}
+
+function notifyRequestTestObserver(event: { path: string; joinedExistingFlight: boolean }): void {
+  const observer = requestTestObservers.at(-1)?.observer;
+  if (!observer?.onRefreshWaiterRegistered) return;
+  try {
+    observer.onRefreshWaiterRegistered(event);
+  } catch {
+    // Test observers must never alter production request behavior.
+  }
+}
+
 function apiErrorFromPayload(payload: ApiResponse<unknown>, response: Response): ApiError {
   return new ApiError(
     payload.error?.message ?? `Request failed: ${response.status}`,
@@ -397,13 +423,17 @@ async function request<T>(path: string, init: RequestInit = {}, internal: Intern
       const routePolicy = requestPolicyFor({ method: init.method ?? "GET", pathname: path });
       const policy = reducedPolicy(routePolicy, internal.policy);
       if (internal.noRefresh || policy === "never") throw error;
+      if (refreshSuppressedAccounts.has(originatingAccount.id)) throw error;
       if (!readVnuRefreshGrant(originatingAccount.id)) {
         removeUnchangedOrigin(originatingAccount);
         throw error;
       }
       let outcome;
       try {
-        outcome = await runVnuRefresh(originatingAccount, init.signal ?? undefined, refreshDeps);
+        const joinedExistingFlight = vnuRefreshStatuses.get(originatingAccount.id)?.state === "reconnecting";
+        const refresh = runVnuRefresh(originatingAccount, init.signal ?? undefined, refreshDeps);
+        notifyRequestTestObserver({ path, joinedExistingFlight });
+        outcome = await refresh;
       } catch (refreshError) {
         throw markVnuRefreshAttempted(normalizeRefreshError(refreshError));
       }
@@ -489,8 +519,8 @@ function queryString(params: Record<string, string | undefined>): string {
   return rendered ? `?${rendered}` : "";
 }
 
-async function vnuRaw(page: string, params: Record<string, string | undefined> = {}) {
-  return request<{ html: string }>(`/api/vnu/raw/${page}${queryString(params)}`);
+async function vnuRaw(page: string, params: Record<string, string | undefined> = {}, signal?: AbortSignal) {
+  return request<{ html: string }>(`/api/vnu/raw/${page}${queryString(params)}`, { signal });
 }
 
 async function vnuDashboard(): Promise<DashboardSummary> {
@@ -544,8 +574,8 @@ async function vnuOwnProfile(): Promise<VnuProfile> {
   return parseProfileHtml((await vnuRaw("profile")).html);
 }
 
-async function vnuClassCatalog(params: { vTermID: string }): Promise<VnuExamCatalogRow[]> {
-  const page = await vnuRaw("exams", params);
+async function vnuClassCatalog(params: { vTermID: string }, signal?: AbortSignal): Promise<VnuExamCatalogRow[]> {
+  const page = await vnuRaw("exams", params, signal);
   return parseExamCatalogHtml(page.html);
 }
 
@@ -652,7 +682,7 @@ export const api = {
   // vnu (daotao)-only class-code -> internal-id lookup tool - see the
   // classLookup capability flag, gated in the UI before these are called.
   vnuOwnProfile: () => vnuOwnProfile(),
-  vnuClassCatalog: (params: { vTermID: string }) => vnuClassCatalog(params),
+  vnuClassCatalog: (params: { vTermID: string }, signal?: AbortSignal) => vnuClassCatalog(params, signal),
   vnuPointDetail: (params: { id: string; Term: string }) => vnuPointDetail(params),
   vnuCrossStudentCode: (params: { stdId: string }) => vnuCrossStudentCode(params),
   vnuCrossStudentId: (params: { stdCode: string }) => vnuCrossStudentId(params),

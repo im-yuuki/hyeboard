@@ -127,9 +127,9 @@ function ClassResolver() {
   // point-detail) and fails closed with VNU_LOGIN_REQUIRED when it can't.
   const catalogQuery = useQuery({
     queryKey: ["vnu-lookup-catalog", state.universityId, state.sessionNonce, termOrdinal],
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       await state.ensureSession();
-      return api.vnuClassCatalog({ vTermID: termOrdinal! });
+      return api.vnuClassCatalog({ vTermID: termOrdinal! }, signal);
     },
     enabled: Boolean(termOrdinal),
   });
@@ -229,9 +229,9 @@ function ReverseClassResolver() {
 
   const catalogQuery = useQuery({
     queryKey: ["vnu-lookup-catalog", state.universityId, state.sessionNonce, termOrdinal],
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       await state.ensureSession();
-      return api.vnuClassCatalog({ vTermID: termOrdinal! });
+      return api.vnuClassCatalog({ vTermID: termOrdinal! }, signal);
     },
     enabled: Boolean(termOrdinal),
   });
@@ -818,6 +818,7 @@ function BulkLookupSection({ maximum, freshnessKey }: { maximum: number; freshne
   const [active, setActive] = useState(false);
   const [progress, setProgress] = useState<BulkLookupProgress>({ processed: 0, total: 0, items: [] });
   const [remainingTargets, setRemainingTargets] = useState<string[]>([]);
+  const [restoredWithoutReplay, setRestoredWithoutReplay] = useState(false);
   const [requestError, setRequestError] = useState<string | undefined>();
   const [exportModel, setExportModel] = useState<ExportDocument | undefined>();
   const [resultPageStart, setResultPageStart] = useState(0);
@@ -853,13 +854,14 @@ function BulkLookupSection({ maximum, freshnessKey }: { maximum: number; freshne
     exportItems.current = [];
     setProgress({ processed: 0, total: 0, items: [] });
     setRemainingTargets([]);
+    setRestoredWithoutReplay(false);
     setRequestError(undefined);
     setExportModel(undefined);
     setResultPageStart(0);
   };
 
   useEffect(() => {
-    const invalidateForAccountSwitch = () => invalidateRun();
+    const invalidateForAccountSwitch = () => clearLookupState(true);
     window.addEventListener(ACCOUNT_SWITCHED_EVENT, invalidateForAccountSwitch);
     return () => {
       window.removeEventListener(ACCOUNT_SWITCHED_EVENT, invalidateForAccountSwitch);
@@ -906,6 +908,7 @@ function BulkLookupSection({ maximum, freshnessKey }: { maximum: number; freshne
     abortController.current = controller;
     setActive(true);
     setRequestError(undefined);
+    setRestoredWithoutReplay(false);
     const retrying = remainingTargets.length > 0;
     const pendingTargets = retrying ? remainingTargets : parsed.targets;
     const initialProgress = retrying ? progress : { processed: 0, total: parsed.targets.length, items: [] };
@@ -944,6 +947,7 @@ function BulkLookupSection({ maximum, freshnessKey }: { maximum: number; freshne
       progressSnapshot.current = execution.progress;
       setProgress(execution.progress);
       setRemainingTargets(execution.remainingTargets);
+      setRestoredWithoutReplay(execution.restoredWithoutReplay);
       const errorCode = execution.error instanceof ApiError
         ? execution.error.code
         : execution.error instanceof Error && execution.error.message === "Invalid bulk lookup response"
@@ -1013,12 +1017,13 @@ function BulkLookupSection({ maximum, freshnessKey }: { maximum: number; freshne
 
         <div className="min-h-20" aria-live="polite">{active ? <div className="space-y-2"><p id="bulk-lookup-progress-label" className="text-sm text-muted-foreground">{t.lookup.bulkProgress(progress.processed, progress.total)}</p><Progress value={progress.total ? progress.processed / progress.total * 100 : 0} aria-labelledby="bulk-lookup-progress-label" /></div> : null}
         {requestError ? <div role="alert"><Empty text={requestErrorMessage} /></div>
+          : restoredWithoutReplay ? <div role="status"><Empty text={t.lookup.bulkSessionRestored} /></div>
           : viewState === "empty" ? <Empty text={t.lookup.bulkEmpty} />
           : viewState === "validation" ? <Empty text={validationMessage} />
           : viewState === "loading" && progress.items.length === 0 ? <Empty text={t.lookup.bulkLoading} />
           : null}</div>
         {progress.items.length > 0 ? (
-          <div aria-live="polite" className="max-h-[32rem] overflow-auto">
+           <div className="max-h-[32rem] overflow-auto">
             <div className="flex items-center justify-between border-b border-border pb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground"><span>{t.lookup.bulkTargetColumn}</span><span>{viewState === "completed" ? t.lookup.bulkCompleted(progress.processed) : t.lookup.bulkProgress(progress.processed, progress.total)}</span></div>
             <div data-testid="bulk-results-list" className="divide-y divide-border">{visibleItems.map((item, index) => <BulkLookupResultRow key={`${item.target}-${index}`} item={item} mode={mode} />)}</div>
             <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-3">
@@ -1041,6 +1046,7 @@ export function LookupPage() {
   const profileQuery = useQuery({
     queryKey: ["vnu-lookup-profile", state.universityId, state.sessionNonce],
     queryFn: async () => { await state.ensureSession(); return api.vnuOwnProfile(); },
+    placeholderData: (previous) => previous,
   });
   // Fail-closed while the universities list is still loading: the section
   // only renders once the active university's capabilities affirmatively
@@ -1049,7 +1055,7 @@ export function LookupPage() {
   const crossLookupEnabled = activeUniversity?.capabilities.crossLookup === true;
   const bulkMaximum = activeUniversity?.limits?.crossLookup?.bulkMaxTargets;
   const bulkLookupEnabled = crossLookupEnabled && Number.isSafeInteger(bulkMaximum) && bulkMaximum! > 0;
-  const bulkFreshnessKey = `${state.universityId}:${state.sessionNonce}:${state.activeAccountId ?? "no-account"}`;
+  const bulkFreshnessKey = `${state.universityId}:${state.activeAccountId ?? "no-account"}`;
 
   return (
     <FeatureFrame title={t.lookup.title} description={t.lookup.description} query={profileQuery}>

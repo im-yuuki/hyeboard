@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { appendBulkLookupChunk, chunkBulkTargets, deriveBulkLookupViewState, executeBulkLookup, parseBulkLookupItems, parseBulkLookupMode, parseBulkTargets } from "./bulk-lookup";
 import type { VnuBulkLookupItem } from "./api";
+import { VnuRequestNotReplayedError } from "./vnu-refresh";
 
 describe("bulk lookup input", () => {
   it("trims and deduplicates targets while preserving first occurrence", () => {
@@ -202,6 +203,79 @@ describe("bulk lookup progress", () => {
 
     expect(execution.progress.items).toEqual(items);
     expect(execution.progress.items.map((item) => item.target)).toEqual(targets);
+  });
+
+  it("preserves acknowledged items and marks the failed chunk plus later targets retryable after refresh", async () => {
+    const targets = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
+    let calls = 0;
+    const execution = await executeBulkLookup({
+      mode: "stdid-to-code",
+      targets,
+      signal: new AbortController().signal,
+      requestChunk: async (_mode, chunk) => {
+        calls += 1;
+        if (calls === 2) throw new VnuRequestNotReplayedError();
+        return chunk.map((target) => ({ target, status: "ok", result: { studentCode: `SYNTHETIC-${target}` } }));
+      },
+    });
+
+    expect(calls).toBe(2);
+    expect(execution.progress.items.map((item) => item.target)).toEqual(targets.slice(0, 5));
+    expect(execution.remainingTargets).toEqual(["foxtrot"]);
+    expect(execution).toMatchObject({ aborted: false, restoredWithoutReplay: true, error: undefined });
+  });
+
+  it("manual retry preserves progress and sends only remaining targets", async () => {
+    const requestedTargets: string[][] = [];
+    const first = await executeBulkLookup({
+      mode: "stdid-to-code",
+      targets: ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"],
+      signal: new AbortController().signal,
+      requestChunk: async (_mode, chunk) => {
+        requestedTargets.push(chunk);
+        if (chunk[0] === "foxtrot") throw new VnuRequestNotReplayedError();
+        return chunk.map((target) => ({ target, status: "error", errorCode: "SYNTHETIC" }));
+      },
+    });
+    const retry = await executeBulkLookup({
+      mode: "stdid-to-code",
+      targets: first.remainingTargets,
+      initialProgress: first.progress,
+      signal: new AbortController().signal,
+      requestChunk: async (_mode, chunk) => {
+        requestedTargets.push(chunk);
+        return chunk.map((target) => ({ target, status: "error", errorCode: "SYNTHETIC" }));
+      },
+    });
+
+    expect(requestedTargets).toEqual([
+      ["alpha", "bravo", "charlie", "delta", "echo"],
+      ["foxtrot"],
+      ["foxtrot"],
+    ]);
+    expect(retry.progress.items.map((item) => item.target)).toEqual(["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"]);
+    expect(retry.remainingTargets).toEqual([]);
+    expect(retry.restoredWithoutReplay).toBe(false);
+  });
+
+  it("keeps restored state false when cancellation wins a late no-replay rejection", async () => {
+    const controller = new AbortController();
+    const execution = await executeBulkLookup({
+      mode: "stdid-to-code",
+      targets: ["alpha"],
+      signal: controller.signal,
+      requestChunk: async () => {
+        controller.abort(new DOMException("Synthetic cancellation", "AbortError"));
+        throw new VnuRequestNotReplayedError();
+      },
+    });
+
+    expect(execution).toMatchObject({
+      aborted: true,
+      restoredWithoutReplay: false,
+      remainingTargets: ["alpha"],
+      error: undefined,
+    });
   });
 });
 
