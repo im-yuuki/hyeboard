@@ -267,6 +267,38 @@ describe("export models", () => {
       }
     }
   });
+
+  it("preserves spaced VNU course display in class, grades, and transcript JSON and CSV", () => {
+    const spacedTerm: ExportDerivedTerm = {
+      ...term,
+      courses: [{ courseCode: "INT 3103", courseName: "Synthetic Parsing", credits: 3 }],
+    };
+    const models = [
+      createClassLookupExport({
+        surface: "class-forward",
+        universityId: "vnu",
+        query: { mode: "course-and-class", value: "INT3103 / 6" },
+        result: { classCode: "INT 3103", classNumber: "6", classId: "SYNTHETIC-CLASS-ID", courseName: "Synthetic Parsing" },
+      }),
+      createGradesExport({ surface: "grades-page", universityId: "vnu", derivedTerms: [spacedTerm] }),
+      createTranscriptExport({
+        universityId: "vnu",
+        query: { mode: "stdId", value: "SYNTHETIC-TARGET" },
+        derivedTerms: [spacedTerm],
+      }),
+    ];
+
+    for (const model of models) {
+      const json = serializeExportJson(model);
+      const csv = parseRfc4180Csv(serializeExportCsv(model));
+      const header = csv.rows[0]!;
+      const classCode = header.indexOf("class_code");
+      const courseCode = header.indexOf("course_code");
+
+      expect(json).toContain("INT 3103");
+      expect(csv.rows.slice(1).some((row) => row[classCode] === "'INT 3103" || row[courseCode] === "'INT 3103")).toBe(true);
+    }
+  });
 });
 
 describe("CSV", () => {

@@ -7,6 +7,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Empty, FeatureHeader, FeedItem, StatusBadge } from "@/components/shared";
 import { api } from "@/lib/api";
 import { useLocale } from "@/lib/i18n";
+import { filterDocumentsByUniversity } from "@/lib/university-course-search";
 import { cn, formatDateTime } from "@/lib/utils";
 import { useFeatureQuery, useHyeboard } from "@/state";
 
@@ -62,9 +63,7 @@ export function DocumentsPage() {
   const docs = useFeatureQuery("documents", () => api.documents(state.universityId), { enabled: showDocuments });
   const news = useFeatureQuery("news", () => api.news(state.universityId), { enabled: showNews });
   const requests = useFeatureQuery("requests", () => api.requests(state.universityId), { enabled: showRequests });
-  const filteredDocs = docSearch.trim()
-    ? docs.data?.filter((item) => `${item.name} ${item.courseCode ?? ""}`.toLowerCase().includes(docSearch.trim().toLowerCase()))
-    : docs.data;
+  const filteredDocs = filterDocumentsByUniversity(docs.data, docSearch, state.universityId);
 
   return (
     <div className="space-y-4">

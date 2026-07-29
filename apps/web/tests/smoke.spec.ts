@@ -164,6 +164,51 @@ async function openMockedLookup(page: import("@playwright/test").Page, bulkMaxim
   return requestCounts;
 }
 
+async function switchDemoShellToVnu(page: import("@playwright/test").Page): Promise<void> {
+  await loginDemo(page);
+  await page.evaluate(() => {
+    const accounts = JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<Record<string, unknown>>;
+    const activeAccountId = localStorage.getItem("hyeboard.activeAccountId");
+    localStorage.setItem("hyeboard.accounts", JSON.stringify(accounts.map((account) => (
+      account.id === activeAccountId ? { ...account, universityId: "vnu" } : account
+    ))));
+    localStorage.setItem("hyeboard.universityId", "vnu");
+    window.dispatchEvent(new CustomEvent("hyeboard:account-switched"));
+  });
+}
+
+async function openMockedVnuLookup(page: import("@playwright/test").Page): Promise<() => number> {
+  let examRequests = 0;
+  await page.route("**/api/vnu/raw/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === "/api/vnu/raw/exams") examRequests += 1;
+    const html = path === "/api/vnu/raw/exams"
+      ? `<table><tr><td>1</td><td>252-INT&nbsp;3103-CN7</td><td>Synthetic Search Systems</td><td>31/12/2099</td><td>9(09:00)</td><td>Synthetic</td><td>LAB-SYNTHETIC</td><td>1</td><td><input name="hidCrdID" value="SYNTHETIC-VNU-CLASS-ID"></td></tr></table>`
+      : "<main></main>";
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { html }, error: null }) });
+  });
+  await switchDemoShellToVnu(page);
+  await page.goto("/lookup");
+  await expect(page.getByRole("heading", { name: "Lookup", exact: true })).toBeVisible();
+  return () => examRequests;
+}
+
+async function openMockedVnuDocuments(page: import("@playwright/test").Page): Promise<() => number> {
+  let syllabusRequests = 0;
+  await page.route("**/api/vnu/raw/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === "/api/vnu/raw/syllabus") syllabusRequests += 1;
+    const html = path === "/api/vnu/raw/syllabus"
+      ? `<table><tr><td>1</td><td>INT&nbsp;3103</td><td>Synthetic Syllabus</td><td>3</td><td><a href="synthetic.pdf">PDF</a></td><td></td><td>1 KB</td><td>31/12/2099</td></tr></table>`
+      : "<main></main>";
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { html }, error: null }) });
+  });
+  await switchDemoShellToVnu(page);
+  await page.goto("/documents");
+  await expect(page.getByText("INT 3103 — Synthetic Syllabus")).toBeVisible();
+  return () => syllabusRequests;
+}
+
 type ApiRequestSnapshot = {
   total: number;
   paths: Array<readonly [string, number]>;
@@ -1919,6 +1964,30 @@ test("lookup successful single results export both formats without refetch and c
   await expectNoPageOverflow(page);
 });
 
+test("VNU class lookup matches compact and spaced codes and exports preserved display", async ({ page }) => {
+  const apiRequestCount = trackApiRequestCounts(page);
+  const examRequests = await openMockedVnuLookup(page);
+  await page.getByLabel("Course code").fill("INT3103");
+  await page.getByLabel("Term").click();
+  await page.getByRole("option", { name: "Semester 2, 2025–2026 (supplementary)" }).click();
+  const row = page.getByTestId("lookup-results").locator(".list-row").filter({ hasText: "Synthetic Search Systems" });
+  await expect(row).toContainText("INT 3103 · CN7");
+  const requestsAfterCompactSearch = examRequests();
+  await page.getByLabel("Course code").fill(" INT 3103 ");
+  await expect(row).toContainText("INT 3103 · CN7");
+  expect(examRequests()).toBe(requestsAfterCompactSearch);
+
+  const exported = await expectExportFormats(page, "class-forward", apiRequestCount, {
+    sourcePath: "/api/vnu/raw/exams",
+    assertCsv: expectClassCsvMatchesJson,
+  });
+  expect(exported).toMatchObject({
+    surface: "class-forward",
+    universityId: "vnu",
+    results: [{ classResult: { classCode: "INT 3103", classNumber: "CN7", classId: "SYNTHETIC-VNU-CLASS-ID" } }],
+  });
+});
+
 test("lookup single-result errors remove stale export actions", async ({ page }) => {
   await openMockedLookup(page);
   const section = page.getByTestId("cross-student-code");
@@ -2352,6 +2421,21 @@ test("feature routes render UI instead of JSON dumps", async ({ page }) => {
   await expect(page.getByText("Written", { exact: false }).first()).toBeVisible();
   await expect(page.getByText("written", { exact: true })).toHaveCount(0);
   await expect(page.getByText(/07:00 AM/)).toHaveCount(0);
+});
+
+test("VNU spaced course codes match compact document searches without refetch", async ({ page }) => {
+  const syllabusRequests = await openMockedVnuDocuments(page);
+  const search = page.getByLabel("Search documents");
+  const document = page.getByText("INT 3103 — Synthetic Syllabus");
+
+  await search.fill("INT3103");
+  await expect(document).toBeVisible();
+  const requestsAfterCompactSearch = syllabusRequests();
+  await search.fill("INT 3103");
+  await expect(document).toBeVisible();
+  await search.fill("Synthetic Syllabus");
+  await expect(document).toBeVisible();
+  expect(syllabusRequests()).toBe(requestsAfterCompactSearch);
 });
 
 test("login fields expose persistent accessible labels on mobile", async ({ page }) => {

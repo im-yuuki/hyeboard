@@ -19,6 +19,7 @@ import { createBulkExport, createClassLookupExport, createResolverLookupExport, 
 import { useLocale } from "@/lib/i18n";
 import { formatTermLabel } from "@/lib/presentation";
 import { calculateTermAcademicSummaries, newestAcademicTermsFirst, type AcademicTermSummary } from "@/lib/term-academic-summary";
+import { filterCatalogRowsByUniversity } from "@/lib/university-course-search";
 import { useHyeboard } from "@/state";
 
 // Newest first - matches the convention every other term picker in the app
@@ -33,16 +34,6 @@ const TERMS_NEWEST_FIRST: readonly VnuExamTermInfo[] = [...VNU_EXAM_TERMS].rever
 // round-trip.
 const VNU_STD_ID_INPUT_PATTERN = /^\d{1,11}$/;
 const VNU_STUDENT_CODE_INPUT_PATTERN = /^\d{8}$/;
-
-function filterCatalogRows(rows: VnuExamCatalogRow[], courseCode: string, classNo: string): VnuExamCatalogRow[] {
-  const codeQuery = courseCode.trim().toUpperCase();
-  const classNoQuery = classNo.trim().toUpperCase();
-  return rows.filter((row) => {
-    if (codeQuery && !row.courseCode.toUpperCase().includes(codeQuery)) return false;
-    if (classNoQuery && (row.classNo ?? "").toUpperCase() !== classNoQuery) return false;
-    return true;
-  });
-}
 
 // Exact match only — no zero-padding or partial-match normalization, so a
 // query can never silently land on a class the user didn't ask for. Every
@@ -143,7 +134,7 @@ function ClassResolver() {
     enabled: Boolean(termOrdinal),
   });
 
-  const filteredRows = filterCatalogRows(catalogQuery.data ?? [], courseCode, classNo);
+  const filteredRows = filterCatalogRowsByUniversity(catalogQuery.data ?? [], courseCode, classNo, state.universityId);
 
   return (
     <div className="space-y-4" id="class-forward-panel">
