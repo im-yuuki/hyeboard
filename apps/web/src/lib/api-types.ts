@@ -13,6 +13,11 @@ export type StoredAccount = {
   addedAt: string;
 };
 
+export type ImportedAccountResult = {
+  account: StoredAccount;
+  auth: AuthResult;
+};
+
 export type ImportSessionInput = {
   studentCode?: string;
   studenthubGoogleCredential?: string;

@@ -1,5 +1,6 @@
 import { useNavigate } from "@tanstack/react-router";
 import { LogOut, Moon, Sun } from "lucide-react";
+import { useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -24,7 +25,15 @@ export function SettingsPage() {
   const { t, locale, setLocale } = useLocale();
   const navigate = useNavigate();
   const data = state.dashboard.data;
-  const signOut = () => { state.logout(); void navigate({ to: "/login" }); };
+  const signOut = async () => {
+    try {
+      await state.logout("settings");
+      await navigate({ to: "/login" });
+    } catch {
+      // State exposes translated inline failure copy; keep current account.
+    }
+  };
+  useEffect(() => () => state.clearAccountActionError("settings"), []);
   return (
     <div className="space-y-6">
       <FeatureHeader title={t.settings.title} description={t.settings.description} />
@@ -87,7 +96,8 @@ export function SettingsPage() {
             <CardDescription>{data?.student?.fullName ? t.settings.signedInAs(data.student.fullName, data.student.studentCode) : t.settings.sessionUnavailable}</CardDescription>
           </CardHeader>
           <CardContent>
-            <Button variant="destructive" className="w-full max-lg:min-h-11" onClick={signOut}><LogOut size={15} className="mr-2" />{t.settings.signOut}</Button>
+            <Button variant="destructive" className="w-full max-lg:min-h-11" onClick={() => { void signOut(); }} disabled={state.activeAccountId ? state.removingAccountIds.has(state.activeAccountId) : false}><LogOut size={15} className="mr-2" />{t.settings.signOut}</Button>
+            {state.accountActionError && state.accountActionErrorSource === "settings" && state.accountActionErrorAccountId === state.activeAccountId ? <p className="mt-2 text-sm text-destructive" role="alert">{state.accountActionError}</p> : null}
           </CardContent>
         </Card>
         <Card>

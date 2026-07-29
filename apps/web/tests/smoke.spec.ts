@@ -707,7 +707,12 @@ test("UET login leads with Google sign-in and reveals manual fallback on demand"
   await expect(page.getByRole("button", { name: "Open learning platform" })).toBeVisible();
 });
 
-test("login keeps relogin fields after session expiry", async ({ page }) => {
+test("VNU plaintext input never enters storage while UET relogin persistence remains", async ({ page }) => {
+  await page.route("**/api/vnu/auth/import-session", (route) => route.fulfill({
+    status: 401,
+    contentType: "application/json",
+    body: JSON.stringify({ data: null, error: { code: "INVALID_VNU_CREDENTIAL", message: "Synthetic invalid VNU credential" } }),
+  }));
   await page.goto("/login");
 
   await page.getByRole("button", { name: "Having trouble? Use a manual token instead" }).click();
@@ -720,16 +725,23 @@ test("login keeps relogin fields after session expiry", async ({ page }) => {
   await page.getByRole("option", { name: "VNU (daotao)" }).click();
   await page.getByPlaceholder("Student code / username").fill("24000000");
   await page.getByPlaceholder("Password").fill("vnu-relogin-password");
-  await page.evaluate(() => sessionStorage.removeItem("hyeboard.sessionToken"));
+  await page.getByRole("button", { name: "Import university session", exact: true }).click();
+  await expect(page.getByText("Synthetic invalid VNU credential")).toBeVisible();
+  expect(await page.evaluate(() => ({
+    username: sessionStorage.getItem("hyeboard.relogin.vnu.username"),
+    password: sessionStorage.getItem("hyeboard.relogin.vnu.password"),
+    grantKeys: Object.keys(sessionStorage).filter((key) => key.startsWith("hyeboard.vnu.refreshGrant.")),
+    local: JSON.stringify({ ...localStorage }),
+  }))).toEqual({ username: null, password: null, grantKeys: [], local: expect.not.stringContaining("vnu-relogin-password") });
   await page.reload();
 
   await page.getByRole("combobox", { name: "School" }).click();
   await page.getByRole("option", { name: "VNU (daotao)" }).click();
-  await expect(page.getByPlaceholder("Student code / username")).toHaveValue("24000000");
-  await expect(page.getByPlaceholder("Password")).toHaveValue("vnu-relogin-password");
+  await expect(page.getByPlaceholder("Student code / username")).toHaveValue("");
+  await expect(page.getByPlaceholder("Password")).toHaveValue("");
 });
 
-test("VNU session expiry clears account and preserves relogin credentials", async ({ page }) => {
+test("VNU plaintext is absent after session expiry and manual sign-in is empty", async ({ page }) => {
   await startMockedVnuSession(page, {
     code: "VNU_SESSION_EXPIRED",
     status: 401,
@@ -746,8 +758,8 @@ test("VNU session expiry clears account and preserves relogin credentials", asyn
 
   await page.getByRole("combobox", { name: "School" }).click();
   await page.getByRole("option", { name: "VNU (daotao)" }).click();
-  await expect(page.getByLabel("Username")).toHaveValue("synthetic-vnu-user");
-  await expect(page.getByLabel("Password", { exact: true })).toHaveValue("synthetic-vnu-password");
+  await expect(page.getByLabel("Username")).toHaveValue("");
+  await expect(page.getByLabel("Password", { exact: true })).toHaveValue("");
 
   const credentialStorage = await page.evaluate(() => {
     const credentialEntries = Object.entries(sessionStorage).filter(([, value]) => value === "synthetic-vnu-user" || value === "synthetic-vnu-password");
@@ -756,10 +768,7 @@ test("VNU session expiry clears account and preserves relogin credentials", asyn
       localStorageSerialized: JSON.stringify({ ...localStorage }),
     };
   });
-  expect(credentialStorage.sessionCredentials).toEqual({
-    "hyeboard.relogin.vnu.username": "synthetic-vnu-user",
-    "hyeboard.relogin.vnu.password": "synthetic-vnu-password",
-  });
+  expect(credentialStorage.sessionCredentials).toEqual({});
   expect(credentialStorage.localStorageSerialized).not.toContain("synthetic-vnu-user");
   expect(credentialStorage.localStorageSerialized).not.toContain("synthetic-vnu-password");
 
@@ -776,7 +785,462 @@ test("VNU session expiry clears account and preserves relogin credentials", asyn
   await newTab.close();
 });
 
-test("concurrent VNU session expiry removes only its originating account", async ({ page }) => {
+test("VNU grant import is account-scoped and deletes legacy plaintext", async ({ page }) => {
+  await page.route("**/api/**", (route) => route.abort());
+  await page.route("**/api/vnu/auth/import-session", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ data: {
+      token: "synthetic-scoped-access",
+      refreshGrant: "synthetic-scoped-grant",
+      session: { authenticated: true, universityId: "vnu", studentCode: "SYNTHETIC-SCOPED-STUDENT", expiresAt: "2099-01-01T00:00:00.000Z" },
+    }, error: null }),
+  }));
+  await page.goto("/login");
+  await page.evaluate(() => {
+    sessionStorage.setItem("hyeboard.relogin.vnu.username", "legacy-synthetic-user");
+    sessionStorage.setItem("hyeboard.relogin.vnu.password", "legacy-synthetic-password");
+  });
+  await page.getByRole("combobox", { name: "School" }).click();
+  await page.getByRole("option", { name: "VNU (daotao)" }).click();
+  await page.getByLabel("Username").fill("SYNTHETIC-SCOPED-USER");
+  await page.getByLabel("Password", { exact: true }).fill("SYNTHETIC-SCOPED-PASSWORD");
+  await page.getByRole("button", { name: "Import university session", exact: true }).click();
+
+  await expect.poll(() => page.evaluate(() => {
+    const account = (JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ id: string; studentCode?: string }>).find((item) => item.studentCode === "SYNTHETIC-SCOPED-STUDENT");
+    return account ? {
+      grant: sessionStorage.getItem(`hyeboard.vnu.refreshGrant.${account.id}`),
+      username: sessionStorage.getItem("hyeboard.relogin.vnu.username"),
+      password: sessionStorage.getItem("hyeboard.relogin.vnu.password"),
+    } : null;
+  })).toEqual({ grant: "synthetic-scoped-grant", username: null, password: null });
+});
+
+test("VNU new tab has no grant, expires to manual login, and removes active or inactive descriptors", async ({ page, context }) => {
+  test.slow();
+  await page.route("**/api/**", (route) => route.abort());
+  const targetId = "synthetic-vnu-new-tab";
+  const survivor = { id: "synthetic-new-tab-survivor", universityId: "mock", token: "synthetic-survivor-token", studentCode: "SYNTHETIC-SURVIVOR", addedAt: "2099-01-01T00:00:00.000Z" };
+  const seedSharedAccount = async (token: string, active: boolean) => {
+    await page.goto("/login");
+    await page.evaluate(({ accountId, accountToken, survivorAccount, targetIsActive }) => {
+      const target = { id: accountId, universityId: "vnu", token: accountToken, studentCode: "SYNTHETIC-NEW-TAB", addedAt: "2099-01-01T00:00:00.000Z" };
+      localStorage.setItem("hyeboard.accounts", JSON.stringify(targetIsActive ? [target, survivorAccount] : [survivorAccount, target]));
+      localStorage.setItem("hyeboard.activeAccountId", targetIsActive ? accountId : survivorAccount.id);
+      localStorage.setItem("hyeboard.universityId", targetIsActive ? "vnu" : "mock");
+      sessionStorage.setItem(`hyeboard.vnu.refreshGrant.${accountId}`, "synthetic-source-tab-grant");
+    }, { accountId: targetId, accountToken: token, survivorAccount: survivor, targetIsActive: active });
+  };
+
+  await page.goto("/login");
+  await page.evaluate(({ accountId }) => {
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([{ id: accountId, universityId: "vnu", token: "synthetic-expiring-new-tab-token", studentCode: "SYNTHETIC-NEW-TAB", addedAt: "2099-01-01T00:00:00.000Z" }]));
+    localStorage.setItem("hyeboard.activeAccountId", accountId);
+    localStorage.setItem("hyeboard.universityId", "vnu");
+    sessionStorage.setItem(`hyeboard.vnu.refreshGrant.${accountId}`, "synthetic-source-tab-grant");
+  }, { accountId: targetId });
+  const expiryTab = await context.newPage();
+  let refreshRequests = 0;
+  await expiryTab.route("**/api/**", (route) => route.abort());
+  await expiryTab.route("**/api/universities", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: [], error: null }) }));
+  await expiryTab.route("**/api/vnu/timetable**", (route) => route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ data: null, error: { code: "VNU_SESSION_EXPIRED", message: "Synthetic new-tab expiry" } }) }));
+  await expiryTab.route("**/api/vnu/auth/refresh", (route) => {
+    refreshRequests += 1;
+    return route.abort();
+  });
+  await expiryTab.goto("/timetable");
+  await expect(expiryTab).toHaveURL(/\/login$/);
+  expect(refreshRequests).toBe(0);
+  expect(await expiryTab.evaluate((accountId) => ({
+    accounts: JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as unknown[],
+    grant: sessionStorage.getItem(`hyeboard.vnu.refreshGrant.${accountId}`),
+  }), targetId)).toEqual({ accounts: [], grant: null });
+  await expiryTab.getByRole("combobox", { name: "School" }).click();
+  await expiryTab.getByRole("option", { name: "VNU (daotao)" }).click();
+  await expect(expiryTab.getByLabel("Username")).toHaveValue("");
+  await expect(expiryTab.getByLabel("Password", { exact: true })).toHaveValue("");
+  await expiryTab.close();
+
+  for (const descriptor of ["synthetic-live-descriptor", "authenticated-fully-expired-descriptor-token"]) {
+    for (const active of [true, false]) {
+      await seedSharedAccount(descriptor, active);
+      const removalTab = await context.newPage();
+      await removalTab.route("**/api/**", (route) => route.abort());
+      let logoutRequest: { authorization?: string; body: string | null } | undefined;
+      await removalTab.route("**/api/vnu/auth/logout", (route) => {
+        logoutRequest = { authorization: route.request().headers().authorization, body: route.request().postData() };
+        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { authenticated: false }, error: null }) });
+      });
+      await removalTab.goto(active ? "/settings" : "/");
+      expect(await removalTab.evaluate((accountId) => sessionStorage.getItem(`hyeboard.vnu.refreshGrant.${accountId}`), targetId)).toBeNull();
+      if (active) {
+        await removalTab.getByRole("button", { name: "Sign out" }).click();
+        await expect(removalTab).toHaveURL(/\/login$/);
+      } else {
+        await removalTab.getByRole("button", { name: "Open account menu" }).click();
+        await removalTab.getByRole("button", { name: "Remove SYNTHETIC-NEW-TAB" }).click();
+      }
+      await expect.poll(() => removalTab.evaluate((accountId) => {
+        const accounts = JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ id: string }>;
+        return accounts.some((account) => account.id === accountId);
+      }, targetId)).toBe(false);
+      expect(logoutRequest).toEqual({ authorization: `Bearer ${descriptor}`, body: JSON.stringify({}) });
+      expect(await removalTab.evaluate(() => {
+        const accounts = JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ id: string }>;
+        return accounts.map((account) => account.id);
+      })).toEqual([survivor.id]);
+      await removalTab.close();
+    }
+  }
+});
+
+test("VNU reconnect status is one polite nonblocking region and ignores inactive events", async ({ page }) => {
+  await page.route("**/api/**", (route) => route.abort());
+  let timetableRequests = 0;
+  let uetTimetableRequests = 0;
+  let universityRequests = 0;
+  await page.route("**/api/universities", (route) => {
+    universityRequests += 1;
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: [], error: null }) });
+  });
+  await page.route("**/api/vnu/timetable**", (route) => {
+    timetableRequests += 1;
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: [], error: null }) });
+  });
+  await page.route("**/api/uet/timetable**", (route) => {
+    uetTimetableRequests += 1;
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: [], error: null }) });
+  });
+  await page.goto("/login");
+  await page.evaluate(() => {
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([
+      { id: "synthetic-vnu-active", universityId: "vnu", token: "synthetic-active-token", studentCode: "SYNTHETIC-ACTIVE", addedAt: "2099-01-01T00:00:00.000Z" },
+      { id: "synthetic-vnu-inactive", universityId: "uet", token: "synthetic-inactive-token", studentCode: "SYNTHETIC-INACTIVE", addedAt: "2099-01-01T00:00:00.000Z" },
+    ]));
+    localStorage.setItem("hyeboard.activeAccountId", "synthetic-vnu-active");
+    localStorage.setItem("hyeboard.universityId", "vnu");
+  });
+  await page.goto("/timetable");
+  await expect.poll(() => timetableRequests).toBe(1);
+  const universityRequestsBeforeEvents = universityRequests;
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-status", { detail: { accountId: "synthetic-vnu-inactive", state: "reconnecting" } })));
+  await expect(page.getByText("Reconnecting to VNU…", { exact: true })).toHaveCount(0);
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-committed", { detail: { accountId: "synthetic-vnu-inactive" } })));
+  expect(timetableRequests).toBe(1);
+  expect(universityRequests).toBe(universityRequestsBeforeEvents);
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-status", { detail: { accountId: "synthetic-vnu-active", state: "reconnecting" } })));
+  const status = page.getByText("Reconnecting to VNU…", { exact: true });
+  await expect(status).toHaveCount(1);
+  await expect(status).toHaveAttribute("role", "status");
+  await expect(status).toHaveAttribute("aria-live", "polite");
+  await expect(status).toHaveText("Reconnecting to VNU…");
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-status", { detail: { accountId: "synthetic-vnu-active", state: "retryable" } })));
+  const retryableStatus = page.getByText("VNU could not reconnect. Retry the affected request.", { exact: true });
+  await expect(retryableStatus).toHaveCount(1);
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-status", { detail: { accountId: "synthetic-vnu-active", state: "idle" } })));
+  await expect(retryableStatus).toHaveCount(0);
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-committed", { detail: { accountId: "synthetic-vnu-active" } })));
+  await expect.poll(() => timetableRequests).toBe(2);
+  expect(universityRequests).toBe(universityRequestsBeforeEvents);
+  await page.evaluate(() => localStorage.setItem("hyeboard.locale", "vi"));
+  await page.reload();
+  await expect(page.getByTestId("account-trigger")).toBeVisible();
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-status", { detail: { accountId: "synthetic-vnu-active", state: "reconnecting" } })));
+  await expect(page.getByText("Đang kết nối lại với VNU…", { exact: true })).toBeVisible();
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-status", { detail: { accountId: "synthetic-vnu-active", state: "idle" } })));
+  await page.getByTestId("account-trigger").click();
+  await page.getByTestId("account-switch-item").filter({ hasText: "(UET)" }).click();
+  await expect.poll(() => uetTimetableRequests).toBe(1);
+  const vnuRequestsAfterSwitch = timetableRequests;
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-committed", { detail: { accountId: "synthetic-vnu-active" } })));
+  expect(uetTimetableRequests).toBe(1);
+  expect(timetableRequests).toBe(vnuRequestsAfterSwitch);
+});
+
+test("VNU remove keeps exact account pending and on revoke failure, then clears only its grant", async ({ page }) => {
+  await page.route("**/api/**", (route) => route.abort());
+  let releaseFirstLogout!: () => void;
+  const firstLogoutMayFinish = new Promise<void>((resolve) => { releaseFirstLogout = resolve; });
+  let logoutAttempt = 0;
+  const logoutRequests: Array<{ authorization?: string; body: string | null }> = [];
+  await page.route("**/api/vnu/auth/logout", async (route) => {
+    logoutAttempt += 1;
+    logoutRequests.push({ authorization: route.request().headers().authorization, body: route.request().postData() });
+    if (logoutAttempt === 1) {
+      await firstLogoutMayFinish;
+      await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ data: null, error: { code: "VNU_REFRESH_UNAVAILABLE", message: "Synthetic unavailable" } }) });
+      return;
+    }
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { authenticated: false }, error: null }) });
+  });
+  await page.goto("/login");
+  await page.evaluate(() => {
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([
+      { id: "synthetic-mock-active", universityId: "mock", token: "synthetic-mock-token", studentCode: "SYNTHETIC-ACTIVE", addedAt: "2099-01-01T00:00:00.000Z" },
+      { id: "synthetic-vnu-remove", universityId: "vnu", token: "synthetic-vnu-remove-token", studentCode: "SYNTHETIC-INACTIVE", addedAt: "2099-01-01T00:00:00.000Z" },
+    ]));
+    localStorage.setItem("hyeboard.activeAccountId", "synthetic-mock-active");
+    sessionStorage.setItem("hyeboard.vnu.refreshGrant.synthetic-vnu-remove", "synthetic-vnu-remove-grant");
+    sessionStorage.setItem("hyeboard.vnu.refreshGrant.synthetic-mock-active", "synthetic-active-grant");
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open account menu" }).click();
+  const removeButton = page.getByRole("button", { name: "Remove SYNTHETIC-INACTIVE" });
+  await removeButton.click();
+  await expect(removeButton).toBeDisabled();
+  releaseFirstLogout();
+  await expect(page.locator('[role="alert"]')).toHaveCount(1);
+  await expect(page.getByRole("alert")).toHaveText("Could not securely remove this VNU account. Try again.");
+  await expect(removeButton).toBeEnabled();
+  expect(await page.evaluate(() => ({
+    accountIds: (JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ id: string }>).map((account) => account.id),
+    grant: sessionStorage.getItem("hyeboard.vnu.refreshGrant.synthetic-vnu-remove"),
+  }))).toEqual({ accountIds: ["synthetic-mock-active", "synthetic-vnu-remove"], grant: "synthetic-vnu-remove-grant" });
+
+  await removeButton.click();
+  await expect(removeButton).toHaveCount(0);
+  await expect(page.locator('[role="alert"]')).toHaveCount(0);
+  expect(logoutRequests).toEqual([
+    { authorization: "Bearer synthetic-vnu-remove-token", body: JSON.stringify({ refreshGrant: "synthetic-vnu-remove-grant" }) },
+    { authorization: "Bearer synthetic-vnu-remove-token", body: JSON.stringify({ refreshGrant: "synthetic-vnu-remove-grant" }) },
+  ]);
+  expect(await page.evaluate(() => ({
+    accountIds: (JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ id: string }>).map((account) => account.id),
+    removedGrant: sessionStorage.getItem("hyeboard.vnu.refreshGrant.synthetic-vnu-remove"),
+    activeGrant: sessionStorage.getItem("hyeboard.vnu.refreshGrant.synthetic-mock-active"),
+  }))).toEqual({ accountIds: ["synthetic-mock-active"], removedGrant: null, activeGrant: "synthetic-active-grant" });
+});
+
+test("VNU active Settings logout uses its grant and one alert while 503 retains state and route", async ({ page }) => {
+  await page.route("**/api/**", (route) => route.abort());
+  let releaseLogout!: () => void;
+  const logoutMayFinish = new Promise<void>((resolve) => { releaseLogout = resolve; });
+  let logoutRequest: { authorization?: string; body: string | null } | undefined;
+  await page.route("**/api/vnu/auth/logout", async (route) => {
+    logoutRequest = { authorization: route.request().headers().authorization, body: route.request().postData() };
+    await logoutMayFinish;
+    await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ data: null, error: { code: "VNU_REFRESH_UNAVAILABLE", message: "Synthetic unavailable" } }) });
+  });
+  await page.goto("/login");
+  await page.evaluate(() => {
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([{ id: "synthetic-vnu-settings", universityId: "vnu", token: "synthetic-vnu-settings-token", studentCode: "SYNTHETIC-SETTINGS", addedAt: "2099-01-01T00:00:00.000Z" }]));
+    localStorage.setItem("hyeboard.activeAccountId", "synthetic-vnu-settings");
+    localStorage.setItem("hyeboard.universityId", "vnu");
+    sessionStorage.setItem("hyeboard.vnu.refreshGrant.synthetic-vnu-settings", "synthetic-vnu-settings-grant");
+  });
+  await page.goto("/settings");
+  const signOut = page.getByRole("button", { name: "Sign out" });
+  await signOut.click();
+  await expect(signOut).toBeDisabled();
+  releaseLogout();
+  await expect(page.locator('[role="alert"]')).toHaveCount(1);
+  await expect(page.getByRole("alert")).toHaveText("Could not securely remove this VNU account. Try again.");
+  await expect(page).toHaveURL(/\/settings$/);
+  await expect(signOut).toBeEnabled();
+  expect(logoutRequest).toEqual({
+    authorization: "Bearer synthetic-vnu-settings-token",
+    body: JSON.stringify({ refreshGrant: "synthetic-vnu-settings-grant" }),
+  });
+  expect(await page.evaluate(() => ({
+    accounts: (JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ id: string }>).map((account) => account.id),
+    grant: sessionStorage.getItem("hyeboard.vnu.refreshGrant.synthetic-vnu-settings"),
+  }))).toEqual({ accounts: ["synthetic-vnu-settings"], grant: "synthetic-vnu-settings-grant" });
+  await page.getByRole("button", { name: "Open account menu" }).click();
+  await expect(page.locator('[role="alert"]')).toHaveCount(1);
+  await expect(page.getByRole("alert")).toHaveText("Could not securely remove this VNU account. Try again.");
+});
+
+test("VNU reconnect cancelled by failed revoke leaves one alert and no stale reconnecting status", async ({ page }) => {
+  await page.route("**/api/**", (route) => route.abort());
+  await page.route("**/api/universities", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: [], error: null }) }));
+  await page.route("**/api/vnu/timetable**", (route) => route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ data: null, error: { code: "VNU_SESSION_EXPIRED", message: "Synthetic expiry" } }) }));
+  let markRefreshEntered!: () => void;
+  const refreshEntered = new Promise<void>((resolve) => { markRefreshEntered = resolve; });
+  let releaseOldRefresh!: () => void;
+  const oldRefreshMayFinish = new Promise<void>((resolve) => { releaseOldRefresh = resolve; });
+  await page.route("**/api/vnu/auth/refresh", async (route) => {
+    markRefreshEntered();
+    await oldRefreshMayFinish;
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: {
+      token: "synthetic-late-refresh-token",
+      refreshGrant: "synthetic-late-refresh-grant",
+      session: { authenticated: true, universityId: "vnu", studentCode: "SYNTHETIC-REFRESH-REVOKE", expiresAt: "2099-01-01T00:00:00.000Z" },
+    }, error: null }) }).catch(() => undefined);
+  });
+  await page.route("**/api/vnu/auth/logout", (route) => route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ data: null, error: { code: "VNU_REFRESH_UNAVAILABLE", message: "Synthetic logout unavailable" } }) }));
+  await page.goto("/login");
+  await page.evaluate(() => {
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([{ id: "synthetic-refresh-revoke", universityId: "vnu", token: "synthetic-refresh-revoke-token", studentCode: "SYNTHETIC-REFRESH-REVOKE", addedAt: "2099-01-01T00:00:00.000Z" }]));
+    localStorage.setItem("hyeboard.activeAccountId", "synthetic-refresh-revoke");
+    localStorage.setItem("hyeboard.universityId", "vnu");
+    sessionStorage.setItem("hyeboard.vnu.refreshGrant.synthetic-refresh-revoke", "synthetic-refresh-revoke-grant");
+  });
+  await page.goto("/timetable");
+  await refreshEntered;
+  await expect(page.getByText("Reconnecting to VNU…", { exact: true })).toBeVisible();
+  await page.evaluate(() => (document.querySelector('a[href="/settings"]') as HTMLElement | null)?.click());
+  await expect(page).toHaveURL(/\/settings$/);
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await expect(page.getByRole("button", { name: "Sign out" })).toBeEnabled();
+  await expect(page.locator('[role="alert"]')).toHaveCount(1);
+  await expect(page.getByText("Reconnecting to VNU…", { exact: true })).toHaveCount(0);
+  expect(await page.evaluate(() => ({
+    accountIds: (JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ id: string }>).map((account) => account.id),
+    grant: sessionStorage.getItem("hyeboard.vnu.refreshGrant.synthetic-refresh-revoke"),
+  }))).toEqual({ accountIds: ["synthetic-refresh-revoke"], grant: "synthetic-refresh-revoke-grant" });
+  releaseOldRefresh();
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+  await expect(page.getByText("Reconnecting to VNU…", { exact: true })).toHaveCount(0);
+  await expect(page.locator('[role="alert"]')).toHaveCount(1);
+});
+
+test("VNU remove failure cannot resurrect Settings ownership after route navigation", async ({ page }) => {
+  await page.route("**/api/**", (route) => route.abort());
+  let markLogoutEntered!: () => void;
+  const logoutEntered = new Promise<void>((resolve) => { markLogoutEntered = resolve; });
+  let releaseLogout!: () => void;
+  const logoutMayFinish = new Promise<void>((resolve) => { releaseLogout = resolve; });
+  await page.route("**/api/vnu/auth/logout", async (route) => {
+    markLogoutEntered();
+    await logoutMayFinish;
+    await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ data: null, error: { code: "VNU_REFRESH_UNAVAILABLE", message: "Synthetic delayed unavailable" } }) });
+  });
+  await page.goto("/login");
+  await page.evaluate(() => {
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([{ id: "synthetic-vnu-delayed-settings", universityId: "vnu", token: "synthetic-delayed-settings-token", studentCode: "SYNTHETIC-DELAYED", addedAt: "2099-01-01T00:00:00.000Z" }]));
+    localStorage.setItem("hyeboard.activeAccountId", "synthetic-vnu-delayed-settings");
+    localStorage.setItem("hyeboard.universityId", "vnu");
+    sessionStorage.setItem("hyeboard.vnu.refreshGrant.synthetic-vnu-delayed-settings", "synthetic-delayed-settings-grant");
+  });
+  await page.goto("/settings");
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await logoutEntered;
+  await page.evaluate(() => (document.querySelector('a[href="/"]') as HTMLElement | null)?.click());
+  await expect(page).toHaveURL(/\/$/);
+  const logoutResponse = page.waitForResponse((response) => response.url().includes("/api/vnu/auth/logout"));
+  releaseLogout();
+  await logoutResponse;
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+  await page.evaluate(() => (document.querySelector('a[href="/settings"]') as HTMLElement | null)?.click());
+  await expect(page).toHaveURL(/\/settings$/);
+  await expect(page.getByRole("button", { name: "Sign out" })).toBeEnabled();
+  await expect(page.locator('[role="alert"]')).toHaveCount(0);
+});
+
+test("VNU remove failure cannot resurrect a closed account-menu owner", async ({ page }) => {
+  await page.route("**/api/**", (route) => route.abort());
+  let markLogoutEntered!: () => void;
+  const logoutEntered = new Promise<void>((resolve) => { markLogoutEntered = resolve; });
+  let releaseLogout!: () => void;
+  const logoutMayFinish = new Promise<void>((resolve) => { releaseLogout = resolve; });
+  await page.route("**/api/vnu/auth/logout", async (route) => {
+    markLogoutEntered();
+    await logoutMayFinish;
+    await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ data: null, error: { code: "VNU_REFRESH_UNAVAILABLE", message: "Synthetic delayed unavailable" } }) });
+  });
+  await page.goto("/login");
+  await page.evaluate(() => {
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([
+      { id: "synthetic-menu-survivor", universityId: "mock", token: "synthetic-menu-survivor-token", studentCode: "SYNTHETIC-SURVIVOR", addedAt: "2099-01-01T00:00:00.000Z" },
+      { id: "synthetic-menu-delayed", universityId: "vnu", token: "synthetic-menu-delayed-token", studentCode: "SYNTHETIC-DELAYED", addedAt: "2099-01-01T00:00:00.000Z" },
+    ]));
+    localStorage.setItem("hyeboard.activeAccountId", "synthetic-menu-survivor");
+    localStorage.setItem("hyeboard.universityId", "mock");
+    sessionStorage.setItem("hyeboard.vnu.refreshGrant.synthetic-menu-delayed", "synthetic-menu-delayed-grant");
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open account menu" }).click();
+  await page.getByRole("button", { name: "Remove SYNTHETIC-DELAYED" }).click();
+  await logoutEntered;
+  await page.keyboard.press("Escape");
+  const logoutResponse = page.waitForResponse((response) => response.url().includes("/api/vnu/auth/logout"));
+  releaseLogout();
+  await logoutResponse;
+  await page.getByRole("button", { name: "Open account menu" }).click();
+  await expect(page.getByRole("button", { name: "Remove SYNTHETIC-DELAYED" })).toBeEnabled();
+  await expect(page.locator('[role="alert"]')).toHaveCount(0);
+});
+
+test("VNU remove older failure stays inert after a newer account action succeeds", async ({ page }) => {
+  await page.route("**/api/**", (route) => route.abort());
+  let markOlderEntered!: () => void;
+  const olderEntered = new Promise<void>((resolve) => { markOlderEntered = resolve; });
+  let releaseOlder!: () => void;
+  const olderMayFinish = new Promise<void>((resolve) => { releaseOlder = resolve; });
+  await page.route("**/api/vnu/auth/logout", async (route) => {
+    const authorization = route.request().headers().authorization;
+    if (authorization === "Bearer synthetic-older-token") {
+      markOlderEntered();
+      await olderMayFinish;
+      await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ data: null, error: { code: "VNU_REFRESH_UNAVAILABLE", message: "Synthetic older unavailable" } }) });
+      return;
+    }
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { authenticated: false }, error: null }) });
+  });
+  await page.goto("/login");
+  await page.evaluate(() => {
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([
+      { id: "synthetic-action-survivor", universityId: "mock", token: "synthetic-action-survivor-token", studentCode: "SYNTHETIC-SURVIVOR", addedAt: "2099-01-01T00:00:00.000Z" },
+      { id: "synthetic-action-older", universityId: "vnu", token: "synthetic-older-token", studentCode: "SYNTHETIC-OLDER", addedAt: "2099-01-01T00:00:00.000Z" },
+      { id: "synthetic-action-newer", universityId: "vnu", token: "synthetic-newer-token", studentCode: "SYNTHETIC-NEWER", addedAt: "2099-01-01T00:00:00.000Z" },
+    ]));
+    localStorage.setItem("hyeboard.activeAccountId", "synthetic-action-survivor");
+    localStorage.setItem("hyeboard.universityId", "mock");
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open account menu" }).click();
+  await page.getByRole("button", { name: "Remove SYNTHETIC-OLDER" }).click();
+  await olderEntered;
+  await page.keyboard.press("Escape");
+  await page.getByRole("button", { name: "Open account menu" }).click();
+  await page.getByRole("button", { name: "Remove SYNTHETIC-NEWER" }).click();
+  await expect(page.getByRole("button", { name: "Remove SYNTHETIC-NEWER" })).toHaveCount(0);
+  const olderResponse = page.waitForResponse((response) => response.request().headers().authorization === "Bearer synthetic-older-token");
+  releaseOlder();
+  await olderResponse;
+  await expect(page.getByRole("button", { name: "Remove SYNTHETIC-OLDER" })).toBeEnabled();
+  await expect(page.locator('[role="alert"]')).toHaveCount(0);
+  expect(await page.evaluate(() => (JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ id: string }>).map((account) => account.id))).toEqual([
+    "synthetic-action-survivor",
+    "synthetic-action-older",
+  ]);
+});
+
+test("VNU remove pending failure stays inert after account switch", async ({ page }) => {
+  await page.route("**/api/**", (route) => route.abort());
+  let markLogoutEntered!: () => void;
+  const logoutEntered = new Promise<void>((resolve) => { markLogoutEntered = resolve; });
+  let releaseLogout!: () => void;
+  const logoutMayFinish = new Promise<void>((resolve) => { releaseLogout = resolve; });
+  await page.route("**/api/vnu/auth/logout", async (route) => {
+    markLogoutEntered();
+    await logoutMayFinish;
+    await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ data: null, error: { code: "VNU_REFRESH_UNAVAILABLE", message: "Synthetic switched unavailable" } }) });
+  });
+  await page.goto("/login");
+  await page.evaluate(() => {
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([
+      { id: "synthetic-switch-pending", universityId: "vnu", token: "synthetic-switch-pending-token", studentCode: "SYNTHETIC-PENDING", addedAt: "2099-01-01T00:00:00.000Z" },
+      { id: "synthetic-switch-survivor", universityId: "mock", token: "synthetic-switch-survivor-token", studentCode: "SYNTHETIC-SURVIVOR", addedAt: "2099-01-01T00:00:00.000Z" },
+    ]));
+    localStorage.setItem("hyeboard.activeAccountId", "synthetic-switch-pending");
+    localStorage.setItem("hyeboard.universityId", "vnu");
+  });
+  await page.goto("/settings");
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await logoutEntered;
+  await page.getByRole("button", { name: "Open account menu" }).click();
+  await page.getByTestId("account-switch-item").filter({ hasText: "SYNTHETIC-SURVIVOR" }).click();
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("hyeboard.activeAccountId"))).toBe("synthetic-switch-survivor");
+  const logoutResponse = page.waitForResponse((response) => response.url().includes("/api/vnu/auth/logout"));
+  releaseLogout();
+  await logoutResponse;
+  await expect(page.getByRole("button", { name: "Sign out" })).toBeEnabled();
+  await expect(page.locator('[role="alert"]')).toHaveCount(0);
+});
+
+test("concurrent VNU expiry leaves a switched inactive origin inert", async ({ page }) => {
   await loginDemo(page);
   const survivingAccount = await page.evaluate(() => {
     const accounts = JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ id: string; universityId: string; token: string }>;
@@ -810,7 +1274,7 @@ test("concurrent VNU session expiry removes only its originating account", async
       activeAccountMatches: localStorage.getItem("hyeboard.activeAccountId") === expectedAccount?.id,
     };
   }, survivingAccount)).toEqual({
-    accountCount: 1,
+    accountCount: 2,
     survivingIdMatches: true,
     survivingTokenMatches: true,
     survivingUniversityMatches: true,

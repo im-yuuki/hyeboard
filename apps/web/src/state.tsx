@@ -1,10 +1,19 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
-import { ACCOUNT_SWITCHED_EVENT, api, clearSessionToken, getActiveAccount, getActiveAccountId, getSessionToken, listAccounts, removeAccount, type StoredAccount, switchAccount } from "@/lib/api";
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
+import { ACCOUNT_SWITCHED_EVENT, api, clearSessionToken, getActiveAccount, getActiveAccountId, getSessionToken, listAccounts, revokeAndRemoveAccount, shouldInvalidateVnuRefreshQuery, type StoredAccount, switchAccount, VNU_REFRESH_COMMITTED_EVENT, VNU_REFRESH_STATUS_EVENT } from "@/lib/api";
+import { useLocale } from "@/lib/i18n";
 import { UET_REAUTH_CREDENTIAL_KEYS } from "@/lib/reauth";
 
 export type Palette = "geist" | "uet" | "vnu";
 export type Mode = "light" | "dark";
+export type AccountActionSource = "account-menu" | "settings";
+
+type AccountActionOperation = {
+  generation: symbol;
+  accountId: string;
+  accountToken: string;
+  source: AccountActionSource;
+};
 
 export type HyeboardState = ReturnType<typeof useHyeboardState>;
 const HyeboardContext = createContext<HyeboardState | null>(null);
@@ -65,6 +74,7 @@ function clearAccentOverride(): void {
 
 function useHyeboardState() {
   const queryClient = useQueryClient();
+  const { t } = useLocale();
   const [universityId, setUniversityId] = useState<string>(() => stored("hyeboard.universityId", "uet"));
   const [palette, setPalette] = useState<Palette>(() => stored("hyeboard.palette", "uet"));
   const [mode, setMode] = useState<Mode>(() => stored("hyeboard.mode", "light"));
@@ -73,6 +83,24 @@ function useHyeboardState() {
   const [sessionNonce, setSessionNonce] = useState(0);
   const [accounts, setAccounts] = useState<StoredAccount[]>(() => listAccounts());
   const [activeAccountId, setActiveAccountId] = useState<string | null>(() => getActiveAccountId());
+  const [removingAccountIds, setRemovingAccountIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [accountActionError, setAccountActionError] = useState<string>();
+  const [accountActionErrorAccountId, setAccountActionErrorAccountId] = useState<string>();
+  const [accountActionErrorSource, setAccountActionErrorSource] = useState<AccountActionSource>();
+  const accountActionErrorSourceRef = useRef<AccountActionSource | undefined>(undefined);
+  const currentAccountActionRef = useRef<AccountActionOperation | undefined>(undefined);
+  const pendingAccountActionsRef = useRef(new Map<string, symbol>());
+  const [vnuReconnectState, setVnuReconnectState] = useState<"idle" | "reconnecting" | "retryable">("idle");
+
+  const clearAccountActionError = (source?: AccountActionSource): void => {
+    const currentSource = currentAccountActionRef.current?.source ?? accountActionErrorSourceRef.current;
+    if (source && currentSource !== source) return;
+    currentAccountActionRef.current = undefined;
+    accountActionErrorSourceRef.current = undefined;
+    setAccountActionError(undefined);
+    setAccountActionErrorAccountId(undefined);
+    setAccountActionErrorSource(undefined);
+  };
 
   // Fires on every account switch/add/remove (see ACCOUNT_SWITCHED_EVENT in
   // lib/api.ts) - re-syncs universityId/palette to whichever account is now
@@ -81,6 +109,8 @@ function useHyeboardState() {
     const syncActiveAccount = () => {
       setAccounts(listAccounts());
       setActiveAccountId(getActiveAccountId());
+      setVnuReconnectState("idle");
+      clearAccountActionError();
       const account = getActiveAccount();
       if (account) {
         setUniversityId(account.universityId);
@@ -92,6 +122,41 @@ function useHyeboardState() {
     window.addEventListener(ACCOUNT_SWITCHED_EVENT, syncActiveAccount);
     return () => window.removeEventListener(ACCOUNT_SWITCHED_EVENT, syncActiveAccount);
   }, []);
+
+  useEffect(() => {
+    const readDetail = (event: Event): { accountId: string; state?: "idle" | "reconnecting" | "retryable" } | undefined => {
+      const detail = (event as CustomEvent<unknown>).detail;
+      if (!detail || typeof detail !== "object") return undefined;
+      const candidate = detail as { accountId?: unknown; state?: unknown };
+      if (typeof candidate.accountId !== "string") return undefined;
+      if (candidate.state !== undefined && candidate.state !== "idle" && candidate.state !== "reconnecting" && candidate.state !== "retryable") return undefined;
+      return { accountId: candidate.accountId, state: candidate.state };
+    };
+    const handleRefreshStatus = (event: Event) => {
+      const detail = readDetail(event);
+      const active = getActiveAccount();
+      if (!detail?.state || !active || active.id !== detail.accountId || active.universityId !== "vnu") return;
+      setVnuReconnectState(detail.state);
+    };
+    const handleRefreshCommitted = (event: Event) => {
+      const detail = readDetail(event);
+      const activeId = getActiveAccountId();
+      const active = getActiveAccount();
+      if (!detail || detail.accountId !== activeId || active?.universityId !== "vnu") return;
+      setVnuReconnectState("idle");
+      setSessionNonce((value) => value + 1);
+      void queryClient.invalidateQueries({
+        predicate: (query) => shouldInvalidateVnuRefreshQuery(query, detail.accountId, activeId),
+        refetchType: "none",
+      });
+    };
+    window.addEventListener(VNU_REFRESH_STATUS_EVENT, handleRefreshStatus);
+    window.addEventListener(VNU_REFRESH_COMMITTED_EVENT, handleRefreshCommitted);
+    return () => {
+      window.removeEventListener(VNU_REFRESH_STATUS_EVENT, handleRefreshStatus);
+      window.removeEventListener(VNU_REFRESH_COMMITTED_EVENT, handleRefreshCommitted);
+    };
+  }, [queryClient]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = palette;
@@ -137,18 +202,66 @@ function useHyeboardState() {
     void queryClient.invalidateQueries();
   };
 
-  const logout = () => {
-    // Best-effort server-side revocation while the Authorization header still carries a
-    // valid token - this is what actually invalidates any persisted uetGoogleCredential.
-    // api.logout() never throws, so this fire-and-forget call never blocks local sign-out.
-    void api.logout(universityId);
-    clearReloginSecrets();
-    clearSessionToken();
-    setSessionNonce((value) => value + 1);
-    void queryClient.invalidateQueries();
+  const removeStoredAccount = async (accountId: string, source: AccountActionSource = "account-menu"): Promise<void> => {
+    if (pendingAccountActionsRef.current.has(accountId)) return;
+    const origin = listAccounts().find((account) => account.id === accountId);
+    if (!origin) return;
+    const operation: AccountActionOperation = {
+      generation: Symbol(`account-action:${accountId}`),
+      accountId,
+      accountToken: origin.token,
+      source,
+    };
+    currentAccountActionRef.current = operation;
+    accountActionErrorSourceRef.current = source;
+    pendingAccountActionsRef.current.set(accountId, operation.generation);
+    setAccountActionError(undefined);
+    setAccountActionErrorAccountId(undefined);
+    setAccountActionErrorSource(source);
+    setRemovingAccountIds((ids) => new Set(ids).add(accountId));
+    let publishedError = false;
+    try {
+      await revokeAndRemoveAccount(accountId);
+      setAccounts(listAccounts());
+      setActiveAccountId(getActiveAccountId());
+    } catch (error) {
+      const account = listAccounts().find((candidate) => candidate.id === accountId);
+      const operationStillOwnsError = currentAccountActionRef.current?.generation === operation.generation
+        && pendingAccountActionsRef.current.get(accountId) === operation.generation
+        && account?.token === operation.accountToken
+        && (source !== "settings" || getActiveAccountId() === accountId);
+      if (operationStillOwnsError) {
+        publishedError = true;
+        setAccountActionError(account.universityId === "vnu" ? t.common.vnuRevocationFailed : error instanceof Error ? error.message : t.common.vnuRevocationFailed);
+        setAccountActionErrorAccountId(accountId);
+        setAccountActionErrorSource(source);
+      }
+      throw error;
+    } finally {
+      if (pendingAccountActionsRef.current.get(accountId) === operation.generation) {
+        pendingAccountActionsRef.current.delete(accountId);
+        setRemovingAccountIds((ids) => {
+          const next = new Set(ids);
+          next.delete(accountId);
+          return next;
+        });
+      }
+      if (!publishedError && currentAccountActionRef.current?.generation === operation.generation) {
+        currentAccountActionRef.current = undefined;
+        accountActionErrorSourceRef.current = undefined;
+        setAccountActionErrorSource(undefined);
+      }
+    }
   };
 
-  return { universityId, selectUniversity, palette, setPalette, mode, setMode, themeHue, setThemeHue, termCode, setTermCode, universities, dashboard, ensureSession, refreshSession, logout, sessionNonce, accounts, activeAccountId, switchToAccount: switchAccount, removeStoredAccount: removeAccount };
+  const logout = async (source: AccountActionSource = "settings"): Promise<void> => {
+    const accountId = getActiveAccountId();
+    if (!accountId) return;
+    await removeStoredAccount(accountId, source);
+    clearReloginSecrets();
+  };
+
+  return { universityId, selectUniversity, palette, setPalette, mode, setMode, themeHue, setThemeHue, termCode, setTermCode, universities, dashboard, ensureSession, refreshSession, logout, sessionNonce, accounts, activeAccountId, switchToAccount: switchAccount, removeStoredAccount, removingAccountIds, accountActionError, accountActionErrorAccountId, accountActionErrorSource, clearAccountActionError, vnuReconnectState };
 }
 
 export function useFeatureQuery<T>(name: string, queryFn: () => Promise<T>, options: { enabled?: boolean } = {}) {

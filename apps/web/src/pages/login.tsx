@@ -93,8 +93,8 @@ export function LoginPage() {
   const [canvasToken, setCanvasToken] = useState(() => sessionStored(RELOGIN_KEYS.uetCanvasToken));
   const [canvasCookie, setCanvasCookie] = useState("");
   const [canvasCsrfToken, setCanvasCsrfToken] = useState("");
-  const [vnuUsername, setVnuUsername] = useState(() => sessionStored(RELOGIN_KEYS.vnuUsername));
-  const [vnuPassword, setVnuPassword] = useState(() => sessionStored(RELOGIN_KEYS.vnuPassword));
+  const [vnuUsername, setVnuUsername] = useState("");
+  const [vnuPassword, setVnuPassword] = useState("");
   const [status, setStatus] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [uetGoogleEmail, setUetGoogleEmail] = useState(() => sessionStored(RELOGIN_KEYS.uetGoogleEmail));
@@ -233,8 +233,8 @@ export function LoginPage() {
     setBusy(true);
     setStatus(t.login.securingSession);
     try {
-      await api.importSession("vnu", { vnuUsername: vnuUsername || undefined, vnuPassword: vnuPassword || undefined });
-      state.selectUniversity("vnu", { clearSession: false });
+      const { account } = await api.importSession("vnu", { vnuUsername: vnuUsername || undefined, vnuPassword: vnuPassword || undefined });
+      state.selectUniversity(account.universityId, { clearSession: false });
       state.refreshSession();
       setStatus(t.login.sessionReadyOpening);
       await navigate({ to: "/" });
@@ -378,11 +378,11 @@ export function LoginPage() {
               <>
                 <div className="grid gap-2">
                   <label htmlFor="vnu-username" className="text-sm font-medium">{t.login.usernameLabel}</label>
-                  <Input id="vnu-username" name="vnu-username" placeholder={t.login.studentUsernamePlaceholder} autoComplete="username" value={vnuUsername} onChange={(event) => { setVnuUsername(event.target.value); setSessionStored(RELOGIN_KEYS.vnuUsername, event.target.value); }} />
+                  <Input id="vnu-username" name="vnu-username" placeholder={t.login.studentUsernamePlaceholder} autoComplete="username" value={vnuUsername} onChange={(event) => setVnuUsername(event.target.value)} />
                 </div>
                 <div className="grid gap-2">
                   <label htmlFor="vnu-password" className="text-sm font-medium">{t.login.passwordLabel}</label>
-                  <Input id="vnu-password" name="vnu-password" type="password" autoComplete="current-password" placeholder={t.login.passwordPlaceholder} value={vnuPassword} onChange={(event) => { setVnuPassword(event.target.value); setSessionStored(RELOGIN_KEYS.vnuPassword, event.target.value); }} onKeyDown={(event) => submitOnEnter(event, importVnuSession)} />
+                  <Input id="vnu-password" name="vnu-password" type="password" autoComplete="current-password" placeholder={t.login.passwordPlaceholder} value={vnuPassword} onChange={(event) => setVnuPassword(event.target.value)} onKeyDown={(event) => submitOnEnter(event, importVnuSession)} />
                 </div>
                 <Button onClick={importVnuSession} disabled={busy} variant="outline" className="w-full">{busy ? <Loader2 size={16} className="animate-spin" /> : null}{t.login.importUniversitySession}</Button>
               </>

@@ -5,17 +5,18 @@ import { parseExamCatalogHtml, parseExamTermOptions, parseExamsHtml, parseGrades
 import { createLinkedAbortController } from "./abort-deadline";
 import { canReauthenticateInline, requestInlineReauth } from "./reauth";
 import { readUetSessionStream } from "./uet-session-stream";
-import { ApiError, markVnuRefreshAttempted, wasVnuRefreshAttempted, type AuthResult, type ImportSessionInput, type StoredAccount } from "./api-types";
+import { ApiError, markVnuRefreshAttempted, wasVnuRefreshAttempted, type AuthResult, type ImportedAccountResult, type ImportSessionInput, type StoredAccount } from "./api-types";
 import { classifyVnuRecovery, clearVnuRefreshGrant, readVnuRefreshGrant, requestPolicyFor, runVnuRefresh, storeVnuRefreshGrant, VNU_REQUEST_NOT_REPLAYED, VnuRequestNotReplayedError, type VnuRequestPolicy } from "./vnu-refresh";
 
 export { ApiError } from "./api-types";
-export type { AuthResult, ImportSessionInput, StoredAccount } from "./api-types";
+export type { AuthResult, ImportedAccountResult, ImportSessionInput, StoredAccount } from "./api-types";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
 const SESSION_KEY = "hyeboard.sessionToken";
 const ACCOUNTS_KEY = "hyeboard.accounts";
 const ACTIVE_ACCOUNT_KEY = "hyeboard.activeAccountId";
 const UET_LOGIN_DEADLINE_MS = 3 * 60_000;
+const LEGACY_VNU_RELOGIN_KEYS = ["hyeboard.relogin.vnu.username", "hyeboard.relogin.vnu.password"] as const;
 
 function uuid(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
@@ -111,6 +112,55 @@ export function upsertAccount(universityId: string, token: string, studentCode?:
   else accounts.push(account);
   writeAccounts(accounts);
   localStorage.setItem(ACTIVE_ACCOUNT_KEY, account.id);
+  window.dispatchEvent(new CustomEvent(ACCOUNT_SWITCHED_EVENT));
+  return account;
+}
+
+function restoreStorageValue(storage: Storage, key: string, value: string | null): void {
+  if (value === null) storage.removeItem(key);
+  else storage.setItem(key, value);
+}
+
+function buildImportedAccount(accounts: StoredAccount[], universityId: string, auth: AuthResult): { account: StoredAccount; index: number } {
+  const studentCode = auth.session.studentCode;
+  const index = accounts.findIndex((account) => account.universityId === universityId && (account.studentCode ?? "") === (studentCode ?? ""));
+  if (index < 0) {
+    return {
+      account: { id: uuid(), universityId, token: auth.token, studentCode, addedAt: new Date().toISOString() },
+      index,
+    };
+  }
+  return {
+    account: { ...accounts[index], token: auth.token, studentCode: studentCode ?? accounts[index].studentCode },
+    index,
+  };
+}
+
+function commitImportedAccount(universityId: string, auth: AuthResult): StoredAccount {
+  const beforeAccounts = localStorage.getItem(ACCOUNTS_KEY);
+  const beforeActiveAccountId = localStorage.getItem(ACTIVE_ACCOUNT_KEY);
+  const accounts = readAccounts();
+  const { account, index } = buildImportedAccount(accounts, universityId, auth);
+  const beforeGrant = readVnuRefreshGrant(account.id);
+
+  try {
+    if (universityId === "vnu") {
+      if (auth.refreshGrant) storeVnuRefreshGrant(account.id, auth.refreshGrant);
+      else clearVnuRefreshGrant(account.id);
+    }
+    if (index < 0) accounts.push(account);
+    else accounts[index] = account;
+    writeAccounts(accounts);
+    localStorage.setItem(ACTIVE_ACCOUNT_KEY, account.id);
+    for (const key of LEGACY_VNU_RELOGIN_KEYS) sessionStorage.removeItem(key);
+  } catch (error) {
+    restoreStorageValue(localStorage, ACCOUNTS_KEY, beforeAccounts);
+    restoreStorageValue(localStorage, ACTIVE_ACCOUNT_KEY, beforeActiveAccountId);
+    if (beforeGrant) storeVnuRefreshGrant(account.id, beforeGrant);
+    else clearVnuRefreshGrant(account.id);
+    throw error;
+  }
+
   window.dispatchEvent(new CustomEvent(ACCOUNT_SWITCHED_EVENT));
   return account;
 }
@@ -243,6 +293,10 @@ async function executeRequest<T>(path: string, init: RequestInit, token: string 
   return { data: payload.data as T, meta: payload.meta };
 }
 
+async function requestWithAccount<T>(account: StoredAccount, path: string, init: RequestInit): Promise<T> {
+  return (await executeRequest<T>(path, init, account.token)).data;
+}
+
 function reducedPolicy(routePolicy: VnuRequestPolicy, override: VnuRequestPolicy | undefined): VnuRequestPolicy {
   if (!override || override === routePolicy) return routePolicy;
   if (override === "never") return "never";
@@ -264,22 +318,68 @@ function removeUnchangedOrigin(account: StoredAccount): void {
   removeAccount(account.id);
 }
 
+const refreshControllers = new Map<string, Set<AbortController>>();
+const refreshSuppressedAccounts = new Set<string>();
+type VnuRefreshStatusGeneration = { generation: number; state: "reconnecting" | "retryable" | "idle" };
+const vnuRefreshStatuses = new Map<string, VnuRefreshStatusGeneration>();
+
+function publishVnuRefreshStatus(accountId: string, state: VnuRefreshStatusGeneration["state"]): void {
+  const previous = vnuRefreshStatuses.get(accountId);
+  const generation = state === "reconnecting" ? (previous?.generation ?? 0) + 1 : (previous?.generation ?? 0);
+  vnuRefreshStatuses.set(accountId, { generation, state });
+  window.dispatchEvent(new CustomEvent(VNU_REFRESH_STATUS_EVENT, { detail: { accountId, state } }));
+}
+
+function resetCancelledReconnectStatus(
+  origin: StoredAccount,
+  originGrant: string | undefined,
+  cancelledStatus: VnuRefreshStatusGeneration | undefined,
+): void {
+  if (cancelledStatus?.state !== "reconnecting") return;
+  const currentAccount = getAccountById(origin.id);
+  const currentStatus = vnuRefreshStatuses.get(origin.id);
+  if (currentAccount?.token !== origin.token) return;
+  if (readVnuRefreshGrant(origin.id) !== originGrant) return;
+  if (currentStatus?.generation !== cancelledStatus.generation || currentStatus.state !== "reconnecting") return;
+  publishVnuRefreshStatus(origin.id, "idle");
+}
+
+export function cancelVnuRefreshForAccount(accountId: string): void {
+  refreshSuppressedAccounts.add(accountId);
+  const controllers = refreshControllers.get(accountId);
+  if (!controllers) return;
+  refreshControllers.delete(accountId);
+  for (const controller of controllers) controller.abort(new DOMException("VNU account action cancelled refresh", "AbortError"));
+}
+
 const refreshDeps = {
-  getAccount: getAccountById,
+  getAccount: (accountId: string) => refreshSuppressedAccounts.has(accountId) ? undefined : getAccountById(accountId),
   getActiveAccountId,
   fetchRefresh: async (account: StoredAccount, grant: string, signal: AbortSignal): Promise<AuthResult> => {
-    const result = await executeRequest<AuthResult>("/api/vnu/auth/refresh", {
-      method: "POST",
-      body: JSON.stringify({ refreshGrant: grant }),
-      signal,
-      cache: "no-store",
-    }, account.token);
-    return result.data;
+    const controller = new AbortController();
+    const controllers = refreshControllers.get(account.id) ?? new Set<AbortController>();
+    controllers.add(controller);
+    refreshControllers.set(account.id, controllers);
+    const abort = () => controller.abort(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    try {
+      const result = await executeRequest<AuthResult>("/api/vnu/auth/refresh", {
+        method: "POST",
+        body: JSON.stringify({ refreshGrant: grant }),
+        signal: controller.signal,
+        cache: "no-store",
+      }, account.token);
+      return result.data;
+    } finally {
+      signal.removeEventListener("abort", abort);
+      controllers.delete(controller);
+      if (controllers.size === 0) refreshControllers.delete(account.id);
+    }
   },
   commit: commitVnuRefresh,
   terminal: removeUnchangedOrigin,
   invalidate: (accountId: string) => window.dispatchEvent(new CustomEvent(VNU_REFRESH_COMMITTED_EVENT, { detail: { accountId } })),
-  status: (accountId: string, state: "reconnecting" | "retryable" | "idle") => window.dispatchEvent(new CustomEvent(VNU_REFRESH_STATUS_EVENT, { detail: { accountId, state } })),
+  status: publishVnuRefreshStatus,
 };
 
 async function request<T>(path: string, init: RequestInit = {}, internal: InternalRequestOptions = {}): Promise<T> {
@@ -558,11 +658,10 @@ export const api = {
   vnuCrossStudentId: (params: { stdCode: string }) => vnuCrossStudentId(params),
   vnuCrossTranscript: (input: VnuCrossTranscriptInput) => vnuCrossTranscript(input),
   vnuCrossLookupBulk: (mode: VnuBulkLookupMode, targets: string[], signal?: AbortSignal) => vnuCrossLookupBulk(mode, targets, signal),
-  importSession: async (universityId: string, body: ImportSessionInput) => {
-    const data = await request<AuthResult>(`/api/${universityId}/auth/import-session`, { method: "POST", body: JSON.stringify(body) });
-    const account = upsertAccount(universityId, data.token, data.session?.studentCode);
-    if (universityId === "vnu" && data.refreshGrant) storeVnuRefreshGrant(account.id, data.refreshGrant);
-    return data;
+  importSession: async (universityId: string, body: ImportSessionInput): Promise<ImportedAccountResult> => {
+    const auth = await request<AuthResult>(`/api/${universityId}/auth/import-session`, { method: "POST", body: JSON.stringify(body) });
+    const account = commitImportedAccount(universityId, auth);
+    return { account, auth };
   },
   // UET Google automation can take 90s+; parent direct login may pause for a
   // human CAPTCHA answer. Both use the Worker's SSE route. VNU, manual
@@ -636,4 +735,40 @@ export const api = {
       // Ignore - the local session is cleared regardless of server-side outcome.
     }
   },
+  revokeAndRemoveAccount,
 };
+
+export async function revokeAndRemoveAccount(accountId: string): Promise<void> {
+  const origin = getAccountById(accountId);
+  if (!origin) return;
+  const originRefreshGrant = origin.universityId === "vnu" ? readVnuRefreshGrant(origin.id) : undefined;
+  const cancelledRefreshStatus = vnuRefreshStatuses.get(origin.id);
+
+  cancelVnuRefreshForAccount(origin.id);
+  try {
+    if (origin.universityId === "vnu") {
+      await requestWithAccount<{ authenticated: false }>(origin, "/api/vnu/auth/logout", {
+        method: "POST",
+        body: JSON.stringify(originRefreshGrant ? { refreshGrant: originRefreshGrant } : {}),
+      });
+    } else {
+      try {
+        await requestWithAccount(origin, `/api/${origin.universityId}/auth/logout`, { method: "POST" });
+      } catch {
+        // Non-VNU logout remains best-effort; local removal must still finish.
+      }
+    }
+
+    const current = getAccountById(origin.id);
+    if (!current || current.token !== origin.token) return;
+    clearVnuRefreshGrant(origin.id);
+    for (const key of LEGACY_VNU_RELOGIN_KEYS) sessionStorage.removeItem(key);
+    vnuRefreshStatuses.delete(origin.id);
+    removeAccount(origin.id);
+  } catch (error) {
+    if (origin.universityId === "vnu") resetCancelledReconnectStatus(origin, originRefreshGrant, cancelledRefreshStatus);
+    throw error;
+  } finally {
+    refreshSuppressedAccounts.delete(origin.id);
+  }
+}

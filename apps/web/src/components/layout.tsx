@@ -101,6 +101,7 @@ function BrandMark({ collapsed = false }: { collapsed?: boolean } = {}) {
 
 export function RootLayout() {
   const { t } = useLocale();
+  const state = useHyeboard();
   const navigate = useNavigate();
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem("hyeboard.sidebarCollapsed") === "true");
@@ -157,6 +158,11 @@ export function RootLayout() {
             <AccountMenu />
           </header>
           <div className="p-4 lg:p-6">
+            {state.vnuReconnectState === "reconnecting" ? (
+              <p className="mb-3 text-sm text-muted-foreground" role="status" aria-live="polite">{t.common.vnuReconnecting}</p>
+            ) : state.vnuReconnectState === "retryable" ? (
+              <p className="mb-3 text-sm text-muted-foreground" role="status" aria-live="polite">{t.common.vnuReconnectRetryable}</p>
+            ) : null}
             <Outlet />
           </div>
         </main>
@@ -271,19 +277,27 @@ function AccountMenu() {
   const navigate = useNavigate();
   const student = state.dashboard.data?.student;
 
-  const signOut = () => {
-    state.logout();
-    void navigate({ to: "/login" });
+  const signOut = async () => {
+    try {
+      await state.logout("account-menu");
+      await navigate({ to: "/login" });
+    } catch {
+      // State exposes translated inline failure copy; keep current route/account.
+    }
   };
 
-  const handleRemove = (event: React.MouseEvent, accountId: string) => {
+  const handleRemove = async (event: React.MouseEvent, accountId: string) => {
     event.preventDefault();
     event.stopPropagation();
-    state.removeStoredAccount(accountId);
+    try {
+      await state.removeStoredAccount(accountId, "account-menu");
+    } catch {
+      // State exposes translated inline failure copy; keep exact account visible.
+    }
   };
 
   return (
-    <DropdownMenu>
+    <DropdownMenu modal={false} onOpenChange={(open) => { if (!open) state.clearAccountActionError("account-menu"); }}>
       <DropdownMenuTrigger asChild>
         <Button variant="ghost" size="sm" className="pressable-icon-button" aria-label={t.common.openAccountMenu} data-testid="account-trigger"><UserRound size={17} /></Button>
       </DropdownMenuTrigger>
@@ -307,18 +321,21 @@ function AccountMenu() {
                   {account.id === state.activeAccountId ? <Check size={14} className="shrink-0 text-primary" /> : <span className="w-3.5 shrink-0" />}
                   <span className="truncate">{accountLabel(account, t)} <span className="text-muted-foreground">({account.universityId.toUpperCase()})</span></span>
                 </span>
-                <button type="button" onClick={(event) => handleRemove(event, account.id)} aria-label={t.common.remove(accountLabel(account, t))} className="shrink-0 rounded p-0.5 text-muted-foreground hover:text-destructive">
+                <button type="button" onClick={(event) => { void handleRemove(event, account.id); }} disabled={state.removingAccountIds.has(account.id)} aria-label={t.common.remove(accountLabel(account, t))} className="grid min-h-11 min-w-11 shrink-0 place-items-center rounded text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50">
                   <X size={13} />
                 </button>
               </DropdownMenuItem>
             ))}
           </>
         ) : null}
+        {state.accountActionError && state.accountActionErrorAccountId && state.accountActionErrorSource === "account-menu" ? (
+          <p className="px-2 py-2 text-sm text-destructive" role="alert">{state.accountActionError}</p>
+        ) : null}
         <DropdownMenuSeparator />
         <DropdownMenuItem asChild><Link to="/settings"><Settings size={16} /> {t.common.settings}</Link></DropdownMenuItem>
         <DropdownMenuItem asChild><Link to="/login"><UserRound size={16} /> {t.common.addAccount}</Link></DropdownMenuItem>
         <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={signOut} className="text-destructive focus:text-destructive"><LogOut size={16} /> {t.common.signOut}</DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => { void signOut(); }} disabled={state.activeAccountId ? state.removingAccountIds.has(state.activeAccountId) : false} className="min-h-11 text-destructive focus:text-destructive"><LogOut size={16} /> {t.common.signOut}</DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -344,4 +361,3 @@ function NavLink({ to, label, icon: Icon, collapsed = false, mobile = false }: {
     </Link>
   );
 }
-

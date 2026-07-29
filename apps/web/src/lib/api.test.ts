@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { api, ApiError, commitVnuRefresh, getActiveAccount, isSessionDeathCode, listAccounts, shouldInvalidateVnuRefreshQuery, shouldRetryQuery, switchAccount, VNU_REFRESH_COMMITTED_EVENT, type StoredAccount } from "./api";
+import { api, ApiError, commitVnuRefresh, getActiveAccount, isSessionDeathCode, listAccounts, shouldInvalidateVnuRefreshQuery, shouldRetryQuery, switchAccount, VNU_REFRESH_COMMITTED_EVENT, VNU_REFRESH_STATUS_EVENT, type StoredAccount } from "./api";
 import { ApiError as SharedApiError, markVnuRefreshAttempted, wasVnuRefreshAttempted } from "./api-types";
 import { readVnuRefreshGrant, storeVnuRefreshGrant, VNU_REQUEST_NOT_REPLAYED } from "./vnu-refresh";
 
@@ -517,5 +517,266 @@ describe("frontend session-death policy", () => {
       session: { universityId: "vnu", studentCode: ACCOUNT.studentCode, expiresAt: "2036-01-01T08:00:00.000Z", authenticated: true },
     })).toThrow("Synthetic storage failure");
     expect(readVnuRefreshGrant(ACCOUNT.id)).toBe("opaque-grant-alpha");
+  });
+
+  it("returns the imported account and commits its grant before the sole switch event", async () => {
+    const dispatchEvent = vi.mocked(window.dispatchEvent);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      data: {
+        token: "opaque-access-alpha",
+        refreshGrant: "opaque-grant-alpha",
+        session: { universityId: "vnu", studentCode: "SYNTHETIC-STUDENT-ALPHA", expiresAt: "2036-01-01T08:00:00.000Z", authenticated: true },
+      },
+      error: null,
+    }))));
+
+    const result = await api.importSession("vnu", { vnuUsername: "SYNTHETIC-VNU-USER", vnuPassword: "SYNTHETIC-VNU-PASSWORD" });
+
+    expect(result.auth.token).toBe("opaque-access-alpha");
+    expect(result.account.studentCode).toBe("SYNTHETIC-STUDENT-ALPHA");
+    expect(readVnuRefreshGrant(result.account.id)).toBe("opaque-grant-alpha");
+    expect(dispatchEvent).toHaveBeenCalledTimes(1);
+    expect(listAccounts()).toContainEqual(result.account);
+  });
+
+  it("commits access-only VNU auth and clears a stale account grant", async () => {
+    storeVnuRefreshGrant(ACCOUNT.id, "stale-grant");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      data: {
+        token: "access-only-token",
+        session: { universityId: "vnu", studentCode: ACCOUNT.studentCode, expiresAt: "2036-01-01T08:00:00.000Z", authenticated: true },
+      },
+      error: null,
+    }))));
+
+    const result = await api.importSession("vnu", { vnuUsername: "SYNTHETIC-VNU-USER", vnuPassword: "SYNTHETIC-VNU-PASSWORD" });
+
+    expect(result.account.id).toBe(ACCOUNT.id);
+    expect(result.auth.refreshGrant).toBeUndefined();
+    expect(readVnuRefreshGrant(ACCOUNT.id)).toBeUndefined();
+    expect(window.dispatchEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it("rolls account, active account, and grant back when imported account persistence fails", async () => {
+    storeVnuRefreshGrant(ACCOUNT.id, "original-grant");
+    const originalSetItem = localStorage.setItem.bind(localStorage);
+    vi.spyOn(localStorage, "setItem").mockImplementation((key, value) => {
+      if (key === "hyeboard.accounts" && value.includes("replacement-access-token")) throw new Error("Synthetic import storage failure");
+      originalSetItem(key, value);
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      data: {
+        token: "replacement-access-token",
+        refreshGrant: "replacement-grant",
+        session: { universityId: "vnu", studentCode: ACCOUNT.studentCode, expiresAt: "2036-01-01T08:00:00.000Z", authenticated: true },
+      },
+      error: null,
+    }))));
+
+    await expect(api.importSession("vnu", { vnuUsername: "SYNTHETIC-VNU-USER", vnuPassword: "SYNTHETIC-VNU-PASSWORD" })).rejects.toThrow("Synthetic import storage failure");
+    expect(listAccounts()).toEqual([ACCOUNT]);
+    expect(getActiveAccount()).toEqual(ACCOUNT);
+    expect(readVnuRefreshGrant(ACCOUNT.id)).toBe("original-grant");
+    expect(window.dispatchEvent).not.toHaveBeenCalled();
+  });
+
+  it("retains exact account and grant when VNU revocation fails", async () => {
+    storeVnuRefreshGrant(ACCOUNT.id, "opaque-grant-alpha");
+    rejectNextRequest("VNU_REFRESH_UNAVAILABLE", 503);
+
+    await expect(api.revokeAndRemoveAccount(ACCOUNT.id)).rejects.toMatchObject({ code: "VNU_REFRESH_UNAVAILABLE" });
+
+    expect(listAccounts()).toEqual([ACCOUNT]);
+    expect(readVnuRefreshGrant(ACCOUNT.id)).toBe("opaque-grant-alpha");
+  });
+
+  it("uses the requested inactive VNU account token and grant", async () => {
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([ACCOUNT, SECOND_ACCOUNT]));
+    localStorage.setItem("hyeboard.activeAccountId", SECOND_ACCOUNT.id);
+    storeVnuRefreshGrant(ACCOUNT.id, "opaque-grant-alpha");
+    storeVnuRefreshGrant(SECOND_ACCOUNT.id, "opaque-grant-beta");
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ data: { authenticated: false }, error: null })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.revokeAndRemoveAccount(ACCOUNT.id);
+
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/vnu/auth/logout"), expect.objectContaining({
+      headers: expect.objectContaining({ Authorization: `Bearer ${ACCOUNT.token}` }),
+      body: JSON.stringify({ refreshGrant: "opaque-grant-alpha" }),
+    }));
+    expect(listAccounts()).toEqual([SECOND_ACCOUNT]);
+    expect(readVnuRefreshGrant(ACCOUNT.id)).toBeUndefined();
+    expect(readVnuRefreshGrant(SECOND_ACCOUNT.id)).toBe("opaque-grant-beta");
+  });
+
+  it("keeps non-VNU exact-account logout best-effort and preserves the active account", async () => {
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([UET_ACCOUNT, SECOND_ACCOUNT]));
+    localStorage.setItem("hyeboard.activeAccountId", SECOND_ACCOUNT.id);
+    storeVnuRefreshGrant(SECOND_ACCOUNT.id, "opaque-grant-beta");
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ data: null, error: { code: "UET_UPSTREAM_UNAVAILABLE", message: "Synthetic unavailable" } }), { status: 503 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.revokeAndRemoveAccount(UET_ACCOUNT.id);
+
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/uet/auth/logout"), expect.objectContaining({
+      headers: expect.objectContaining({ Authorization: `Bearer ${UET_ACCOUNT.token}` }),
+      method: "POST",
+    }));
+    expect(listAccounts()).toEqual([SECOND_ACCOUNT]);
+    expect(getActiveAccount()).toEqual(SECOND_ACCOUNT);
+    expect(readVnuRefreshGrant(SECOND_ACCOUNT.id)).toBe("opaque-grant-beta");
+  });
+
+  it.each(["active", "inactive"])("removes a %s grantless VNU account through its descriptor", async (kind) => {
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([ACCOUNT, SECOND_ACCOUNT]));
+    localStorage.setItem("hyeboard.activeAccountId", kind === "active" ? ACCOUNT.id : SECOND_ACCOUNT.id);
+    sessionStorage.clear();
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ data: { authenticated: false }, error: null })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.revokeAndRemoveAccount(ACCOUNT.id);
+
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/vnu/auth/logout"), expect.objectContaining({
+      headers: expect.objectContaining({ Authorization: `Bearer ${ACCOUNT.token}` }),
+      body: JSON.stringify({}),
+    }));
+    expect(listAccounts()).toEqual([SECOND_ACCOUNT]);
+  });
+
+  it.each(["active", "inactive"])("removes a %s grantless VNU account through a fully expired descriptor", async (kind) => {
+    const expired = { ...ACCOUNT, token: "authenticated-fully-expired-descriptor-token" };
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([expired, SECOND_ACCOUNT]));
+    localStorage.setItem("hyeboard.activeAccountId", kind === "active" ? expired.id : SECOND_ACCOUNT.id);
+    sessionStorage.clear();
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ data: { authenticated: false }, error: null })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.revokeAndRemoveAccount(expired.id);
+
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/vnu/auth/logout"), expect.objectContaining({
+      headers: expect.objectContaining({ Authorization: `Bearer ${expired.token}` }),
+      body: JSON.stringify({}),
+    }));
+    expect(listAccounts()).toEqual([SECOND_ACCOUNT]);
+  });
+
+  it("cancels an in-flight refresh before exact-account revocation can remove state", async () => {
+    storeVnuRefreshGrant(ACCOUNT.id, "opaque-grant-alpha");
+    let refreshSignal!: AbortSignal;
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: null, error: { code: "VNU_SESSION_EXPIRED", message: "Synthetic expiry" } }), { status: 401 }))
+      .mockImplementationOnce((_url, init: RequestInit) => {
+        refreshSignal = init.signal as AbortSignal;
+        return new Promise<Response>((_resolve, reject) => refreshSignal.addEventListener("abort", () => reject(refreshSignal.reason), { once: true }));
+      })
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: { authenticated: false }, error: null })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const refreshing = api.timetable("vnu");
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await api.revokeAndRemoveAccount(ACCOUNT.id);
+    await expect(refreshing).rejects.toMatchObject({ code: "VNU_SESSION_EXPIRED" });
+
+    expect(refreshSignal.aborted).toBe(true);
+    expect(listAccounts()).toEqual([]);
+    expect(readVnuRefreshGrant(ACCOUNT.id)).toBeUndefined();
+  });
+
+  it("clears reconnecting status when exact-account revoke fails after cancelling refresh", async () => {
+    storeVnuRefreshGrant(ACCOUNT.id, "opaque-grant-alpha");
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: null, error: { code: "VNU_SESSION_EXPIRED", message: "Synthetic expiry" } }), { status: 401 }))
+      .mockImplementationOnce((_url, init: RequestInit) => new Promise<Response>((_resolve, reject) => {
+        const signal = init.signal as AbortSignal;
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: null, error: { code: "VNU_REFRESH_UNAVAILABLE", message: "Synthetic logout unavailable" } }), { status: 503 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const refreshing = api.timetable("vnu");
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await expect(api.revokeAndRemoveAccount(ACCOUNT.id)).rejects.toMatchObject({ code: "VNU_REFRESH_UNAVAILABLE" });
+    await expect(refreshing).rejects.toMatchObject({ code: "VNU_SESSION_EXPIRED" });
+
+    const statusStates = vi.mocked(window.dispatchEvent).mock.calls
+      .map(([event]) => event as unknown as { type: string; detail: { accountId: string; state: string } })
+      .filter((event) => event.type === VNU_REFRESH_STATUS_EVENT && event.detail.accountId === ACCOUNT.id)
+      .map((event) => event.detail.state);
+    expect(statusStates).toEqual(["reconnecting", "idle"]);
+    expect(listAccounts()).toEqual([ACCOUNT]);
+    expect(readVnuRefreshGrant(ACCOUNT.id)).toBe("opaque-grant-alpha");
+  });
+
+  it("does not let an old failed revoke clear a newer reconnect generation for the same account artifacts", async () => {
+    storeVnuRefreshGrant(ACCOUNT.id, "opaque-grant-alpha");
+    let releaseLogout!: (response: Response) => void;
+    let releaseNewRefresh!: (response: Response) => void;
+    let requestNumber = 0;
+    const expiryResponse = () => new Response(JSON.stringify({ data: null, error: { code: "VNU_SESSION_EXPIRED", message: "Synthetic expiry" } }), { status: 401 });
+    const fetchMock = vi.fn((_url: string, init: RequestInit) => {
+      requestNumber += 1;
+      if (requestNumber === 1 || requestNumber === 4) return Promise.resolve(expiryResponse());
+      if (requestNumber === 2) {
+        return new Promise<Response>((_resolve, reject) => {
+          const signal = init.signal as AbortSignal;
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      }
+      if (requestNumber === 3) return new Promise<Response>((resolve) => { releaseLogout = resolve; });
+      if (requestNumber === 5) return new Promise<Response>((resolve) => { releaseNewRefresh = resolve; });
+      return Promise.resolve(new Response(JSON.stringify({ data: [], error: null })));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const oldRefreshing = api.timetable("vnu").then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const revoking = api.revokeAndRemoveAccount(ACCOUNT.id);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    await expect(oldRefreshing).resolves.toMatchObject({ code: "VNU_SESSION_EXPIRED" });
+
+    const newerRefreshing = api.timetable("vnu");
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5));
+
+    releaseLogout(new Response(JSON.stringify({ data: null, error: { code: "VNU_REFRESH_UNAVAILABLE", message: "Synthetic old logout unavailable" } }), { status: 503 }));
+    await expect(revoking).rejects.toMatchObject({ code: "VNU_REFRESH_UNAVAILABLE" });
+    const statesBeforeNewRefreshSettles = vi.mocked(window.dispatchEvent).mock.calls
+      .map(([event]) => event as unknown as { type: string; detail: { accountId: string; state: string } })
+      .filter((event) => event.type === VNU_REFRESH_STATUS_EVENT && event.detail.accountId === ACCOUNT.id)
+      .map((event) => event.detail.state);
+    expect(statesBeforeNewRefreshSettles).toEqual(["reconnecting", "reconnecting"]);
+
+    releaseNewRefresh(new Response(JSON.stringify({ data: {
+      token: "newer-rotated-token",
+      refreshGrant: "newer-rotated-grant",
+      session: { universityId: "vnu", studentCode: ACCOUNT.studentCode, expiresAt: "2036-01-01T08:00:00.000Z", authenticated: true },
+    }, error: null })));
+    await expect(newerRefreshing).resolves.toEqual([]);
+    expect(getActiveAccount()?.token).toBe("newer-rotated-token");
+    expect(readVnuRefreshGrant(ACCOUNT.id)).toBe("newer-rotated-grant");
+  });
+
+  it("leaves a newer same-account token and grant untouched after old revocation succeeds", async () => {
+    storeVnuRefreshGrant(ACCOUNT.id, "old-grant");
+    let release!: (response: Response) => void;
+    const fetchMock = vi.fn(() => new Promise<Response>((resolve) => { release = resolve; }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = api.revokeAndRemoveAccount(ACCOUNT.id);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    const replacement = { ...ACCOUNT, token: "newer-token" };
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([replacement]));
+    storeVnuRefreshGrant(ACCOUNT.id, "newer-grant");
+    release(new Response(JSON.stringify({ data: { authenticated: false }, error: null })));
+    await pending;
+
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/vnu/auth/logout"), expect.objectContaining({
+      headers: expect.objectContaining({ Authorization: `Bearer ${ACCOUNT.token}` }),
+      body: JSON.stringify({ refreshGrant: "old-grant" }),
+    }));
+    expect(listAccounts()).toEqual([replacement]);
+    expect(readVnuRefreshGrant(ACCOUNT.id)).toBe("newer-grant");
   });
 });
