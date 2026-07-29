@@ -10,6 +10,11 @@
 
 **Approved design:** `docs/superpowers/specs/2026-07-28-vnu-automatic-relogin-design.md`
 
+## Execution Status
+
+- `[COMPLETE]`: task implementation and task-level verification are committed. Any unchecked boxes beneath that heading are archived TDD execution instructions, not pending work.
+- `[PENDING]`: task has not been completed. Its unchecked boxes remain live execution steps.
+
 ---
 
 ## Worktree, Baseline, and Execution Guard
@@ -143,7 +148,9 @@ Eight sequential commits. Each task's GREEN command includes its package typeche
 
 ---
 
-### Task 1: Add Purpose-Bound Refresh-Grant Cryptography
+### Task 1 [COMPLETE]: Add Purpose-Bound Refresh-Grant Cryptography
+
+Completed in `9cf569e`. Unchecked step boxes below are the archived TDD recipe already executed for this commit.
 
 **Files:**
 - Modify: `packages/core/src/index.ts:108-154`
@@ -456,7 +463,9 @@ Expected: one commit; no other paths staged.
 
 ---
 
-### Task 2: Add Authoritative VNU Refresh Durable Object
+### Task 2 [COMPLETE]: Add Authoritative VNU Refresh Durable Object
+
+Completed in `3dfd375`. Unchecked step boxes below are the archived TDD recipe already executed for this commit.
 
 **Files:**
 - Create: `apps/worker/src/vnu-refresh-control.ts`
@@ -1070,7 +1079,9 @@ git commit -m "feat(worker): add authoritative VNU refresh control"
 
 ---
 
-### Task 3: Split Recoverability and Issue Grants Only After Verified Identity
+### Task 3 [COMPLETE]: Split Recoverability and Issue Grants Only After Verified Identity
+
+Completed in `abbf8f8`. Unchecked step boxes below are the archived TDD recipe already executed for this commit.
 
 **Files:**
 - Modify: `packages/schemas/src/index.ts:237-276`
@@ -1277,7 +1288,9 @@ git commit -m "feat(worker): issue verified VNU refresh grants"
 
 ---
 
-### Task 4: Add Refresh and Race-Safe Logout Routes
+### Task 4 [COMPLETE]: Add Refresh and Race-Safe Logout Routes
+
+Completed in `02a810e`. Unchecked step boxes below are the archived TDD recipe already executed for this commit.
 
 **Files:**
 - Modify: `apps/worker/src/app.ts:146-255,257-271,939-1008`
@@ -1576,7 +1589,9 @@ git commit -m "feat(worker): rotate and revoke VNU refresh grants"
 
 ---
 
-### Task 5: Add Exact-Account Browser Coordinator and Safe Replay Policy
+### Task 5 [COMPLETE]: Add Exact-Account Browser Coordinator and Safe Replay Policy
+
+Completed in `9375b02`. Unchecked step boxes below are the archived TDD recipe already executed for this commit.
 
 **Files:**
 - Create: `apps/web/src/lib/api-types.ts`
@@ -1934,7 +1949,9 @@ git commit -m "feat(web): coordinate VNU refresh and safe replay"
 
 ---
 
-### Task 6: Integrate Login, Reconnect Status, and Exact-Account Revocation UI
+### Task 6 [COMPLETE]: Integrate Login, Reconnect Status, and Exact-Account Revocation UI
+
+Completed in `fedda4d`. Unchecked step boxes below are the archived TDD recipe already executed for this commit.
 
 **Files:**
 - Modify: `apps/web/src/lib/api-types.ts`
@@ -2195,7 +2212,7 @@ git commit -m "feat(web): integrate VNU reconnect account lifecycle"
 
 ---
 
-### Task 7: Preserve Bulk Progress Across Refresh Without POST Replay
+### Task 7 [PENDING]: Preserve Bulk Progress Across Refresh Without POST Replay
 
 **Files:**
 - Modify: `apps/web/src/lib/bulk-lookup.ts:10-186`
@@ -2479,7 +2496,7 @@ git commit -m "feat(web): preserve bulk progress through VNU reconnect"
 
 ---
 
-### Task 8: Document Boundaries and Run Exhaustive Verification
+### Task 8 [PENDING]: Document Boundaries and Run Exhaustive Verification
 
 **Files:**
 - Modify: `README.md:20-27,56-74`
