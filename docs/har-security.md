@@ -9,3 +9,7 @@ Rules:
 - Store only manually redacted samples under `samples/har-redacted/`.
 - Document endpoint shapes and field names, not real values.
 - Use Worker secrets for encryption keys.
+
+## Reconnect grant handling
+
+Treat encrypted VNU reconnect grants as credentials. Never paste them into issues, logs, screenshots, HAR samples, query strings, exports, analytics, or test fixtures. Browser storage is limited to `sessionStorage` keys prefixed with `hyeboard.vnu.refreshGrant.`; new VNU server logs contain only stable operation, code, and status fields.

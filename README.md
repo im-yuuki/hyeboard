@@ -73,6 +73,12 @@ Exports are explicit browser-only JSON or CSV downloads built from sanitized res
 
 Raw HAR captures and any file containing real credentials/cookies/tokens must never be committed — `.gitignore` excludes `*.har`, `cred.txt`, `.env*`, and `.dev.vars`. See `docs/har-security.md` for HAR-handling guidance.
 
+### VNU reconnect grants
+
+Successful VNU sign-in returns an ordinary access token and a separate encrypted reconnect grant. The browser stores the grant only in the current tab's `sessionStorage`, keyed by Hyeboard's opaque local account ID. A new tab or browser restart requires manual VNU sign-in after upstream expiry.
+
+Reconnect grants have a fixed eight-hour lifetime from manual sign-in. Rotation does not extend that lifetime. Cloudflare deployments serialize refresh attempts plus linked access/grant activation and revocation through `VNU_REFRESH_CONTROL`. Self-hosted Node/Bun deployments have no equivalent durable authority: they issue no reconnect grant or linked descriptor, provide no automatic refresh, and retain existing access-session behavior without claiming exact revocation.
+
 ## License
 
 Hyeboard is licensed under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0-only).
