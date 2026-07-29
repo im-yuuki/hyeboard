@@ -11,6 +11,7 @@ import {
   applyCompleteRefresh,
   applyRevokeExactLinkedPair,
   applyRevokeLinkedPairByAccess,
+  applyRevokePrincipalByLinkedGrant,
   cleanVnuRefreshState,
   deriveVnuRefreshPrincipal,
   nextVnuRefreshAlarm,
@@ -25,6 +26,7 @@ const NOW = Date.parse("2036-02-03T04:05:06.000Z");
 const EXPIRY = NOW + 8 * 60 * 60 * 1000;
 const OLD: LinkedPair = { accessTokenId: "A".repeat(22), accessExpiresAt: EXPIRY - 60_000, grantId: "B".repeat(22), grantExpiresAt: EXPIRY };
 const NEXT: LinkedPair = { accessTokenId: "C".repeat(22), accessExpiresAt: EXPIRY + 60_000, grantId: "D".repeat(22), grantExpiresAt: EXPIRY };
+const grantTombstone = (pair: LinkedPair) => ({ accessTokenId: pair.accessTokenId, accessExpiresAt: pair.accessExpiresAt, grantExpiresAt: pair.grantExpiresAt });
 const stale = (state: VnuRefreshControlState): VnuRefreshControlState => ({ ...state, revokedAccess: { ...state.revokedAccess, ["S".repeat(22)]: NOW } });
 
 describe("normative VNU refresh contracts", () => {
@@ -44,6 +46,7 @@ describe("normative VNU refresh contracts", () => {
       { ...state, lease: { ...state.lease, accessTokenId: OLD.accessTokenId } },
       { ...state, active: { ...OLD, extra: true } },
       { ...state, revokedAccess: undefined },
+      { ...state, revokedGrants: { ["E".repeat(22)]: { ...grantTombstone(NEXT), extra: true } } },
       { ...state, window: { count: -1, resetAt: NOW } },
     ]) expect(() => parseVnuRefreshControlState(invalid)).toThrow(/Invalid VNU refresh (state|pair)/);
   });
@@ -61,6 +64,60 @@ describe("normative VNU refresh contracts", () => {
     for (const state of impossible) expect(() => parseVnuRefreshControlState(state)).toThrow("Invalid VNU refresh state");
   });
 
+  it("parses legacy numeric grant tombstones but never promotes them to pair linkage", () => {
+    const legacy: VnuRefreshControlState = {
+      active: NEXT,
+      revokedAccess: {},
+      revokedGrants: { [OLD.grantId]: OLD.grantExpiresAt },
+      window: { count: 1, resetAt: EXPIRY + 1 },
+    };
+    expect(parseVnuRefreshControlState(legacy)).toEqual(legacy);
+    expect(applyRevokePrincipalByLinkedGrant(legacy, OLD, NOW + 1)).toEqual({
+      state: legacy,
+      result: { kind: "mismatch" },
+      changed: false,
+    });
+    expect(applyCheckAccess(legacy, NEXT, NOW + 1).result).toEqual({ kind: "active" });
+  });
+
+  it("rejects ambiguous grant tombstones despite an exact access tombstone", () => {
+    for (const active of [undefined, NEXT]) {
+      const ambiguousGrantTombstones = [
+        OLD.grantExpiresAt,
+        { ...grantTombstone(OLD), accessTokenId: active?.accessTokenId ?? "Y".repeat(22) },
+        { ...grantTombstone(OLD), accessExpiresAt: OLD.accessExpiresAt - 1 },
+      ];
+      for (const tombstone of ambiguousGrantTombstones) {
+        const state: VnuRefreshControlState = {
+          ...(active ? { active } : {}),
+          revokedAccess: { [OLD.accessTokenId]: OLD.accessExpiresAt },
+          revokedGrants: { [OLD.grantId]: tombstone },
+          window: { count: 0, resetAt: EXPIRY + 1 },
+        };
+        expect(applyRevokeLinkedPairByAccess(state, OLD, NOW + 1)).toEqual({
+          state,
+          result: { kind: "mismatch" },
+          changed: false,
+        });
+        expect(nextVnuRefreshAlarm(state)).toBe(OLD.accessExpiresAt);
+      }
+    }
+  });
+
+  it("keeps an exact linked tombstone idempotent without touching unrelated active state", () => {
+    const state: VnuRefreshControlState = {
+      active: NEXT,
+      revokedAccess: { [OLD.accessTokenId]: OLD.accessExpiresAt },
+      revokedGrants: { [OLD.grantId]: grantTombstone(OLD) },
+      window: { count: 0, resetAt: EXPIRY + 1 },
+    };
+    expect(applyRevokeLinkedPairByAccess(state, OLD, NOW + 1)).toEqual({
+      state,
+      result: { kind: "revoked" },
+      changed: false,
+    });
+  });
+
   it("does not schedule quiescent zero-attempt state", () => {
     const state: VnuRefreshControlState = { revokedAccess: {}, revokedGrants: {}, window: { count: 0, resetAt: NOW + VNU_REFRESH_WINDOW_MS } };
     expect(nextVnuRefreshAlarm(state)).toBeUndefined();
@@ -74,7 +131,7 @@ describe("VNU refresh transitions", () => {
     expect(first).toMatchObject({ result: { kind: "activated" }, changed: true });
     expect(second).toMatchObject({ result: { kind: "activated" }, changed: true, state: { active: NEXT } });
     expect(second.state.revokedAccess[OLD.accessTokenId]).toBe(OLD.accessExpiresAt);
-    expect(second.state.revokedGrants[OLD.grantId]).toBe(OLD.grantExpiresAt);
+    expect(second.state.revokedGrants[OLD.grantId]).toEqual(grantTombstone(OLD));
   });
 
   it("same activation is unchanged without lease and clears lease as one mutation", () => {
@@ -224,19 +281,98 @@ describe("VNU refresh transitions", () => {
     expect(applyCheckAccess(rotated, NEXT, NOW + 2).result).toEqual({ kind: "active" });
   });
 
+  it("uses an exact old linked grant proof to revoke a completed rotation", () => {
+    const leased = applyBeginRefresh(applyActivatePair(undefined, OLD, NOW).state, OLD, NOW).state;
+    const rotated = applyCompleteRefresh(leased, { old: OLD, next: NEXT }, NOW + 1).state;
+    const revoked = applyRevokePrincipalByLinkedGrant(rotated, OLD, NOW + 2);
+    expect(revoked).toMatchObject({ result: { kind: "revoked" }, changed: true });
+    expect(revoked.state.active).toBeUndefined();
+    expect(revoked.state.lease).toBeUndefined();
+    expect(revoked.state.revokedAccess).toMatchObject({
+      [OLD.accessTokenId]: OLD.accessExpiresAt,
+      [NEXT.accessTokenId]: NEXT.accessExpiresAt,
+    });
+    expect(revoked.state.revokedGrants).toMatchObject({
+      [OLD.grantId]: grantTombstone(OLD),
+      [NEXT.grantId]: grantTombstone(NEXT),
+    });
+    expect(applyRevokePrincipalByLinkedGrant(revoked.state, OLD, NOW + 3)).toEqual({
+      state: revoked.state,
+      result: { kind: "revoked" },
+      changed: false,
+    });
+  });
+
+  it("rejects malformed old linkage without mutating the current pair", () => {
+    const leased = applyBeginRefresh(applyActivatePair(undefined, OLD, NOW).state, OLD, NOW).state;
+    const rotated = applyCompleteRefresh(leased, { old: OLD, next: NEXT }, NOW + 1).state;
+    for (const wrong of [
+      { ...OLD, accessTokenId: "Z".repeat(22) },
+      { ...OLD, accessExpiresAt: OLD.accessExpiresAt + 1 },
+      { ...OLD, grantId: "Y".repeat(22) },
+      { ...OLD, grantExpiresAt: OLD.grantExpiresAt + 1 },
+    ]) {
+      expect(applyRevokePrincipalByLinkedGrant(rotated, wrong, NOW + 2)).toEqual({
+        state: rotated,
+        result: { kind: "mismatch" },
+        changed: false,
+      });
+    }
+  });
+
   it("uses an exact live old grant after its access tombstone is cleaned while next stays active", () => {
     const old = { ...OLD, accessExpiresAt: NOW };
     const leased = applyBeginRefresh(applyActivatePair(undefined, old, NOW - 1).state, old, NOW - 1).state;
     const rotated = applyCompleteRefresh(leased, { old, next: NEXT }, NOW).state;
     const cleaned = cleanVnuRefreshState(rotated, NOW + 1);
     expect(cleaned.revokedAccess).toEqual({});
-    expect(cleaned.revokedGrants).toEqual({ [old.grantId]: old.grantExpiresAt });
+    expect(cleaned.revokedGrants).toEqual({ [old.grantId]: grantTombstone(old) });
     expect(applyRevokeLinkedPairByAccess(cleaned, old, NOW + 1)).toEqual({ state: cleaned, result: { kind: "revoked" }, changed: false });
-    for (const wrong of [{ ...old, grantId: "Z".repeat(22) }, { ...old, grantExpiresAt: old.grantExpiresAt + 1 }]) {
+    for (const wrong of [
+      { ...old, accessTokenId: "Y".repeat(22) },
+      { ...old, accessExpiresAt: old.accessExpiresAt - 1 },
+      { ...old, grantId: "Z".repeat(22) },
+      { ...old, grantExpiresAt: old.grantExpiresAt + 1 },
+    ]) {
       expect(applyRevokeLinkedPairByAccess(cleaned, wrong, NOW + 1)).toEqual({ state: cleaned, result: { kind: "mismatch" }, changed: false });
+      expect(applyRevokePrincipalByLinkedGrant(cleaned, wrong, NOW + 1)).toEqual({ state: cleaned, result: { kind: "mismatch" }, changed: false });
     }
     expect(applyRevokeLinkedPairByAccess(cleaned, { ...old, accessTokenId: "Z".repeat(22), accessExpiresAt: NOW + 2 }, NOW + 1)).toEqual({ state: cleaned, result: { kind: "mismatch" }, changed: false });
     expect(applyCheckAccess(cleaned, NEXT, NOW + 1).result).toEqual({ kind: "active" });
+    const principalRevoked = applyRevokePrincipalByLinkedGrant(cleaned, old, NOW + 1);
+    expect(principalRevoked).toMatchObject({ result: { kind: "revoked" }, changed: true });
+    expect(principalRevoked.state.active).toBeUndefined();
+    expect(principalRevoked.state.revokedAccess[NEXT.accessTokenId]).toBe(NEXT.accessExpiresAt);
+  });
+
+  it("requires exact old four-field linkage while next is leased", () => {
+    const old = { ...OLD, accessExpiresAt: NOW };
+    const rotated = applyCompleteRefresh(
+      applyBeginRefresh(applyActivatePair(undefined, old, NOW - 1).state, old, NOW - 1).state,
+      { old, next: NEXT },
+      NOW,
+    ).state;
+    const cleaned = cleanVnuRefreshState(rotated, NOW + 1);
+    const leasedNext = applyBeginRefresh(cleaned, NEXT, NOW + 1).state;
+    for (const wrong of [
+      { ...old, accessTokenId: "Y".repeat(22) },
+      { ...old, accessExpiresAt: old.accessExpiresAt - 1 },
+    ]) {
+      expect(applyRevokePrincipalByLinkedGrant(leasedNext, wrong, NOW + 2)).toEqual({
+        state: leasedNext,
+        result: { kind: "mismatch" },
+        changed: false,
+      });
+    }
+    const revoked = applyRevokePrincipalByLinkedGrant(leasedNext, old, NOW + 2);
+    expect(revoked).toMatchObject({ result: { kind: "revoked" }, changed: true });
+    expect(revoked.state.active).toBeUndefined();
+    expect(revoked.state.lease).toBeUndefined();
+    expect(applyRevokePrincipalByLinkedGrant(revoked.state, old, NOW + 3)).toEqual({
+      state: revoked.state,
+      result: { kind: "revoked" },
+      changed: false,
+    });
   });
 
   it("exact linked revoke and grantless revoke share exact boundaries", () => {
@@ -265,6 +401,7 @@ describe("VNU refresh coordinator", () => {
     completeRefresh: async (input: { old: LinkedPair; next: LinkedPair }) => { calls.push(["completeRefresh", input]); return { kind: "completed" as const }; },
     abortRefresh: async (input: { pair: LinkedPair; terminal: boolean }) => { calls.push(["abortRefresh", input]); return { kind: "aborted" as const }; },
     revokeLinkedPairByAccess: async (pair: LinkedPair) => { calls.push(["revokeLinkedPairByAccess", pair]); return { kind: "revoked" as const }; },
+    revokePrincipalByLinkedGrant: async (pair: LinkedPair) => { calls.push(["revokePrincipalByLinkedGrant", pair]); return { kind: "revoked" as const }; },
     revokeExactLinkedPair: async (pair: LinkedPair) => { calls.push(["revokeExactLinkedPair", pair]); return { kind: "revoked" as const }; },
   }) satisfies VnuRefreshControlStub;
 
@@ -287,8 +424,9 @@ describe("VNU refresh coordinator", () => {
     await coordinator.completeRefresh(principal, { old: OLD, next: NEXT });
     await coordinator.abortRefresh(principal, { pair: OLD, terminal: false });
     await coordinator.revokeLinkedPairByAccess(principal, OLD);
+    await coordinator.revokePrincipalByLinkedGrant(principal, OLD);
     await coordinator.revokeExactLinkedPair(principal, OLD);
-    expect(getByName).toHaveBeenCalledTimes(7);
+    expect(getByName).toHaveBeenCalledTimes(8);
     expect(JSON.stringify(calls)).not.toMatch(/username|password|studentCode|cookie|raw.?token|SYNTHETIC-VNU-USER/i);
   });
 

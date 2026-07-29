@@ -23,6 +23,7 @@ import {
   applyCompleteRefresh,
   applyRevokeExactLinkedPair,
   applyRevokeLinkedPairByAccess,
+  applyRevokePrincipalByLinkedGrant,
   checkAccessAuthoritatively,
   DurableObjectVnuRefreshControlCoordinator,
   nextVnuRefreshAlarm,
@@ -200,6 +201,9 @@ class TestVnuImportRefreshControl implements VnuRefreshControlCoordinator {
     if ((this.revokedPairs.get(principalKey) ?? []).some((revoked) => JSON.stringify(revoked) === JSON.stringify(pair))) return "revoked";
     return "mismatch";
   }
+  async revokePrincipalByLinkedGrant(principalKey: string, pair: LinkedPair): Promise<"revoked" | "mismatch" | "expired"> {
+    return this.revokeLinkedPairByAccess(principalKey, pair);
+  }
   async revokeExactLinkedPair(principalKey: string, pair: LinkedPair): Promise<"revoked" | "mismatch" | "expired"> {
     this.throwIfUnavailable("revoke-exact");
     this.exactRevocationAttempts.push({ principalKey, pair });
@@ -290,6 +294,7 @@ function productionAuthorityHarness(stored: unknown, options: { rpcFailure?: Err
     completeRefresh: unsupported,
     abortRefresh: unsupported,
     revokeLinkedPairByAccess: unsupported,
+    revokePrincipalByLinkedGrant: unsupported,
     revokeExactLinkedPair: unsupported,
   });
   const expectedPrincipal = options.expectedPrincipal ?? "a".repeat(64);
@@ -336,6 +341,12 @@ function productionRefreshAuthorityHarness(
       revokeGate.markEntered();
       await revokeGate.release;
       return mutate((state, now) => applyRevokeLinkedPairByAccess(state, pair, now));
+    },
+    revokePrincipalByLinkedGrant: async (pair) => {
+      calls.revokeLinked += 1;
+      revokeGate.markEntered();
+      await revokeGate.release;
+      return mutate((state, now) => applyRevokePrincipalByLinkedGrant(state, pair, now));
     },
     revokeExactLinkedPair: (pair) => mutate((state, now) => applyRevokeExactLinkedPair(state, pair, now)),
   };
@@ -1621,7 +1632,7 @@ describe("VNU import session cache", () => {
     });
     const refreshing = requestVnuRefresh(app, imported.token, imported.refreshGrant);
     await gate.entered;
-    const logout = await requestVnuLogout(app, imported.token);
+    const logout = await requestVnuLogout(app, imported.token, imported.refreshGrant);
     gate.release(importedVnu());
     const late = await refreshing;
     expect(logout.status).toBe(200);
@@ -1632,7 +1643,7 @@ describe("VNU import session cache", () => {
     expect(adapterMocks.importSession).toHaveBeenCalledTimes(2);
   });
 
-  it("lets refresh complete before an entered old-descriptor logout without revoking the next pair", async () => {
+  it("revokes a completed refresh when entered old-descriptor logout carries its linked grant", async () => {
     const imported = await importVnu(app);
     const oldPayload = await decryptSession(imported.token, SESSION_SECRET);
     const principalKey = oldPayload.vnuRefresh!.principalKey;
@@ -1640,7 +1651,7 @@ describe("VNU import session cache", () => {
     const gate = enteredOperation<void>();
     const authority = productionRefreshAuthorityHarness(activeAuthorityState(oldPair), principalKey, { markEntered: gate.markEntered, release: gate.result });
     setVnuRefreshControlCoordinator(authority.coordinator);
-    const oldLogoutPromise = requestVnuLogout(app, imported.token);
+    const oldLogoutPromise = requestVnuLogout(app, imported.token, imported.refreshGrant);
     await gate.entered;
 
     adapterMocks.importSession.mockResolvedValueOnce(importedVnu());
@@ -1659,17 +1670,17 @@ describe("VNU import session cache", () => {
     expect(oldLogout.status).toBe(200);
     expect(oldLogout.headers.get("Cache-Control")).toBe("no-store");
     expect(authority.storage.transactionCount).toBe(1);
-    expect(authority.storage.putCount).toBe(0);
+    expect(authority.storage.putCount).toBe(1);
     expect(authority.storage.deleteCount).toBe(0);
-    expect(authority.storage.alarmUpdateCount).toBe(0);
-    expect((authority.storage.stored as VnuRefreshControlState).active).toEqual(nextPair);
+    expect(authority.storage.alarmUpdateCount).toBe(1);
+    expect((authority.storage.stored as VnuRefreshControlState).active).toBeUndefined();
     expect(cache.revocationUrls()).toEqual([]);
     expect(authority.calls).toEqual({ begin: 1, complete: 1, abort: 0, revokeLinked: 1 });
     expect(adapterMocks.importSession).toHaveBeenCalledTimes(2);
 
-    gradesSpy = vi.spyOn(DaotaoClient.prototype, "getGradesHtml").mockResolvedValue("<html>SYNTHETIC_NEXT_PAIR_ACTIVE</html>");
-    expect((await getVnuRawPage(app, refreshedBody.data.token)).status).toBe(200);
-    expect(gradesSpy).toHaveBeenCalledTimes(1);
+    gradesSpy = vi.spyOn(DaotaoClient.prototype, "getGradesHtml").mockResolvedValue("<html>UPSTREAM_SHOULD_NOT_RUN</html>");
+    expect((await getVnuRawPage(app, refreshedBody.data.token)).status).toBe(401);
+    expect(gradesSpy).not.toHaveBeenCalled();
 
     authority.storage.resetCounts();
     const newLogout = await requestVnuLogout(app, refreshedBody.data.token, refreshedBody.data.refreshGrant);
@@ -1677,8 +1688,8 @@ describe("VNU import session cache", () => {
     expect(newLogout.headers.get("Cache-Control")).toBe("no-store");
     expect((authority.storage.stored as VnuRefreshControlState).active).toBeUndefined();
     expect(authority.storage.transactionCount).toBe(1);
-    expect(authority.storage.putCount).toBe(1);
-    expect(authority.storage.alarmUpdateCount).toBe(1);
+    expect(authority.storage.putCount).toBe(0);
+    expect(authority.storage.alarmUpdateCount).toBe(0);
     expect(authority.calls).toEqual({ begin: 1, complete: 1, abort: 0, revokeLinked: 2 });
     expect(cache.revocationUrls()).toEqual([]);
     expect(adapterMocks.importSession).toHaveBeenCalledTimes(2);
@@ -1707,9 +1718,19 @@ describe("VNU import session cache", () => {
     expect(lostText).not.toContain("SYNTHETIC_COMPLETION_DELIVERY_LOSS");
     expect(state.active).toBeDefined();
     expect(state.revokedAccess[oldPayload.vnuRefresh!.accessTokenId]).toBe(Date.parse(oldPayload.vnuRefresh!.accessExpiresAt));
-    expect(state.revokedGrants[oldPayload.vnuRefresh!.grantId]).toBe(Date.parse(oldPayload.vnuRefresh!.grantExpiresAt));
+    expect(state.revokedGrants[oldPayload.vnuRefresh!.grantId]).toEqual({
+      accessTokenId: oldPayload.vnuRefresh!.accessTokenId,
+      accessExpiresAt: Date.parse(oldPayload.vnuRefresh!.accessExpiresAt),
+      grantExpiresAt: Date.parse(oldPayload.vnuRefresh!.grantExpiresAt),
+    });
     expect(authority.calls).toEqual({ begin: 1, complete: 1, abort: 1, revokeLinked: 0 });
     await expect(authority.coordinator.checkAccess(principalKey, state.active!)).resolves.toEqual({ kind: "active" });
+
+    const logout = await requestVnuLogout(app, imported.token, imported.refreshGrant);
+    expect(logout.status).toBe(200);
+    expect((authority.storage.stored as VnuRefreshControlState).active).toBeUndefined();
+    expect(await authority.coordinator.checkAccess(principalKey, state.active!)).toEqual({ kind: "revoked" });
+    expect((await requestVnuLogout(app, imported.token, imported.refreshGrant)).status).toBe(200);
     expect(cache.revocationUrls()).toEqual([]);
   });
 
@@ -1961,7 +1982,7 @@ describe("VNU import session cache", () => {
   });
 
   it.each([
-    ["expired", async (imported: CoordinatorVnuImportResponse) => {
+    ["expired", 409, "VNU_REFRESH_IDENTITY_MISMATCH", async (imported: CoordinatorVnuImportResponse) => {
       const grant = await decryptVnuRefreshGrant(imported.refreshGrant, SESSION_SECRET, syntheticTime);
       const expired = createVnuRefreshGrant({
         username: grant.username,
@@ -1971,8 +1992,8 @@ describe("VNU import session cache", () => {
       });
       return encryptVnuRefreshGrant(expired, SESSION_SECRET);
     }],
-    ["wrong-purpose", async (imported: CoordinatorVnuImportResponse) => imported.token],
-  ])("rejects a production-backed %s optional logout grant before every authority operation and write", async (_label, makeInvalidGrant) => {
+    ["wrong-purpose", 401, "VNU_REFRESH_GRANT_INVALID", async (imported: CoordinatorVnuImportResponse) => imported.token],
+  ] as const)("rejects a production-backed %s optional logout grant before every authority operation and write", async (_label, expectedStatus, expectedCode, makeInvalidGrant) => {
     const imported = await importVnu(app);
     const payload = await decryptSession(imported.token, SESSION_SECRET);
     const principalKey = payload.vnuRefresh!.principalKey;
@@ -1985,13 +2006,14 @@ describe("VNU import session cache", () => {
       vi.spyOn(authority.coordinator, "completeRefresh"),
       vi.spyOn(authority.coordinator, "abortRefresh"),
       vi.spyOn(authority.coordinator, "revokeLinkedPairByAccess"),
+      vi.spyOn(authority.coordinator, "revokePrincipalByLinkedGrant"),
       vi.spyOn(authority.coordinator, "revokeExactLinkedPair"),
     ];
 
     const response = await requestVnuLogout(app, imported.token, await makeInvalidGrant(imported));
-    expect(response.status).toBe(401);
+    expect(response.status).toBe(expectedStatus);
     expect(response.headers.get("Cache-Control")).toBe("no-store");
-    await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_REFRESH_GRANT_INVALID" } });
+    await expect(response.json()).resolves.toMatchObject({ error: { code: expectedCode } });
     for (const spy of coordinatorSpies) expect(spy).not.toHaveBeenCalled();
     expect(authority.objectNames).toEqual([]);
     expect(authority.storage.getCount).toBe(0);
@@ -2027,6 +2049,65 @@ describe("VNU import session cache", () => {
     expect(response.status).toBe(200);
     expect(refreshControl.revocationAttempts).toHaveLength(1);
     expect(refreshControl.mutationCount).toBe(mutationCount);
+  });
+
+  it("accepts a correctly linked expired logout grant without authority mutation", async () => {
+    const imported = await importVnu(app);
+    const payload = await decryptSessionForVnuLogout(imported.token, SESSION_SECRET);
+    const pair = descriptorPairFixture(payload);
+    const principalKey = payload.vnuRefresh!.principalKey;
+    const gate = enteredOperation<void>();
+    gate.release();
+    const authority = productionRefreshAuthorityHarness(activeAuthorityState(pair), principalKey, { markEntered: gate.markEntered, release: gate.result });
+    setVnuRefreshControlCoordinator(authority.coordinator);
+    syntheticTime = pair.grantExpiresAt;
+
+    const response = await requestVnuLogout(app, imported.token, imported.refreshGrant);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(authority.storage.transactionCount).toBe(1);
+    expect(authority.storage.putCount).toBe(0);
+    expect(authority.storage.deleteCount).toBe(0);
+    expect(authority.storage.alarmUpdateCount).toBe(0);
+  });
+
+  it("accepts an expired old linked grant after completed rotation without mutating next", async () => {
+    const imported = await importVnu(app);
+    const oldPayload = await decryptSessionForVnuLogout(imported.token, SESSION_SECRET);
+    const oldPair = descriptorPairFixture(oldPayload);
+    const principalKey = oldPayload.vnuRefresh!.principalKey;
+    const gate = enteredOperation<void>();
+    gate.release();
+    const authority = productionRefreshAuthorityHarness(activeAuthorityState(oldPair), principalKey, { markEntered: gate.markEntered, release: gate.result });
+    setVnuRefreshControlCoordinator(authority.coordinator);
+    adapterMocks.importSession.mockResolvedValueOnce(importedVnu());
+    const refreshed = await requestVnuRefresh(app, imported.token, imported.refreshGrant);
+    expect(refreshed.status).toBe(200);
+    const nextPair = (authority.storage.stored as VnuRefreshControlState).active!;
+    syntheticTime = oldPair.grantExpiresAt;
+    authority.storage.resetCounts();
+
+    expect((await requestVnuLogout(app, imported.token, imported.refreshGrant)).status).toBe(200);
+    expect((authority.storage.stored as VnuRefreshControlState).active).toEqual(nextPair);
+    expect(authority.storage.putCount).toBe(0);
+    expect(await authority.coordinator.checkAccess(principalKey, nextPair)).toEqual({ kind: "revoked" });
+  });
+
+  it("rejects a tampered expired logout grant before authority mutation", async () => {
+    const imported = await importVnu(app);
+    const payload = await decryptSessionForVnuLogout(imported.token, SESSION_SECRET);
+    const pair = descriptorPairFixture(payload);
+    const authority = productionAuthorityHarness(activeAuthorityState(pair), { expectedPrincipal: payload.vnuRefresh!.principalKey });
+    setVnuRefreshControlCoordinator(authority.coordinator);
+    syntheticTime = pair.grantExpiresAt;
+    const tampered = `${imported.refreshGrant.slice(0, -1)}${imported.refreshGrant.endsWith("A") ? "B" : "A"}`;
+
+    const response = await requestVnuLogout(app, imported.token, tampered);
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_REFRESH_GRANT_INVALID" } });
+    expect(authority.storage.transactionCount).toBe(0);
+    expect(authority.storage.putCount).toBe(0);
+    expect(authority.objectNames).toEqual([]);
   });
 
   it.each(["expired", "mismatch"] as const)("rejects live-half authority %s instead of claiming idempotent logout", async (authorityResult) => {

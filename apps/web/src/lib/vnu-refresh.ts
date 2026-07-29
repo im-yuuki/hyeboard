@@ -28,8 +28,14 @@ export function clearVnuRefreshGrant(accountId: string): void {
 export function classifyVnuRecovery(error: unknown): boolean {
   if (!(error instanceof ApiError)) return false;
   if (error.code === "VNU_SESSION_EXPIRED") return true;
-  return error.code === "VNU_LOGIN_REQUIRED"
-    && error.details?.reason === "MISSING_VNU_CREDENTIAL";
+  if (error.code !== "VNU_LOGIN_REQUIRED") return false;
+  const details: unknown = error.details;
+  if (!details || typeof details !== "object" || Array.isArray(details)) return false;
+  if (Object.getPrototypeOf(details) !== Object.prototype) return false;
+  const keys = Object.keys(details);
+  return keys.length === 1
+    && keys[0] === "reason"
+    && (details as Record<string, unknown>).reason === "MISSING_VNU_CREDENTIAL";
 }
 
 export function requestPolicyFor(input: { method: string; pathname: string }): VnuRequestPolicy {

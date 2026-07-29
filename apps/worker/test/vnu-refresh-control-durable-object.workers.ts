@@ -9,6 +9,7 @@ import {
   vnuRefreshUnavailable,
   type LinkedPair,
   type VnuRefreshControlNamespace,
+  type VnuRefreshControlState,
   type VnuRefreshControlStorage,
 } from "../src/vnu-refresh-control";
 
@@ -66,6 +67,58 @@ function coordinator(namespace: VnuRefreshControlNamespace = env.VNU_REFRESH_CON
 }
 
 describe("real Durable Object persistence matrix", () => {
+  it("rejects ambiguous grant tombstones with exact access tombstones without writes", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(NOW);
+    const authority = coordinator();
+    let caseIndex = 0;
+    for (const active of [undefined, NEXT]) {
+      const ambiguousGrantTombstones = [
+        OLD.grantExpiresAt,
+        { accessTokenId: active?.accessTokenId ?? "Y".repeat(22), accessExpiresAt: OLD.accessExpiresAt, grantExpiresAt: OLD.grantExpiresAt },
+        { accessTokenId: OLD.accessTokenId, accessExpiresAt: OLD.accessExpiresAt - 1, grantExpiresAt: OLD.grantExpiresAt },
+      ];
+      for (const tombstone of ambiguousGrantTombstones) {
+        const principal = caseIndex.toString(16).padStart(64, "0");
+        caseIndex += 1;
+        const stub = env.VNU_REFRESH_CONTROL.getByName(principal);
+        await runInDurableObject(stub, async (_instance, context) => {
+          await context.storage.put(VNU_REFRESH_STATE_KEY, {
+            ...(active ? { active } : {}),
+            revokedAccess: { [OLD.accessTokenId]: OLD.accessExpiresAt },
+            revokedGrants: { [OLD.grantId]: tombstone },
+            window: { count: 0, resetAt: EXPIRY + 1 },
+          });
+          await context.storage.setAlarm(OLD.accessExpiresAt);
+        });
+        await instrument(stub);
+        const before = await snapshot(stub);
+        expect(await authority.revokeLinkedPairByAccess(principal, OLD)).toBe("mismatch");
+        expect(await counters(stub)).toEqual({ get: 0, transaction: 1, put: 0, deleteState: 0, setAlarm: 0, deleteAlarm: 0 });
+        expect(await snapshot(stub)).toEqual(before);
+      }
+    }
+  });
+
+  it("accepts an exact linked tombstone idempotently without touching unrelated active state", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(NOW);
+    const principal = "fe".repeat(32);
+    const stub = env.VNU_REFRESH_CONTROL.getByName(principal);
+    await runInDurableObject(stub, async (_instance, context) => {
+      await context.storage.put(VNU_REFRESH_STATE_KEY, {
+        active: NEXT,
+        revokedAccess: { [OLD.accessTokenId]: OLD.accessExpiresAt },
+        revokedGrants: { [OLD.grantId]: { accessTokenId: OLD.accessTokenId, accessExpiresAt: OLD.accessExpiresAt, grantExpiresAt: OLD.grantExpiresAt } },
+        window: { count: 0, resetAt: EXPIRY + 1 },
+      });
+      await context.storage.setAlarm(OLD.accessExpiresAt);
+    });
+    await instrument(stub);
+    const before = await snapshot(stub);
+    expect(await coordinator().revokeLinkedPairByAccess(principal, OLD)).toBe("revoked");
+    expect(await counters(stub)).toEqual({ get: 0, transaction: 1, put: 0, deleteState: 0, setAlarm: 0, deleteAlarm: 0 });
+    expect(await snapshot(stub)).toEqual(before);
+  });
+
   it("deletes quiescent state and alarm after final grant and window expiry", async () => {
     vi.useFakeTimers(); vi.setSystemTime(NOW);
     const principal = "dead".repeat(16);
@@ -253,10 +306,9 @@ describe("real Durable Object persistence matrix", () => {
     expect(await authority.revokeLinkedPairByAccess(principal, pair)).toBe("revoked");
     expect(await counters(stub)).toMatchObject({ put: 0, setAlarm: 0, deleteAlarm: 0 });
     expect(await snapshot(stub)).toEqual(first);
-    // The expired access tombstone is intentionally gone, so exact access-ID
-    // discrimination is information-theoretically unavailable. The live exact
-    // grant authorizes only idempotent no-mutation success.
-    expect(await authority.revokeLinkedPairByAccess(principal, { ...pair, accessTokenId: "Y".repeat(22) })).toBe("revoked");
+    // The independent access tombstone is gone, but its bounded linkage remains
+    // inside the corresponding grant tombstone through grant expiry.
+    expect(await authority.revokeLinkedPairByAccess(principal, { ...pair, accessTokenId: "Y".repeat(22) })).toBe("mismatch");
     expect(await snapshot(stub)).toEqual(first);
     expect(await authority.revokeLinkedPairByAccess(principal, { ...pair, accessTokenId: "Z".repeat(22), accessExpiresAt: NOW + 2 })).toBe("mismatch");
   });
@@ -275,17 +327,44 @@ describe("real Durable Object persistence matrix", () => {
     vi.setSystemTime(NOW + 1);
     await runInDurableObject(stub, async (instance) => instance.alarm());
     const cleaned = await snapshot(stub); await counters(stub, true);
-    expect(cleaned.bytes).not.toContain(old.accessTokenId);
-    expect(cleaned.bytes).toContain(old.grantId);
+    const cleanedState = await runInDurableObject(stub, async (_instance, context) => context.storage.get<VnuRefreshControlState>(VNU_REFRESH_STATE_KEY));
+    expect(cleanedState?.revokedAccess[old.accessTokenId]).toBeUndefined();
+    expect(cleanedState?.revokedGrants[old.grantId]).toEqual({
+      accessTokenId: old.accessTokenId,
+      accessExpiresAt: old.accessExpiresAt,
+      grantExpiresAt: old.grantExpiresAt,
+    });
     expect(await authority.revokeLinkedPairByAccess(principal, old)).toBe("revoked");
     expect(await counters(stub, true)).toEqual({ get: 0, transaction: 1, put: 0, deleteState: 0, setAlarm: 0, deleteAlarm: 0 });
     expect(await snapshot(stub)).toEqual(cleaned);
-    for (const wrong of [{ ...old, grantId: "Z".repeat(22) }, { ...old, grantExpiresAt: old.grantExpiresAt + 1 }]) {
+    for (const wrong of [
+      { ...old, accessTokenId: "Y".repeat(22) },
+      { ...old, accessExpiresAt: old.accessExpiresAt - 1 },
+      { ...old, grantId: "Z".repeat(22) },
+      { ...old, grantExpiresAt: old.grantExpiresAt + 1 },
+    ]) {
       expect(await authority.revokeLinkedPairByAccess(principal, wrong)).toBe("mismatch");
+      expect(await counters(stub, true)).toEqual({ get: 0, transaction: 1, put: 0, deleteState: 0, setAlarm: 0, deleteAlarm: 0 });
+      expect(await snapshot(stub)).toEqual(cleaned);
+      expect(await authority.revokePrincipalByLinkedGrant(principal, wrong)).toBe("mismatch");
       expect(await counters(stub, true)).toEqual({ get: 0, transaction: 1, put: 0, deleteState: 0, setAlarm: 0, deleteAlarm: 0 });
       expect(await snapshot(stub)).toEqual(cleaned);
     }
     expect(await authority.checkAccess(principal, NEXT)).toEqual({ kind: "active" });
+    await authority.beginRefresh(principal, NEXT);
+    const leased = await snapshot(stub); await counters(stub, true);
+    for (const wrong of [{ ...old, accessTokenId: "Y".repeat(22) }, { ...old, accessExpiresAt: old.accessExpiresAt - 1 }]) {
+      expect(await authority.revokePrincipalByLinkedGrant(principal, wrong)).toBe("mismatch");
+      expect(await counters(stub, true)).toEqual({ get: 0, transaction: 1, put: 0, deleteState: 0, setAlarm: 0, deleteAlarm: 0 });
+      expect(await snapshot(stub)).toEqual(leased);
+    }
+    expect(await authority.revokePrincipalByLinkedGrant(principal, old)).toBe("revoked");
+    expect(await counters(stub, true)).toEqual({ get: 0, transaction: 1, put: 1, deleteState: 0, setAlarm: 1, deleteAlarm: 0 });
+    const revoked = await snapshot(stub);
+    expect(await authority.revokePrincipalByLinkedGrant(principal, old)).toBe("revoked");
+    expect(await counters(stub, true)).toEqual({ get: 0, transaction: 1, put: 0, deleteState: 0, setAlarm: 0, deleteAlarm: 0 });
+    expect(await snapshot(stub)).toEqual(revoked);
+    expect(await authority.checkAccess(principal, NEXT)).toEqual({ kind: "revoked" });
   });
 
   it("unrelated live grants cannot retain an expired access tombstone", async () => {
@@ -397,7 +476,7 @@ describe("entered-operation races", () => {
     expect(stored).toMatchObject({ active: OLD });
   });
 
-  it("logout-before-complete beats late completion; completed-first accepts exact old logout idempotently", async () => {
+  it("logout-before-complete beats late completion; completed-first linked-grant logout revokes next", async () => {
     vi.useFakeTimers(); vi.setSystemTime(NOW);
     const firstPrincipal = "f".repeat(64);
     const first = env.VNU_REFRESH_CONTROL.getByName(firstPrincipal);
@@ -411,16 +490,19 @@ describe("entered-operation races", () => {
     const second = env.VNU_REFRESH_CONTROL.getByName(secondPrincipal);
     await instrument(second);
     const before = await snapshot(second); await counters(second, true);
-    expect(await auth.revokeLinkedPairByAccess(secondPrincipal, OLD)).toBe("revoked");
-    expect(await counters(second)).toEqual({ get: 0, transaction: 1, put: 0, deleteState: 0, setAlarm: 0, deleteAlarm: 0 });
-    expect(await snapshot(second)).toEqual(before);
+    expect(await auth.revokePrincipalByLinkedGrant(secondPrincipal, OLD)).toBe("revoked");
+    expect(await counters(second)).toEqual({ get: 0, transaction: 1, put: 1, deleteState: 0, setAlarm: 1, deleteAlarm: 0 });
+    const revoked = await snapshot(second);
+    expect(revoked).not.toEqual(before);
     for (const wrong of [{ ...OLD, accessExpiresAt: OLD.accessExpiresAt + 1 }, { ...OLD, grantId: "Z".repeat(22) }]) {
       await counters(second, true);
-      expect(await auth.revokeLinkedPairByAccess(secondPrincipal, wrong)).toBe("mismatch");
+      expect(await auth.revokePrincipalByLinkedGrant(secondPrincipal, wrong)).toBe("mismatch");
       expect(await counters(second)).toEqual({ get: 0, transaction: 1, put: 0, deleteState: 0, setAlarm: 0, deleteAlarm: 0 });
-      expect(await snapshot(second)).toEqual(before);
+      expect(await snapshot(second)).toEqual(revoked);
     }
-    expect(await auth.checkAccess(secondPrincipal, NEXT)).toEqual({ kind: "active" });
+    expect(await auth.revokePrincipalByLinkedGrant(secondPrincipal, OLD)).toBe("revoked");
+    expect(await counters(second, true)).toEqual({ get: 0, transaction: 2, put: 0, deleteState: 0, setAlarm: 0, deleteAlarm: 0 });
+    expect(await auth.checkAccess(secondPrincipal, NEXT)).toEqual({ kind: "revoked" });
 
     const partialPrincipal = "12".repeat(32);
     const partial = env.VNU_REFRESH_CONTROL.getByName(partialPrincipal);
@@ -472,6 +554,7 @@ describe("entered-operation races", () => {
       async completeRefresh(input) { await stub.completeRefresh(input); throw new Error("SENTINEL_RESPONSE_LOST"); },
       abortRefresh: (input) => stub.abortRefresh(input),
       revokeLinkedPairByAccess: (pair) => stub.revokeLinkedPairByAccess(pair),
+      revokePrincipalByLinkedGrant: (pair) => stub.revokePrincipalByLinkedGrant(pair),
       revokeExactLinkedPair: (pair) => stub.revokeExactLinkedPair(pair),
     }) };
     await expect(coordinator(lossyNamespace).completeRefresh(principal, { old: OLD, next: NEXT })).rejects.toEqual(vnuRefreshUnavailable());
@@ -481,7 +564,13 @@ describe("entered-operation races", () => {
     const state = await runInDurableObject(stub, async (_instance, context) => context.storage.get<{ active: LinkedPair; revokedAccess: Record<string, number>; revokedGrants: Record<string, number> }>(VNU_REFRESH_STATE_KEY));
     expect(state?.active).toEqual(NEXT);
     expect(state?.revokedAccess[OLD.accessTokenId]).toBe(OLD.accessExpiresAt);
-    expect(state?.revokedGrants[OLD.grantId]).toBe(OLD.grantExpiresAt);
+    expect(state?.revokedGrants[OLD.grantId]).toEqual({
+      accessTokenId: OLD.accessTokenId,
+      accessExpiresAt: OLD.accessExpiresAt,
+      grantExpiresAt: OLD.grantExpiresAt,
+    });
+    expect(await normal.revokePrincipalByLinkedGrant(principal, OLD)).toBe("revoked");
+    expect(await normal.checkAccess(principal, NEXT)).toEqual({ kind: "revoked" });
   });
 
   it("concurrent callers atomically consume exactly five leased attempts", async () => {
@@ -572,6 +661,7 @@ describe("coordinator failure and privacy boundary", () => {
     const before = await snapshot(stub);
     const otherBefore = await snapshot(otherStub);
     expect(await auth.checkAccess(other, OLD)).toEqual({ kind: "revoked" });
+    expect(await auth.revokePrincipalByLinkedGrant(other, OLD)).toBe("mismatch");
     expect(await auth.checkAccess(principal, OLD)).toEqual({ kind: "active" });
     for (const wrong of [{ ...OLD, accessTokenId: "X".repeat(22) }, { ...OLD, grantId: "Y".repeat(22) }, { ...OLD, accessExpiresAt: OLD.accessExpiresAt + 1 }, { ...OLD, grantExpiresAt: OLD.grantExpiresAt + 1 }]) {
       expect(await auth.revokeLinkedPairByAccess(principal, wrong)).toBe("mismatch");
@@ -593,6 +683,7 @@ describe("coordinator failure and privacy boundary", () => {
         completeRefresh: (input) => { calls.push(["completeRefresh", input]); return stub.completeRefresh(input); },
         abortRefresh: (input) => { calls.push(["abortRefresh", input]); return stub.abortRefresh(input); },
         revokeLinkedPairByAccess: (pair) => { calls.push(["revokeLinkedPairByAccess", pair]); return stub.revokeLinkedPairByAccess(pair); },
+        revokePrincipalByLinkedGrant: (pair) => { calls.push(["revokePrincipalByLinkedGrant", pair]); return stub.revokePrincipalByLinkedGrant(pair); },
         revokeExactLinkedPair: (pair) => { calls.push(["revokeExactLinkedPair", pair]); return stub.revokeExactLinkedPair(pair); },
       };
     } };

@@ -61,6 +61,22 @@ describe("VNU refresh storage and policy", () => {
     expect(classifyVnuRecovery(error)).toBe(expected);
   });
 
+  it("rejects mixed, non-object, and prototype-derived recovery details", () => {
+    const inherited = Object.create({ reason: "MISSING_VNU_CREDENTIAL" }) as unknown;
+    const cases: unknown[] = [
+      { reason: "MISSING_VNU_CREDENTIAL", privateKey: "SYNTHETIC-PRIVATE" },
+      { reason: "MISSING_VNU_CREDENTIAL", retryAfterSeconds: 5 },
+      inherited,
+      null,
+      ["MISSING_VNU_CREDENTIAL"],
+      { reason: "SYNTHETIC-UNKNOWN" },
+    ];
+    for (const details of cases) {
+      const error = new ApiError("missing", "VNU_LOGIN_REQUIRED", 401, details as never);
+      expect(classifyVnuRecovery(error)).toBe(false);
+    }
+  });
+
   it.each([
     ["get", "/api/vnu/raw/profile", "safe-replay"],
     ["GET", "/api/vnu/raw/point-detail?id=SYNTHETIC", "safe-replay"],

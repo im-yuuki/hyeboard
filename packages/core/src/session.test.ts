@@ -7,6 +7,7 @@ import {
   decryptSessionForVnuLogout,
   decryptSessionForVnuRefresh,
   decryptVnuRefreshGrant,
+  decryptVnuRefreshGrantForLogout,
   deriveVnuRefreshPrincipal,
   encryptSession,
   encryptVnuRefreshGrant,
@@ -257,6 +258,29 @@ describe("VNU refresh grants", () => {
     const encrypted = await encryptVnuRefreshGrant(grant, SECRET);
     await expect(decryptVnuRefreshGrant(encrypted, WRONG_SECRET, NOW)).rejects.toMatchObject({ code: "VNU_REFRESH_GRANT_INVALID" });
     await expect(decryptVnuRefreshGrant(encrypted, SECRET, Date.parse(grant.expiresAt))).rejects.toMatchObject({ code: "VNU_REFRESH_GRANT_INVALID" });
+  });
+
+  it("authenticates an expired grant only through the logout decoder", async () => {
+    const { grant } = await linkedArtifacts();
+    const token = await encryptVnuRefreshGrant(grant, SECRET);
+    const expiredAt = Date.parse(grant.expiresAt);
+    await expect(decryptVnuRefreshGrant(token, SECRET, expiredAt)).rejects.toMatchObject({ code: "VNU_REFRESH_GRANT_INVALID" });
+    await expect(decryptVnuRefreshGrantForLogout(token, SECRET)).resolves.toEqual(grant);
+  });
+
+  it("keeps logout grant decoding strict for tampering and malformed purpose payloads", async () => {
+    const { grant } = await linkedArtifacts();
+    const malformed = await encryptMalformedGrantFixture({ ...grant, purpose: "access" });
+    const token = await encryptVnuRefreshGrant(grant, SECRET);
+    const [iv, ciphertext] = token.split(".") as [string, string];
+    const tampered = `${iv}.${ciphertext.slice(0, -1)}${ciphertext.endsWith("A") ? "B" : "A"}`;
+    for (const invalid of ["not-a-grant", malformed, tampered]) {
+      await expect(decryptVnuRefreshGrantForLogout(invalid, SECRET)).rejects.toMatchObject({
+        code: "VNU_REFRESH_GRANT_INVALID",
+        status: 401,
+        details: undefined,
+      });
+    }
   });
 
   it("preserves weak-secret behavior", async () => {

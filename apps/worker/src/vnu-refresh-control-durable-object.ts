@@ -8,6 +8,7 @@ import {
   applyCompleteRefresh,
   applyRevokeExactLinkedPair,
   applyRevokeLinkedPairByAccess,
+  applyRevokePrincipalByLinkedGrant,
   checkAccessAuthoritatively,
   cleanVnuRefreshState,
   isQuiescentVnuRefreshState,
@@ -60,6 +61,7 @@ export class VnuRefreshControlDurableObject extends DurableObject<Env> {
   completeRefresh(input: { old: LinkedPair; next: LinkedPair }) { return this.mutate((state, now) => applyCompleteRefresh(state, input, now)); }
   abortRefresh(input: { pair: LinkedPair; terminal: boolean }) { return this.mutate((state, now) => applyAbortRefresh(state, input, now)); }
   revokeLinkedPairByAccess(pair: AccessDescriptorRef) { return this.mutate((state, now) => applyRevokeLinkedPairByAccess(state, pair, now)); }
+  revokePrincipalByLinkedGrant(pair: LinkedPair) { return this.mutate((state, now) => applyRevokePrincipalByLinkedGrant(state, pair, now)); }
   revokeExactLinkedPair(pair: LinkedPair) { return this.mutate((state, now) => applyRevokeExactLinkedPair(state, pair, now)); }
   async alarm() {
     await this.mutate((state, now) => {

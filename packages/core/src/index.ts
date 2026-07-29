@@ -423,6 +423,16 @@ export async function encryptVnuRefreshGrant(payload: VnuRefreshGrantPayload, se
 }
 
 export async function decryptVnuRefreshGrant(token: string, secret: string, now = Date.now()): Promise<VnuRefreshGrantPayload> {
+  const payload = await decryptAuthenticatedVnuRefreshGrant(token, secret);
+  if (Date.parse(payload.expiresAt) <= now) throw invalidVnuRefreshGrant();
+  return payload;
+}
+
+export function decryptVnuRefreshGrantForLogout(token: string, secret: string): Promise<VnuRefreshGrantPayload> {
+  return decryptAuthenticatedVnuRefreshGrant(token, secret);
+}
+
+async function decryptAuthenticatedVnuRefreshGrant(token: string, secret: string): Promise<VnuRefreshGrantPayload> {
   try {
     const parts = token.split(".");
     if (parts.length !== 2 || !parts[0] || !parts[1]) throw invalidVnuRefreshGrant();
@@ -438,7 +448,6 @@ export async function decryptVnuRefreshGrant(token: string, secret: string, now 
     );
     const payload: unknown = JSON.parse(new TextDecoder().decode(decrypted));
     assertVnuRefreshGrantPayload(payload);
-    if (Date.parse(payload.expiresAt) <= now) throw invalidVnuRefreshGrant();
     return payload;
   } catch (error) {
     if (error instanceof HyeboardError && error.code === "WEAK_SESSION_SECRET") throw error;

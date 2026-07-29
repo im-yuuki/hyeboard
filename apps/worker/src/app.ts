@@ -1,5 +1,5 @@
 import { cors } from "@elysiajs/cors";
-import { createVnuRefreshAccessDescriptor, createVnuRefreshGrant, decryptSession, decryptSessionForVnuLogout, decryptSessionForVnuRefresh, decryptVnuRefreshGrant, deriveVnuRefreshPrincipal, encryptSession, encryptVnuRefreshGrant, fail, getLogger, HyeboardError, isExpired, ok, parseBearerToken, rotateVnuRefreshGrant, VNU_REFRESH_GRANT_MAX_LENGTH, type EncryptedSessionPayload, type VnuRefreshAccessDescriptor, type VnuRefreshGrantPayload } from "@hyeboard/core";
+import { createVnuRefreshAccessDescriptor, createVnuRefreshGrant, decryptSession, decryptSessionForVnuLogout, decryptSessionForVnuRefresh, decryptVnuRefreshGrant, decryptVnuRefreshGrantForLogout, deriveVnuRefreshPrincipal, encryptSession, encryptVnuRefreshGrant, fail, getLogger, HyeboardError, isExpired, ok, parseBearerToken, rotateVnuRefreshGrant, VNU_REFRESH_GRANT_MAX_LENGTH, type EncryptedSessionPayload, type VnuRefreshAccessDescriptor, type VnuRefreshGrantPayload } from "@hyeboard/core";
 import { apiErrorDetailsSchema, type AuthResult } from "@hyeboard/schemas";
 import { DaotaoClient, getAdapter, isDaotaoSessionExpired, listUniversities, parseProfileHtml, parseTranscriptHeader, parseTranscriptHtml, type BrowserBinding, type BrowserConnection, type VnuTranscript } from "@hyeboard/university-adapters";
 import { Elysia, t } from "elysia";
@@ -1369,19 +1369,24 @@ export function createApp(adapter: any) {
       const descriptor = session!.vnuRefresh!;
       const pair = descriptorPair(descriptor);
       if (logoutBody.refreshGrant !== undefined) {
-        const grant = await decryptVnuRefreshGrant(logoutBody.refreshGrant, secret);
+        const grant = await decryptVnuRefreshGrantForLogout(logoutBody.refreshGrant, secret);
         await linkedRefreshInputs(session!, grant, secret);
         ensureVnuIdentityMatch(session!, grant);
       }
 
       let result: "revoked" | "mismatch" | "expired";
       try {
-        result = await requireVnuRefreshControlCoordinator().revokeLinkedPairByAccess(descriptor.principalKey, pair);
+        const coordinator = requireVnuRefreshControlCoordinator();
+        result = logoutBody.refreshGrant === undefined
+          ? await coordinator.revokeLinkedPairByAccess(descriptor.principalKey, pair)
+          : await coordinator.revokePrincipalByLinkedGrant(descriptor.principalKey, pair);
       } catch {
         throw vnuRefreshUnavailable();
       }
       if (result === "mismatch") throw new HyeboardError("VNU_REFRESH_GRANT_REVOKED", "The VNU reconnect grant has been revoked.", 401);
-      if (result === "expired" && (pair.accessExpiresAt > Date.now() || pair.grantExpiresAt > Date.now())) {
+      const suppliedLinkedGrantIsLive = logoutBody.refreshGrant !== undefined && pair.grantExpiresAt > Date.now();
+      const grantlessPairHasLiveArtifact = logoutBody.refreshGrant === undefined && (pair.accessExpiresAt > Date.now() || pair.grantExpiresAt > Date.now());
+      if (result === "expired" && (suppliedLinkedGrantIsLive || grantlessPairHasLiveArtifact)) {
         throw new HyeboardError("VNU_REFRESH_GRANT_REVOKED", "The VNU reconnect grant has been revoked.", 401);
       }
       return ok({ authenticated: false });

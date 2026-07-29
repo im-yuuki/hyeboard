@@ -104,6 +104,7 @@ describe("frontend session-death policy", () => {
   });
 
   it.each(["VNU_RATE_LIMITED", "VNU_PROBE_BUDGET_UNAVAILABLE"])("preserves stored session and account state for %s", async (code) => {
+    storeVnuRefreshGrant(ACCOUNT.id, "synthetic-refresh-grant");
     rejectNextRequest(code, code === "VNU_RATE_LIMITED" ? 429 : 503);
 
     await expect(requestCrossLookup()).rejects.toMatchObject({ code });
@@ -112,6 +113,7 @@ describe("frontend session-death policy", () => {
     expect(listAccounts()).toEqual([ACCOUNT]);
     expect(getActiveAccount()).toEqual(ACCOUNT);
     expect(localStorage.getItem("hyeboard.activeAccountId")).toBe(ACCOUNT.id);
+    expect(readVnuRefreshGrant(ACCOUNT.id)).toBe("synthetic-refresh-grant");
   });
 
   it("keeps a code-less 401 inline without removing the account", async () => {
@@ -129,6 +131,7 @@ describe("frontend session-death policy", () => {
   });
 
   it.each(["MISSING_SESSION", "SESSION_EXPIRED", "INVALID_SESSION"])("clears stored state for genuine session-death code %s", async (code) => {
+    storeVnuRefreshGrant(ACCOUNT.id, "synthetic-refresh-grant");
     rejectNextRequest(code, 401);
 
     await expect(requestCrossLookup()).rejects.toMatchObject({ code });
@@ -137,6 +140,40 @@ describe("frontend session-death policy", () => {
     expect(listAccounts()).toEqual([]);
     expect(getActiveAccount()).toBeUndefined();
     expect(localStorage.getItem("hyeboard.activeAccountId")).toBeNull();
+    expect(readVnuRefreshGrant(ACCOUNT.id)).toBeUndefined();
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves a newer same-account VNU token and grant after a late terminal response", async () => {
+    storeVnuRefreshGrant(ACCOUNT.id, "synthetic-old-refresh-grant");
+    let releaseResponse!: (response: Response) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((resolve) => { releaseResponse = resolve; })));
+    const pending = requestCrossLookup();
+    const replacement = { ...ACCOUNT, token: "synthetic-replacement-token" };
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([replacement]));
+    storeVnuRefreshGrant(ACCOUNT.id, "synthetic-replacement-refresh-grant");
+    releaseResponse(jsonError("INVALID_SESSION", 401));
+
+    await expect(pending).rejects.toMatchObject({ code: "INVALID_SESSION" });
+    expect(listAccounts()).toEqual([replacement]);
+    expect(readVnuRefreshGrant(ACCOUNT.id)).toBe("synthetic-replacement-refresh-grant");
+  });
+
+  it("clears only the unchanged inactive VNU origin and its grant", async () => {
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([ACCOUNT, SECOND_ACCOUNT]));
+    storeVnuRefreshGrant(ACCOUNT.id, "synthetic-origin-refresh-grant");
+    storeVnuRefreshGrant(SECOND_ACCOUNT.id, "synthetic-other-refresh-grant");
+    let releaseResponse!: (response: Response) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((resolve) => { releaseResponse = resolve; })));
+    const pending = requestCrossLookup();
+    switchAccount(SECOND_ACCOUNT.id);
+    releaseResponse(jsonError("SESSION_EXPIRED", 401));
+
+    await expect(pending).rejects.toMatchObject({ code: "SESSION_EXPIRED" });
+    expect(listAccounts()).toEqual([SECOND_ACCOUNT]);
+    expect(getActiveAccount()).toEqual(SECOND_ACCOUNT);
+    expect(readVnuRefreshGrant(ACCOUNT.id)).toBeUndefined();
+    expect(readVnuRefreshGrant(SECOND_ACCOUNT.id)).toBe("synthetic-other-refresh-grant");
   });
 
   it("removes the originating account when bulk lookup returns top-level VNU_SESSION_EXPIRED", async () => {
@@ -278,6 +315,25 @@ describe("frontend session-death policy", () => {
     expect(error).toMatchObject({ details: { retryAfterSeconds: 9, limit: 5, windowSeconds: 900 } });
     expect((error as ApiError).details).toEqual({ retryAfterSeconds: 9, limit: 5, windowSeconds: 900 });
     expect(JSON.stringify(error)).not.toContain("privateToken");
+  });
+
+  it("does not recover VNU login-required responses with mixed details", async () => {
+    storeVnuRefreshGrant(ACCOUNT.id, "synthetic-refresh-grant");
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      data: null,
+      error: {
+        code: "VNU_LOGIN_REQUIRED",
+        message: "Synthetic missing credential",
+        details: { reason: "MISSING_VNU_CREDENTIAL", retryAfterSeconds: 5, privateKey: "SYNTHETIC-PRIVATE" },
+      },
+    }), { status: 401, headers: { "Content-Type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const error = await requestCrossLookup().catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: "VNU_LOGIN_REQUIRED", details: undefined });
+    expect(JSON.stringify(error)).not.toContain("SYNTHETIC-PRIVATE");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(readVnuRefreshGrant(ACCOUNT.id)).toBe("synthetic-refresh-grant");
   });
 
   it("preserves only allowed details from a plain-JSON UET stream-start error", async () => {

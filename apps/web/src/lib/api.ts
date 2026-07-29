@@ -289,13 +289,16 @@ function apiErrorFromPayload(payload: ApiResponse<unknown>, response: Response):
     payload.error?.message ?? `Request failed: ${response.status}`,
     payload.error?.code,
     response.status,
-    parseApiErrorDetails(payload.error?.details),
+    parseApiErrorDetails(payload.error?.details, payload.error?.code),
   );
 }
 
-function parseApiErrorDetails(details: unknown): ApiErrorDetails | undefined {
-  const parsed = apiErrorDetailsSchema.strip().safeParse(details);
-  return parsed.success ? parsed.data : undefined;
+function parseApiErrorDetails(details: unknown, code?: string): ApiErrorDetails | undefined {
+  const exact = apiErrorDetailsSchema.safeParse(details);
+  if (exact.success) return exact.data;
+  if (code === "VNU_LOGIN_REQUIRED") return undefined;
+  const sanitized = apiErrorDetailsSchema.strip().safeParse(details);
+  return sanitized.success ? sanitized.data : undefined;
 }
 
 async function executeRequest<T>(path: string, init: RequestInit, token: string | undefined): Promise<{ data: T; meta?: Record<string, unknown> }> {
@@ -342,6 +345,13 @@ function removeUnchangedOrigin(account: StoredAccount): void {
   if (getActiveAccountId() !== account.id || !findUnchangedStoredAccount(account)) return;
   clearVnuRefreshGrant(account.id);
   removeAccount(account.id);
+}
+
+function removeDeadOriginatingAccount(account: StoredAccount): void {
+  const unchangedAccount = findUnchangedStoredAccount(account);
+  if (!unchangedAccount) return;
+  if (unchangedAccount.universityId === "vnu") clearVnuRefreshGrant(unchangedAccount.id);
+  removeAccount(unchangedAccount.id);
 }
 
 const refreshControllers = new Map<string, Set<AbortController>>();
@@ -461,7 +471,7 @@ async function request<T>(path: string, init: RequestInit = {}, internal: Intern
       // A recoverable UET session death shows the inline re-auth dialog
       // (see components/reauth.tsx) instead of signing the user out.
       if (originatingAccountIsActive && canReauthenticateInline(currentOriginatingAccount.universityId)) requestInlineReauth();
-      else if (sessionDied && currentOriginatingAccount) removeAccount(currentOriginatingAccount.id);
+      else if (sessionDied && currentOriginatingAccount) removeDeadOriginatingAccount(currentOriginatingAccount);
     }
     throw error;
   }
