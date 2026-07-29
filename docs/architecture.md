@@ -1,6 +1,6 @@
 # Hyeboard Architecture
 
-Hyeboard uses one Cloudflare Worker deployment containing the client-heavy dashboard and its API/BFF.
+Cloudflare deployments use one Worker containing the client-heavy dashboard and its API/BFF.
 
 ```txt
 Cloudflare Worker
@@ -12,6 +12,8 @@ Cloudflare Worker
 ```
 
 The frontend never calls university upstream systems directly. University-specific behavior lives in adapters.
+
+Self-hosted Node/Bun deployments run the bundled worker without Cloudflare Durable Objects. VNU sessions remain access-only: no automatic relogin or exact revocation is provided.
 
 ## UET Sources
 
