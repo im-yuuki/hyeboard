@@ -1,8 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { api, ApiError, cancelVnuRefreshForAccount, commitVnuRefresh, getActiveAccount, installRequestTestObserver, isSessionDeathCode, listAccounts, shouldInvalidateVnuRefreshQuery, shouldRetryQuery, switchAccount, VNU_REFRESH_COMMITTED_EVENT, VNU_REFRESH_STATUS_EVENT, type StoredAccount } from "./api";
+import { api, ApiError, cancelVnuRefreshForAccount, commitVnuRefresh, getActiveAccount, isSessionDeathCode, listAccounts, shouldInvalidateVnuRefreshQuery, shouldRetryQuery, switchAccount, VNU_REFRESH_COMMITTED_EVENT, VNU_REFRESH_STATUS_EVENT, type StoredAccount } from "./api";
 import { ApiError as SharedApiError, markVnuRefreshAttempted, wasVnuRefreshAttempted } from "./api-types";
 import { readVnuRefreshGrant, storeVnuRefreshGrant, VNU_REQUEST_NOT_REPLAYED } from "./vnu-refresh";
-import { executeBulkLookup } from "./bulk-lookup";
 
 class MemoryStorage implements Storage {
   private readonly values = new Map<string, string>();
@@ -433,29 +432,20 @@ describe("frontend session-death policy", () => {
     const rejection = invoke();
     await expect(rejection).rejects.toMatchObject({ code: VNU_REQUEST_NOT_REPLAYED });
     expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes("/api/vnu/auth/refresh"))).toHaveLength(1);
+    expect(fetchMock.mock.calls.filter(([url]) => !String(url).includes("/api/vnu/auth/refresh"))).toHaveLength(1);
   });
 
-  it("joins a safe GET to the bulk refresh and replays only the GET with the rotated token", async () => {
+  it("joins two safe GET waiters to one held refresh and replays each exactly once", async () => {
     storeVnuRefreshGrant(ACCOUNT.id, "opaque-grant-alpha");
-    const targets = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet", "kilo"];
     const rotatedAuth = {
       token: "rotated-token-alpha",
       refreshGrant: "rotated-grant-alpha",
       session: { universityId: "vnu", studentCode: ACCOUNT.studentCode, expiresAt: "2036-01-01T08:00:00.000Z", authenticated: true as const },
     };
-    let markRefreshEntered!: () => void;
-    const refreshEntered = new Promise<void>((resolve) => { markRefreshEntered = resolve; });
     let releaseRefresh!: (response: Response) => void;
     const refreshResponse = new Promise<Response>((resolve) => { releaseRefresh = resolve; });
-    let markSafeGetJoined!: () => void;
-    const safeGetJoined = new Promise<void>((resolve) => { markSafeGetJoined = resolve; });
-    const restoreObserver = installRequestTestObserver({
-      onRefreshWaiterRegistered: ({ path, joinedExistingFlight }) => {
-        if (path === "/api/vnu/timetable" && joinedExistingFlight) markSafeGetJoined();
-      },
-    });
     const calls: Array<{ path: string; method: string; token: string | null }> = [];
-    let bulkPosts = 0;
     let safeGets = 0;
 
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -464,86 +454,129 @@ describe("frontend session-death policy", () => {
       const token = new Headers(init?.headers).get("Authorization");
       calls.push({ path, method, token });
       if (path === "/api/vnu/auth/refresh") {
-        markRefreshEntered();
         return refreshResponse;
       }
-      if (path === "/api/vnu/cross-lookup/bulk") {
-        bulkPosts += 1;
-        if (bulkPosts === 1) {
-          const body = JSON.parse(String(init?.body)) as { targets: string[] };
-          return jsonOk({ items: body.targets.map((target) => ({ target, status: "error", errorCode: "SYNTHETIC" })) });
-        }
-        return jsonError("VNU_SESSION_EXPIRED", 401);
-      }
-      if (path === "/api/vnu/timetable") {
+      if (path === "/api/vnu/raw/exams") {
         safeGets += 1;
-        if (safeGets === 1) return jsonError("VNU_SESSION_EXPIRED", 401);
-        return jsonOk([]);
+        if (safeGets <= 2) return jsonError("VNU_SESSION_EXPIRED", 401);
+        return jsonOk({ html: "<main></main>" });
       }
       throw new Error(`Unexpected request: ${method} ${path}`);
     }));
 
-    try {
-      const bulkRun = executeBulkLookup({
-        mode: "stdid-to-code",
-        targets,
-        signal: new AbortController().signal,
-        requestChunk: (mode, chunk, signal) => api.vnuCrossLookupBulk(mode, chunk, signal),
-      });
-      await refreshEntered;
-      const safeGet = api.timetable("vnu");
-      await safeGetJoined;
-      releaseRefresh(jsonOk(rotatedAuth));
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+    let markSecondWaiterRegistered!: () => void;
+    const secondWaiterRegistered = new Promise<void>((resolve) => { markSecondWaiterRegistered = resolve; });
+    const originalAddEventListener = secondController.signal.addEventListener.bind(secondController.signal);
+    vi.spyOn(secondController.signal, "addEventListener").mockImplementation((type, listener, options) => {
+      originalAddEventListener(type, listener, options);
+      if (type === "abort") markSecondWaiterRegistered();
+    });
 
-      await expect(safeGet).resolves.toEqual([]);
-      const bulk = await bulkRun;
-      expect(bulk).toMatchObject({ aborted: false, restoredWithoutReplay: true });
-      expect(bulk.progress.items.map((item) => item.target)).toEqual(targets.slice(0, 5));
-      expect(bulk.remainingTargets).toEqual(targets.slice(5));
-      expect(calls.filter((call) => call.path === "/api/vnu/cross-lookup/bulk")).toHaveLength(2);
-      expect(calls.filter((call) => call.path === "/api/vnu/auth/refresh")).toHaveLength(1);
-      expect(calls.filter((call) => call.path === "/api/vnu/timetable")).toEqual([
-        { path: "/api/vnu/timetable", method: "GET", token: `Bearer ${ACCOUNT.token}` },
-        { path: "/api/vnu/timetable", method: "GET", token: `Bearer ${rotatedAuth.token}` },
-      ]);
-      expect(calls.filter((call) => call.path === "/api/vnu/cross-lookup/bulk" && call.token === `Bearer ${rotatedAuth.token}`)).toHaveLength(0);
-      expect(listAccounts()).toContainEqual(expect.objectContaining({ id: ACCOUNT.id, token: rotatedAuth.token }));
-      expect(readVnuRefreshGrant(ACCOUNT.id)).toBe(rotatedAuth.refreshGrant);
-    } finally {
-      restoreObserver();
-    }
+    const first = api.vnuClassCatalog({ vTermID: "1" }, firstController.signal);
+    const second = api.vnuClassCatalog({ vTermID: "1" }, secondController.signal);
+    await secondWaiterRegistered;
+    expect(calls.filter((call) => call.path === "/api/vnu/auth/refresh")).toHaveLength(1);
+    releaseRefresh(jsonOk(rotatedAuth));
+
+    await expect(Promise.all([first, second])).resolves.toEqual([[], []]);
+    expect(calls.filter((call) => call.path === "/api/vnu/auth/refresh")).toHaveLength(1);
+    expect(calls.filter((call) => call.path === "/api/vnu/raw/exams")).toEqual([
+      { path: "/api/vnu/raw/exams", method: "GET", token: `Bearer ${ACCOUNT.token}` },
+      { path: "/api/vnu/raw/exams", method: "GET", token: `Bearer ${ACCOUNT.token}` },
+      { path: "/api/vnu/raw/exams", method: "GET", token: `Bearer ${rotatedAuth.token}` },
+      { path: "/api/vnu/raw/exams", method: "GET", token: `Bearer ${rotatedAuth.token}` },
+    ]);
+    expect(listAccounts()).toContainEqual(expect.objectContaining({ id: ACCOUNT.id, token: rotatedAuth.token }));
+    expect(readVnuRefreshGrant(ACCOUNT.id)).toBe(rotatedAuth.refreshGrant);
   });
 
-  it("keeps request observers stack-safe and isolates observer exceptions", async () => {
+  it("aborts one refresh after every safe GET waiter cancels and ignores its late success", async () => {
     storeVnuRefreshGrant(ACCOUNT.id, "opaque-grant-alpha");
-    const observerA = vi.fn();
-    const observerB = vi.fn(() => { throw new Error("Synthetic observer failure"); });
-    const restoreA = installRequestTestObserver({ onRefreshWaiterRegistered: observerA });
-    const restoreB = installRequestTestObserver({ onRefreshWaiterRegistered: observerB });
-    const auth = (suffix: string) => ({
-      token: `rotated-token-${suffix}`,
-      refreshGrant: `rotated-grant-${suffix}`,
-      session: { universityId: "vnu", studentCode: ACCOUNT.studentCode, expiresAt: "2036-01-01T08:00:00.000Z", authenticated: true as const },
+    let releaseLateRefresh!: () => void;
+    const lateRefreshMayReturn = new Promise<void>((resolve) => { releaseLateRefresh = resolve; });
+    let markLateRefreshReturned!: () => void;
+    const lateRefreshReturned = new Promise<void>((resolve) => { markLateRefreshReturned = resolve; });
+    let refreshAbortCount = 0;
+    let safeGetCount = 0;
+    let refreshCallCount = 0;
+    const requestAuthorizations: Array<{ path: string; authorization: string | null }> = [];
+    let markSecondWaiterRegistered!: () => void;
+    const secondWaiterRegistered = new Promise<void>((resolve) => { markSecondWaiterRegistered = resolve; });
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+    const originalAddEventListener = secondController.signal.addEventListener.bind(secondController.signal);
+    vi.spyOn(secondController.signal, "addEventListener").mockImplementation((type, listener, options) => {
+      originalAddEventListener(type, listener, options);
+      if (type === "abort") markSecondWaiterRegistered();
     });
-    vi.stubGlobal("fetch", vi.fn()
-      .mockResolvedValueOnce(jsonError("VNU_SESSION_EXPIRED", 401))
-      .mockResolvedValueOnce(jsonOk(auth("alpha")))
-      .mockResolvedValueOnce(jsonOk([]))
-      .mockResolvedValueOnce(jsonError("VNU_SESSION_EXPIRED", 401))
-      .mockResolvedValueOnce(jsonOk(auth("beta")))
-      .mockResolvedValueOnce(jsonOk([])));
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), "https://hyeboard.invalid").pathname;
+      requestAuthorizations.push({ path, authorization: new Headers(init?.headers).get("Authorization") });
+      if (path === "/api/vnu/raw/exams") {
+        safeGetCount += 1;
+        if (safeGetCount <= 3) return jsonError("VNU_SESSION_EXPIRED", 401);
+        return jsonOk({ html: "<main></main>" });
+      }
+      if (path === "/api/vnu/auth/refresh") {
+        refreshCallCount += 1;
+        if (refreshCallCount === 2) {
+          return jsonOk({
+            token: "fresh-rotated-token",
+            refreshGrant: "fresh-rotated-grant",
+            session: { universityId: "vnu", studentCode: ACCOUNT.studentCode, expiresAt: "2036-01-01T08:00:00.000Z", authenticated: true },
+          });
+        }
+        init?.signal?.addEventListener("abort", () => { refreshAbortCount += 1; }, { once: true });
+        await lateRefreshMayReturn;
+        markLateRefreshReturned();
+        return jsonOk({
+          token: "obsolete-rotated-token",
+          refreshGrant: "obsolete-rotated-grant",
+          session: { universityId: "vnu", studentCode: ACCOUNT.studentCode, expiresAt: "2036-01-01T08:00:00.000Z", authenticated: true },
+        });
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
 
-    restoreA();
-    try {
-      await expect(api.timetable("vnu")).resolves.toEqual([]);
-      expect(observerB).toHaveBeenCalledTimes(1);
-      restoreB();
-      await expect(api.timetable("vnu")).resolves.toEqual([]);
-      expect(observerA).not.toHaveBeenCalled();
-    } finally {
-      restoreA();
-      restoreB();
-    }
+    const first = api.vnuClassCatalog({ vTermID: "1" }, firstController.signal);
+    const second = api.vnuClassCatalog({ vTermID: "1" }, secondController.signal);
+    await secondWaiterRegistered;
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes("/api/vnu/auth/refresh"))).toHaveLength(1);
+
+    firstController.abort(new DOMException("first safe GET cancelled", "AbortError"));
+    await expect(first).rejects.toMatchObject({ code: "VNU_REFRESH_CANCELLED" });
+    expect(refreshAbortCount).toBe(0);
+    secondController.abort(new DOMException("second safe GET cancelled", "AbortError"));
+    await expect(second).rejects.toMatchObject({ code: "VNU_REFRESH_CANCELLED" });
+    expect(refreshAbortCount).toBe(1);
+
+    const dispatchEvent = vi.mocked(window.dispatchEvent);
+    dispatchEvent.mockClear();
+    releaseLateRefresh();
+    await lateRefreshReturned;
+    await expect(api.vnuClassCatalog({ vTermID: "2" })).resolves.toEqual([]);
+
+    expect(safeGetCount).toBe(4);
+    expect(refreshCallCount).toBe(2);
+    expect(requestAuthorizations.filter(({ path }) => path === "/api/vnu/raw/exams")).toEqual([
+      { path: "/api/vnu/raw/exams", authorization: `Bearer ${ACCOUNT.token}` },
+      { path: "/api/vnu/raw/exams", authorization: `Bearer ${ACCOUNT.token}` },
+      { path: "/api/vnu/raw/exams", authorization: `Bearer ${ACCOUNT.token}` },
+      { path: "/api/vnu/raw/exams", authorization: "Bearer fresh-rotated-token" },
+    ]);
+    expect(listAccounts()).toContainEqual(expect.objectContaining({ id: ACCOUNT.id, token: "fresh-rotated-token" }));
+    expect(readVnuRefreshGrant(ACCOUNT.id)).toBe("fresh-rotated-grant");
+    expect(dispatchEvent.mock.calls.map(([event]) => ({
+      type: (event as unknown as { type: string }).type,
+      detail: (event as unknown as { detail: unknown }).detail,
+    }))).toEqual([
+      { type: VNU_REFRESH_STATUS_EVENT, detail: { accountId: ACCOUNT.id, state: "reconnecting" } },
+      { type: VNU_REFRESH_COMMITTED_EVENT, detail: { accountId: ACCOUNT.id } },
+      { type: VNU_REFRESH_STATUS_EVENT, detail: { accountId: ACCOUNT.id, state: "idle" } },
+    ]);
   });
 
   it("never refreshes auth or unlisted non-GET requests", async () => {

@@ -18,6 +18,17 @@ async function loginDemo(page: import("@playwright/test").Page) {
   await expect(page.getByRole("heading", { name: /Welcome back, Demo Student/i })).toBeVisible();
 }
 
+async function clickVisibleNavigationLink(
+  page: import("@playwright/test").Page,
+  href: "/" | "/settings",
+  isMobile: boolean,
+): Promise<void> {
+  if (isMobile) await page.getByRole("button", { name: "Open navigation menu" }).click();
+  const link = page.locator(`a[href="${href}"]:visible`);
+  await expect(link).toHaveCount(1);
+  await link.click();
+}
+
 async function startMockedVnuSession(
   page: import("@playwright/test").Page,
   error: { code?: string; status: number; message: string },
@@ -862,29 +873,37 @@ test("VNU grant import is account-scoped and deletes legacy plaintext", async ({
   })).toEqual({ grant: "synthetic-scoped-grant", username: null, password: null });
 });
 
-test("VNU new tab has no grant, expires to manual login, and removes active or inactive descriptors", async ({ page, context }) => {
-  test.slow();
-  await page.route("**/api/**", (route) => route.abort());
-  const targetId = "synthetic-vnu-new-tab";
-  const survivor = { id: "synthetic-new-tab-survivor", universityId: "mock", token: "synthetic-survivor-token", studentCode: "SYNTHETIC-SURVIVOR", addedAt: "2099-01-01T00:00:00.000Z" };
-  const seedSharedAccount = async (token: string, active: boolean) => {
-    await page.goto("/login");
-    await page.evaluate(({ accountId, accountToken, survivorAccount, targetIsActive }) => {
-      const target = { id: accountId, universityId: "vnu", token: accountToken, studentCode: "SYNTHETIC-NEW-TAB", addedAt: "2099-01-01T00:00:00.000Z" };
-      localStorage.setItem("hyeboard.accounts", JSON.stringify(targetIsActive ? [target, survivorAccount] : [survivorAccount, target]));
-      localStorage.setItem("hyeboard.activeAccountId", targetIsActive ? accountId : survivorAccount.id);
-      localStorage.setItem("hyeboard.universityId", targetIsActive ? "vnu" : "mock");
-      sessionStorage.setItem(`hyeboard.vnu.refreshGrant.${accountId}`, "synthetic-source-tab-grant");
-    }, { accountId: targetId, accountToken: token, survivorAccount: survivor, targetIsActive: active });
-  };
+const NEW_TAB_VNU_ACCOUNT_ID = "synthetic-vnu-new-tab";
+const NEW_TAB_SURVIVOR = { id: "synthetic-new-tab-survivor", universityId: "mock", token: "synthetic-survivor-token", studentCode: "SYNTHETIC-SURVIVOR", addedAt: "2099-01-01T00:00:00.000Z" };
 
+async function seedNewTabDescriptorScenario(
+  page: import("@playwright/test").Page,
+  token: string,
+  targetIsActive: boolean,
+): Promise<void> {
   await page.goto("/login");
-  await page.evaluate(({ accountId }) => {
+  await page.evaluate(({ accountId, accountToken, survivor, active }) => {
+    const target = { id: accountId, universityId: "vnu", token: accountToken, studentCode: "SYNTHETIC-NEW-TAB", addedAt: "2099-01-01T00:00:00.000Z" };
+    localStorage.setItem("hyeboard.accounts", JSON.stringify(active ? [target, survivor] : [survivor, target]));
+    localStorage.setItem("hyeboard.activeAccountId", active ? accountId : survivor.id);
+    localStorage.setItem("hyeboard.universityId", active ? "vnu" : "mock");
+    sessionStorage.setItem(`hyeboard.vnu.refreshGrant.${accountId}`, "synthetic-source-tab-grant");
+  }, { accountId: NEW_TAB_VNU_ACCOUNT_ID, accountToken: token, survivor: NEW_TAB_SURVIVOR, active: targetIsActive });
+}
+
+async function seedExpiringNewTabAccount(page: import("@playwright/test").Page): Promise<void> {
+  await page.goto("/login");
+  await page.evaluate((accountId) => {
     localStorage.setItem("hyeboard.accounts", JSON.stringify([{ id: accountId, universityId: "vnu", token: "synthetic-expiring-new-tab-token", studentCode: "SYNTHETIC-NEW-TAB", addedAt: "2099-01-01T00:00:00.000Z" }]));
     localStorage.setItem("hyeboard.activeAccountId", accountId);
     localStorage.setItem("hyeboard.universityId", "vnu");
     sessionStorage.setItem(`hyeboard.vnu.refreshGrant.${accountId}`, "synthetic-source-tab-grant");
-  }, { accountId: targetId });
+  }, NEW_TAB_VNU_ACCOUNT_ID);
+}
+
+test("VNU new tab without a grant expires to empty manual login", async ({ page, context }) => {
+  await page.route("**/api/**", (route) => route.abort());
+  await seedExpiringNewTabAccount(page);
   const expiryTab = await context.newPage();
   let refreshRequests = 0;
   await expiryTab.route("**/api/**", (route) => route.abort());
@@ -900,16 +919,22 @@ test("VNU new tab has no grant, expires to manual login, and removes active or i
   expect(await expiryTab.evaluate((accountId) => ({
     accounts: JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as unknown[],
     grant: sessionStorage.getItem(`hyeboard.vnu.refreshGrant.${accountId}`),
-  }), targetId)).toEqual({ accounts: [], grant: null });
+  }), NEW_TAB_VNU_ACCOUNT_ID)).toEqual({ accounts: [], grant: null });
   await expiryTab.getByRole("combobox", { name: "School" }).click();
   await expiryTab.getByRole("option", { name: "VNU (daotao)" }).click();
   await expect(expiryTab.getByLabel("Username")).toHaveValue("");
   await expect(expiryTab.getByLabel("Password", { exact: true })).toHaveValue("");
   await expiryTab.close();
+});
 
-  for (const descriptor of ["synthetic-live-descriptor", "authenticated-fully-expired-descriptor-token"]) {
-    for (const active of [true, false]) {
-      await seedSharedAccount(descriptor, active);
+for (const descriptorCase of [
+  { label: "live", token: "synthetic-live-descriptor" },
+  { label: "fully expired", token: "authenticated-fully-expired-descriptor-token" },
+] as const) {
+  for (const targetIsActive of [true, false] as const) {
+    test(`VNU new tab removes ${targetIsActive ? "active" : "inactive"} ${descriptorCase.label} descriptor without a grant`, async ({ page, context }) => {
+      await page.route("**/api/**", (route) => route.abort());
+      await seedNewTabDescriptorScenario(page, descriptorCase.token, targetIsActive);
       const removalTab = await context.newPage();
       await removalTab.route("**/api/**", (route) => route.abort());
       let logoutRequest: { authorization?: string; body: string | null } | undefined;
@@ -917,9 +942,9 @@ test("VNU new tab has no grant, expires to manual login, and removes active or i
         logoutRequest = { authorization: route.request().headers().authorization, body: route.request().postData() };
         return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { authenticated: false }, error: null }) });
       });
-      await removalTab.goto(active ? "/settings" : "/");
-      expect(await removalTab.evaluate((accountId) => sessionStorage.getItem(`hyeboard.vnu.refreshGrant.${accountId}`), targetId)).toBeNull();
-      if (active) {
+      await removalTab.goto(targetIsActive ? "/settings" : "/");
+      expect(await removalTab.evaluate((accountId) => sessionStorage.getItem(`hyeboard.vnu.refreshGrant.${accountId}`), NEW_TAB_VNU_ACCOUNT_ID)).toBeNull();
+      if (targetIsActive) {
         await removalTab.getByRole("button", { name: "Sign out" }).click();
         await expect(removalTab).toHaveURL(/\/login$/);
       } else {
@@ -929,51 +954,65 @@ test("VNU new tab has no grant, expires to manual login, and removes active or i
       await expect.poll(() => removalTab.evaluate((accountId) => {
         const accounts = JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ id: string }>;
         return accounts.some((account) => account.id === accountId);
-      }, targetId)).toBe(false);
-      expect(logoutRequest).toEqual({ authorization: `Bearer ${descriptor}`, body: JSON.stringify({}) });
+      }, NEW_TAB_VNU_ACCOUNT_ID)).toBe(false);
+      expect(logoutRequest).toEqual({ authorization: `Bearer ${descriptorCase.token}`, body: JSON.stringify({}) });
       expect(await removalTab.evaluate(() => {
         const accounts = JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ id: string }>;
         return accounts.map((account) => account.id);
-      })).toEqual([survivor.id]);
+      })).toEqual([NEW_TAB_SURVIVOR.id]);
       await removalTab.close();
-    }
+    });
   }
-});
+}
 
-test("VNU reconnect status is one polite nonblocking region and ignores inactive events", async ({ page }) => {
+type VnuReconnectRequestCounts = {
+  vnuTimetable: number;
+  uetTimetable: number;
+  universities: number;
+};
+
+async function seedVnuReconnectScenario(
+  page: import("@playwright/test").Page,
+  locale: "en" | "vi" = "en",
+): Promise<VnuReconnectRequestCounts> {
+  const counts: VnuReconnectRequestCounts = { vnuTimetable: 0, uetTimetable: 0, universities: 0 };
   await page.route("**/api/**", (route) => route.abort());
-  let timetableRequests = 0;
-  let uetTimetableRequests = 0;
-  let universityRequests = 0;
   await page.route("**/api/universities", (route) => {
-    universityRequests += 1;
+    counts.universities += 1;
     return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: [], error: null }) });
   });
   await page.route("**/api/vnu/timetable**", (route) => {
-    timetableRequests += 1;
+    counts.vnuTimetable += 1;
     return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: [], error: null }) });
   });
   await page.route("**/api/uet/timetable**", (route) => {
-    uetTimetableRequests += 1;
+    counts.uetTimetable += 1;
     return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: [], error: null }) });
   });
   await page.goto("/login");
-  await page.evaluate(() => {
+  await page.evaluate((selectedLocale) => {
     localStorage.setItem("hyeboard.accounts", JSON.stringify([
       { id: "synthetic-vnu-active", universityId: "vnu", token: "synthetic-active-token", studentCode: "SYNTHETIC-ACTIVE", addedAt: "2099-01-01T00:00:00.000Z" },
       { id: "synthetic-vnu-inactive", universityId: "uet", token: "synthetic-inactive-token", studentCode: "SYNTHETIC-INACTIVE", addedAt: "2099-01-01T00:00:00.000Z" },
     ]));
     localStorage.setItem("hyeboard.activeAccountId", "synthetic-vnu-active");
     localStorage.setItem("hyeboard.universityId", "vnu");
-  });
+    localStorage.setItem("hyeboard.locale", selectedLocale);
+  }, locale);
+  const initialTimetable = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/vnu/timetable");
   await page.goto("/timetable");
-  await expect.poll(() => timetableRequests).toBe(1);
-  const universityRequestsBeforeEvents = universityRequests;
-  await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-status", { detail: { accountId: "synthetic-vnu-inactive", state: "reconnecting" } })));
-  await expect(page.getByText("Reconnecting to VNU…", { exact: true })).toHaveCount(0);
-  await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-committed", { detail: { accountId: "synthetic-vnu-inactive" } })));
-  expect(timetableRequests).toBe(1);
-  expect(universityRequests).toBe(universityRequestsBeforeEvents);
+  await initialTimetable;
+  await expect(page.getByTestId("account-trigger")).toBeVisible();
+  return counts;
+}
+
+function reconnectCountsSnapshot(counts: VnuReconnectRequestCounts): VnuReconnectRequestCounts {
+  return { ...counts };
+}
+
+test("VNU active reconnect status is one polite nonblocking region and committed refresh refetches", async ({ page }) => {
+  const counts = await seedVnuReconnectScenario(page);
+  const beforeCommit = reconnectCountsSnapshot(counts);
   await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-status", { detail: { accountId: "synthetic-vnu-active", state: "reconnecting" } })));
   const status = page.getByText("Reconnecting to VNU…", { exact: true });
   await expect(status).toHaveCount(1);
@@ -985,22 +1024,56 @@ test("VNU reconnect status is one polite nonblocking region and ignores inactive
   await expect(retryableStatus).toHaveCount(1);
   await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-status", { detail: { accountId: "synthetic-vnu-active", state: "idle" } })));
   await expect(retryableStatus).toHaveCount(0);
+  const refetchedTimetable = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/vnu/timetable");
   await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-committed", { detail: { accountId: "synthetic-vnu-active" } })));
-  await expect.poll(() => timetableRequests).toBe(2);
-  expect(universityRequests).toBe(universityRequestsBeforeEvents);
-  await page.evaluate(() => localStorage.setItem("hyeboard.locale", "vi"));
-  await page.reload();
-  await expect(page.getByTestId("account-trigger")).toBeVisible();
+  await refetchedTimetable;
+  expect(counts).toEqual({ ...beforeCommit, vnuTimetable: beforeCommit.vnuTimetable + 1 });
+});
+
+test("VNU inactive reconnect events cause no refetch after causal render and request lifecycles", async ({ page, isMobile }) => {
+  const counts = await seedVnuReconnectScenario(page);
+  const beforeEvents = reconnectCountsSnapshot(counts);
+  await page.evaluate(() => {
+    window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-status", { detail: { accountId: "synthetic-vnu-inactive", state: "reconnecting" } }));
+    window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-status", { detail: { accountId: "synthetic-vnu-active", state: "reconnecting" } }));
+  });
+  await expect(page.getByText("Reconnecting to VNU…", { exact: true })).toBeVisible();
+  expect(counts).toEqual(beforeEvents);
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-status", { detail: { accountId: "synthetic-vnu-active", state: "idle" } })));
+  await expect(page.getByText("Reconnecting to VNU…", { exact: true })).toHaveCount(0);
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-committed", { detail: { accountId: "synthetic-vnu-inactive" } })));
+  await clickVisibleNavigationLink(page, "/settings", isMobile);
+  await expect(page).toHaveURL(/\/settings$/);
+  const returnedTimetable = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/vnu/timetable");
+  await page.goto("/timetable");
+  await returnedTimetable;
+  expect(counts.vnuTimetable).toBe(beforeEvents.vnuTimetable + 1);
+  expect(counts.uetTimetable).toBe(beforeEvents.uetTimetable);
+});
+
+test("VNU reconnect status is localized", async ({ page }) => {
+  await seedVnuReconnectScenario(page, "vi");
   await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-status", { detail: { accountId: "synthetic-vnu-active", state: "reconnecting" } })));
   await expect(page.getByText("Đang kết nối lại với VNU…", { exact: true })).toBeVisible();
   await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-status", { detail: { accountId: "synthetic-vnu-active", state: "idle" } })));
+  await expect(page.getByText("Đang kết nối lại với VNU…", { exact: true })).toHaveCount(0);
+});
+
+test("VNU committed event stays inactive after switching accounts", async ({ page, isMobile }) => {
+  const counts = await seedVnuReconnectScenario(page);
+  const switchedTimetable = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/uet/timetable");
   await page.getByTestId("account-trigger").click();
   await page.getByTestId("account-switch-item").filter({ hasText: "(UET)" }).click();
-  await expect.poll(() => uetTimetableRequests).toBe(1);
-  const vnuRequestsAfterSwitch = timetableRequests;
+  await switchedTimetable;
+  const afterSwitch = reconnectCountsSnapshot(counts);
   await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-committed", { detail: { accountId: "synthetic-vnu-active" } })));
-  expect(uetTimetableRequests).toBe(1);
-  expect(timetableRequests).toBe(vnuRequestsAfterSwitch);
+  await clickVisibleNavigationLink(page, "/settings", isMobile);
+  await expect(page).toHaveURL(/\/settings$/);
+  const returnedTimetable = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/uet/timetable");
+  await page.goto("/timetable");
+  await returnedTimetable;
+  expect(counts.vnuTimetable).toBe(afterSwitch.vnuTimetable);
+  expect(counts.uetTimetable).toBe(afterSwitch.uetTimetable + 1);
 });
 
 test("VNU remove keeps exact account pending and on revoke failure, then clears only its grant", async ({ page }) => {
@@ -1096,7 +1169,7 @@ test("VNU active Settings logout uses its grant and one alert while 503 retains 
   await expect(page.getByRole("alert")).toHaveText("Could not securely remove this VNU account. Try again.");
 });
 
-test("VNU reconnect cancelled by failed revoke leaves one alert and no stale reconnecting status", async ({ page }) => {
+test("VNU reconnect cancelled by failed revoke leaves one alert and no stale reconnecting status", async ({ page, isMobile }) => {
   await page.route("**/api/**", (route) => route.abort());
   await page.route("**/api/universities", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: [], error: null }) }));
   await page.route("**/api/vnu/timetable**", (route) => route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ data: null, error: { code: "VNU_SESSION_EXPIRED", message: "Synthetic expiry" } }) }));
@@ -1104,16 +1177,46 @@ test("VNU reconnect cancelled by failed revoke leaves one alert and no stale rec
   const refreshEntered = new Promise<void>((resolve) => { markRefreshEntered = resolve; });
   let releaseOldRefresh!: () => void;
   const oldRefreshMayFinish = new Promise<void>((resolve) => { releaseOldRefresh = resolve; });
+  let markOldRefreshRouteCompleted!: () => void;
+  const oldRefreshRouteCompleted = new Promise<void>((resolve) => { markOldRefreshRouteCompleted = resolve; });
+  let markOldRefreshBrowserSettled!: () => void;
+  const oldRefreshBrowserSettled = new Promise<void>((resolve) => { markOldRefreshBrowserSettled = resolve; });
+  let refreshRequests = 0;
+  const markMatchingRefreshSettled = (request: import("@playwright/test").Request) => {
+    if (new URL(request.url()).pathname === "/api/vnu/auth/refresh") markOldRefreshBrowserSettled();
+  };
+  page.on("requestfinished", markMatchingRefreshSettled);
+  page.on("requestfailed", markMatchingRefreshSettled);
+  await page.addInitScript(() => {
+    const observations = { committed: 0, statuses: [] as string[] };
+    window.addEventListener("hyeboard:vnu-refresh-committed", () => { observations.committed += 1; });
+    window.addEventListener("hyeboard:vnu-refresh-status", (event) => {
+      const state = (event as CustomEvent<{ state?: string }>).detail.state;
+      if (state) observations.statuses.push(state);
+    });
+    Object.defineProperty(window, "__lateRefreshObservations", { value: observations, configurable: true });
+  });
   await page.route("**/api/vnu/auth/refresh", async (route) => {
+    refreshRequests += 1;
     markRefreshEntered();
     await oldRefreshMayFinish;
-    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: {
-      token: "synthetic-late-refresh-token",
-      refreshGrant: "synthetic-late-refresh-grant",
-      session: { authenticated: true, universityId: "vnu", studentCode: "SYNTHETIC-REFRESH-REVOKE", expiresAt: "2099-01-01T00:00:00.000Z" },
-    }, error: null }) }).catch(() => undefined);
+    try {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: {
+        token: "synthetic-late-refresh-token",
+        refreshGrant: "synthetic-late-refresh-grant",
+        session: { authenticated: true, universityId: "vnu", studentCode: "SYNTHETIC-REFRESH-REVOKE", expiresAt: "2099-01-01T00:00:00.000Z" },
+      }, error: null }) });
+    } catch {
+      // Cancellation may detach the request before the synthetic late response is sent.
+    } finally {
+      markOldRefreshRouteCompleted();
+    }
   });
-  await page.route("**/api/vnu/auth/logout", (route) => route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ data: null, error: { code: "VNU_REFRESH_UNAVAILABLE", message: "Synthetic logout unavailable" } }) }));
+  let logoutRequests = 0;
+  await page.route("**/api/vnu/auth/logout", (route) => {
+    logoutRequests += 1;
+    return route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ data: null, error: { code: "VNU_REFRESH_UNAVAILABLE", message: "Synthetic logout unavailable" } }) });
+  });
   await page.goto("/login");
   await page.evaluate(() => {
     localStorage.setItem("hyeboard.accounts", JSON.stringify([{ id: "synthetic-refresh-revoke", universityId: "vnu", token: "synthetic-refresh-revoke-token", studentCode: "SYNTHETIC-REFRESH-REVOKE", addedAt: "2099-01-01T00:00:00.000Z" }]));
@@ -1124,23 +1227,44 @@ test("VNU reconnect cancelled by failed revoke leaves one alert and no stale rec
   await page.goto("/timetable");
   await refreshEntered;
   await expect(page.getByText("Reconnecting to VNU…", { exact: true })).toBeVisible();
-  await page.evaluate(() => (document.querySelector('a[href="/settings"]') as HTMLElement | null)?.click());
+  await clickVisibleNavigationLink(page, "/settings", isMobile);
   await expect(page).toHaveURL(/\/settings$/);
   await page.getByRole("button", { name: "Sign out" }).click();
   await expect(page.getByRole("button", { name: "Sign out" })).toBeEnabled();
   await expect(page.locator('[role="alert"]')).toHaveCount(1);
   await expect(page.getByText("Reconnecting to VNU…", { exact: true })).toHaveCount(0);
-  expect(await page.evaluate(() => ({
+  await oldRefreshBrowserSettled;
+  const stateBeforeLateResponse = await page.evaluate(() => ({
     accountIds: (JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ id: string }>).map((account) => account.id),
+    token: (JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ token: string }>)[0]?.token,
     grant: sessionStorage.getItem("hyeboard.vnu.refreshGrant.synthetic-refresh-revoke"),
-  }))).toEqual({ accountIds: ["synthetic-refresh-revoke"], grant: "synthetic-refresh-revoke-grant" });
+    observations: (window as unknown as { __lateRefreshObservations: { committed: number; statuses: string[] } }).__lateRefreshObservations,
+  }));
+  expect(stateBeforeLateResponse).toEqual({
+    accountIds: ["synthetic-refresh-revoke"],
+    token: "synthetic-refresh-revoke-token",
+    grant: "synthetic-refresh-revoke-grant",
+    observations: { committed: 0, statuses: ["reconnecting", "idle"] },
+  });
   releaseOldRefresh();
-  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+  await oldRefreshRouteCompleted;
+  const retryLogoutResponse = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/vnu/auth/logout");
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await retryLogoutResponse;
+  await expect(page.getByRole("button", { name: "Sign out" })).toBeEnabled();
   await expect(page.getByText("Reconnecting to VNU…", { exact: true })).toHaveCount(0);
   await expect(page.locator('[role="alert"]')).toHaveCount(1);
+  expect(await page.evaluate(() => ({
+    accountIds: (JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ id: string }>).map((account) => account.id),
+    token: (JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ token: string }>)[0]?.token,
+    grant: sessionStorage.getItem("hyeboard.vnu.refreshGrant.synthetic-refresh-revoke"),
+    observations: (window as unknown as { __lateRefreshObservations: { committed: number; statuses: string[] } }).__lateRefreshObservations,
+  }))).toEqual(stateBeforeLateResponse);
+  expect(refreshRequests).toBe(1);
+  expect(logoutRequests).toBe(2);
 });
 
-test("VNU remove failure cannot resurrect Settings ownership after route navigation", async ({ page }) => {
+test("VNU remove failure cannot resurrect Settings ownership after route navigation", async ({ page, isMobile }) => {
   await page.route("**/api/**", (route) => route.abort());
   let markLogoutEntered!: () => void;
   const logoutEntered = new Promise<void>((resolve) => { markLogoutEntered = resolve; });
@@ -1161,13 +1285,12 @@ test("VNU remove failure cannot resurrect Settings ownership after route navigat
   await page.goto("/settings");
   await page.getByRole("button", { name: "Sign out" }).click();
   await logoutEntered;
-  await page.evaluate(() => (document.querySelector('a[href="/"]') as HTMLElement | null)?.click());
+  await clickVisibleNavigationLink(page, "/", isMobile);
   await expect(page).toHaveURL(/\/$/);
   const logoutResponse = page.waitForResponse((response) => response.url().includes("/api/vnu/auth/logout"));
   releaseLogout();
   await logoutResponse;
-  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
-  await page.evaluate(() => (document.querySelector('a[href="/settings"]') as HTMLElement | null)?.click());
+  await clickVisibleNavigationLink(page, "/settings", isMobile);
   await expect(page).toHaveURL(/\/settings$/);
   await expect(page.getByRole("button", { name: "Sign out" })).toBeEnabled();
   await expect(page.locator('[role="alert"]')).toHaveCount(0);
@@ -1288,7 +1411,7 @@ test("VNU remove pending failure stays inert after account switch", async ({ pag
 test("concurrent VNU expiry leaves a switched inactive origin inert", async ({ page }) => {
   await loginDemo(page);
   const survivingAccount = await page.evaluate(() => {
-    const accounts = JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ id: string; universityId: string; token: string }>;
+    const accounts = JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ id: string; universityId: string; token: string; studentCode: string }>;
     return accounts.find((account) => account.universityId === "mock");
   });
   expect(survivingAccount).toBeDefined();
@@ -1305,10 +1428,22 @@ test("concurrent VNU expiry leaves a switched inactive origin inert", async ({ p
   await page.getByTestId("account-switch-item").filter({ hasText: "(MOCK)" }).click();
   await expect.poll(() => page.evaluate(() => localStorage.getItem("hyeboard.activeAccountId"))).toBe(survivingAccount?.id);
 
+  const releasedRawPaths = ["/api/vnu/raw/profile", "/api/vnu/raw/grades", "/api/vnu/raw/progress", "/api/vnu/raw/syllabus"];
+  const rawRequestSettlements = releasedRawPaths.map((path) => Promise.race([
+    page.waitForEvent("requestfinished", { predicate: (request) => new URL(request.url()).pathname === path }),
+    page.waitForEvent("requestfailed", { predicate: (request) => new URL(request.url()).pathname === path }),
+  ]));
   mockedSession.releaseRawRequests();
-  await mockedSession.allRawResponsesFulfilled;
-  await expect(harmlessExtraRawRequest).resolves.toBe(401);
-  await page.waitForLoadState("networkidle");
+  await Promise.all([
+    mockedSession.allRawResponsesFulfilled,
+    expect(harmlessExtraRawRequest).resolves.toBe(401),
+    ...rawRequestSettlements,
+  ]);
+  await page.getByRole("button", { name: "Open account menu" }).click();
+  const activeSurvivor = page.locator('[data-testid="account-switch-item"]:visible').filter({ hasText: survivingAccount?.studentCode });
+  await expect(activeSurvivor).toHaveCount(1);
+  await expect(activeSurvivor.locator("svg.text-primary")).toHaveCount(1);
+  await expect(page.locator('[role="alert"]')).toHaveCount(0);
   await expect.poll(() => page.evaluate((expectedAccount) => {
     const accounts = JSON.parse(localStorage.getItem("hyeboard.accounts") ?? "[]") as Array<{ id: string; universityId: string; token: string }>;
     return {
@@ -1848,10 +1983,6 @@ test("bulk and safe VNU lookup cancel one shared refresh without late mutations"
   let markRefreshAbort!: () => void;
   const refreshAbortObserved = new Promise<void>((resolve) => { markRefreshAbort = resolve; });
   const bulkAuthorizations: Array<string | null> = [];
-  let markSafeGetJoined!: () => void;
-  const safeGetJoined = new Promise<void>((resolve) => { markSafeGetJoined = resolve; });
-  await page.exposeFunction("__markTask7SafeGetJoined", markSafeGetJoined);
-
   page.on("requestfailed", (request) => {
     if (!request.url().includes("/api/vnu/auth/refresh")) return;
     refreshAborted += 1;
@@ -1900,25 +2031,14 @@ test("bulk and safe VNU lookup cancel one shared refresh without late mutations"
     if (activeId) sessionStorage.setItem(`hyeboard.vnu.refreshGrant.${activeId}`, "synthetic-cancel-grant");
   }, { token: initialToken });
   await page.reload();
-  await page.evaluate(async () => {
+  await page.evaluate(() => {
     const events = { committed: 0, statuses: [] as string[] };
     window.addEventListener("hyeboard:vnu-refresh-committed", () => { events.committed += 1; });
     window.addEventListener("hyeboard:vnu-refresh-status", (event) => {
       const state = (event as CustomEvent<{ state?: string }>).detail.state;
       if (state) events.statuses.push(state);
     });
-    Object.defineProperty(window, "__task7RefreshEvents", { value: events, configurable: true });
-    const loadApi = new Function("return import('/src/lib/api.ts')") as () => Promise<{
-      installRequestTestObserver(observer: { onRefreshWaiterRegistered(event: { path: string; joinedExistingFlight: boolean }): void }): () => void;
-    }>;
-    const apiModule = await loadApi();
-    const restoreObserver = apiModule.installRequestTestObserver({
-      onRefreshWaiterRegistered: ({ path, joinedExistingFlight }) => {
-        if (!path.startsWith("/api/vnu/raw/exams") || !joinedExistingFlight) return;
-        (window as unknown as { __markTask7SafeGetJoined(): void }).__markTask7SafeGetJoined();
-      },
-    });
-    Object.defineProperty(window, "__restoreTask7RequestObserver", { value: restoreObserver, configurable: true });
+    Object.defineProperty(window, "__vnuRefreshEvents", { value: events, configurable: true });
   });
 
   const bulk = page.getByTestId("bulk-lookup");
@@ -1930,10 +2050,13 @@ test("bulk and safe VNU lookup cancel one shared refresh without late mutations"
   await expect(bulk.getByRole("button", { name: "Export" })).toBeVisible();
 
   const term = page.getByRole("combobox", { name: "Term" });
+  const safeExpiryResponse = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/vnu/raw/exams" && response.status() === 401);
   await term.click();
-  await page.getByRole("option").first().click();
-  await safeGetJoined;
+  const termOptions = page.getByRole("listbox");
+  await termOptions.getByRole("option", { name: "Semester 2, 2025–2026 (supplementary)", exact: true }).click();
+  await safeExpiryResponse;
   await page.getByRole("button", { name: "Class ID to course" }).click();
+  await expect(page.getByTestId("reverse-class-lookup")).toBeVisible();
   await bulk.getByRole("button", { name: "Cancel" }).click();
   await refreshAbortObserved;
   expect(refreshPosts).toBe(1);
@@ -1943,7 +2066,7 @@ test("bulk and safe VNU lookup cancel one shared refresh without late mutations"
   const beforeLate = await page.evaluate(() => ({
     account: localStorage.getItem("hyeboard.accounts"),
     grants: Object.entries(sessionStorage).filter(([key]) => key.startsWith("hyeboard.vnu.refreshGrant.")),
-    events: (window as unknown as { __task7RefreshEvents: { committed: number; statuses: string[] } }).__task7RefreshEvents,
+    events: (window as unknown as { __vnuRefreshEvents: { committed: number; statuses: string[] } }).__vnuRefreshEvents,
   }));
   await expect(bulk.getByRole("button", { name: "Retry remaining" })).toBeVisible();
   await expect(bulk.getByRole("button", { name: "Export" })).toBeVisible();
@@ -1954,14 +2077,13 @@ test("bulk and safe VNU lookup cancel one shared refresh without late mutations"
   const afterLate = await page.evaluate(() => ({
     account: localStorage.getItem("hyeboard.accounts"),
     grants: Object.entries(sessionStorage).filter(([key]) => key.startsWith("hyeboard.vnu.refreshGrant.")),
-    events: (window as unknown as { __task7RefreshEvents: { committed: number; statuses: string[] } }).__task7RefreshEvents,
+    events: (window as unknown as { __vnuRefreshEvents: { committed: number; statuses: string[] } }).__vnuRefreshEvents,
   }));
   expect(afterLate).toEqual(beforeLate);
   expect(bulkPosts).toBe(2);
   expect(refreshPosts).toBe(1);
   expect(refreshAborted).toBe(1);
   expect(bulkAuthorizations).toEqual([`Bearer ${initialToken}`, `Bearer ${initialToken}`]);
-  await page.evaluate(() => (window as unknown as { __restoreTask7RequestObserver(): void }).__restoreTask7RequestObserver());
 });
 
 test("bulk resets without stale resurrection while second chunk is gated", async ({ page }) => {
@@ -2916,47 +3038,36 @@ test("view toggles and key settings actions meet mobile touch target size", asyn
   // WebKit at a 3x device pixel ratio can report a CSS 44px target as
   // 43.99998 due to subpixel snapping, so allow a hairline rounding tolerance.
   const MIN_TOUCH_TARGET = 43.9;
+  const expectTouchTarget = async (locator: import("@playwright/test").Locator) => {
+    await expect(locator).toBeVisible();
+    const box = await locator.boundingBox();
+    expect(box).not.toBeNull();
+    expect(box!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET);
+  };
 
   await page.goto("/timetable");
   for (const name of ["List", "Calendar"]) {
-    const box = await page.getByRole("button", { name, exact: true }).boundingBox();
-    expect(box).not.toBeNull();
-    expect(box!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET);
+    await expectTouchTarget(page.getByRole("button", { name, exact: true }));
   }
 
   await page.goto("/exams");
   for (const name of ["List", "Calendar"]) {
-    const box = await page.getByRole("button", { name, exact: true }).boundingBox();
-    expect(box).not.toBeNull();
-    expect(box!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET);
+    await expectTouchTarget(page.getByRole("button", { name, exact: true }));
   }
-  const examsTermBox = await page.getByRole("combobox", { name: "Term" }).boundingBox();
-  expect(examsTermBox).not.toBeNull();
-  expect(examsTermBox!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET);
+  await expectTouchTarget(page.getByRole("combobox", { name: "Term" }));
 
   await page.goto("/grades");
-  const gradesTermBox = await page.getByTestId("grades-term-select").boundingBox();
-  expect(gradesTermBox).not.toBeNull();
-  expect(gradesTermBox!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET);
+  await expectTouchTarget(page.getByTestId("grades-term-select"));
 
   await page.goto("/settings");
-  const toggleBox = await page.getByRole("button", { name: "Toggle light and dark mode" }).boundingBox();
-  expect(toggleBox).not.toBeNull();
-  expect(toggleBox!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET);
+  await expectTouchTarget(page.getByRole("button", { name: "Toggle light and dark mode" }));
 
   for (const name of ["Neutral", "Colored"]) {
-    const box = await page.getByRole("button", { name, exact: true }).boundingBox();
-    expect(box).not.toBeNull();
-    expect(box!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET);
+    await expectTouchTarget(page.getByRole("button", { name, exact: true }));
   }
 
-  const languageBox = await page.getByRole("combobox", { name: "Language" }).boundingBox();
-  expect(languageBox).not.toBeNull();
-  expect(languageBox!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET);
-
-  const signOutBox = await page.getByRole("button", { name: "Sign out" }).boundingBox();
-  expect(signOutBox).not.toBeNull();
-  expect(signOutBox!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET);
+  await expectTouchTarget(page.getByRole("combobox", { name: "Language" }));
+  await expectTouchTarget(page.getByRole("button", { name: "Sign out" }));
 });
 
 test("exam and tuition tables keep every column reachable on mobile via internal scroll", async ({ page }) => {

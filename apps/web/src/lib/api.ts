@@ -258,32 +258,6 @@ type InternalRequestOptions = {
   tokenOverride?: string;
 };
 
-type RequestTestObserver = {
-  onRefreshWaiterRegistered?(event: { path: string; joinedExistingFlight: boolean }): void;
-};
-
-type RequestTestObserverEntry = { observer: RequestTestObserver };
-const requestTestObservers: RequestTestObserverEntry[] = [];
-
-export function installRequestTestObserver(observer: RequestTestObserver): () => void {
-  const entry = { observer };
-  requestTestObservers.push(entry);
-  return () => {
-    const index = requestTestObservers.indexOf(entry);
-    if (index >= 0) requestTestObservers.splice(index, 1);
-  };
-}
-
-function notifyRequestTestObserver(event: { path: string; joinedExistingFlight: boolean }): void {
-  const observer = requestTestObservers.at(-1)?.observer;
-  if (!observer?.onRefreshWaiterRegistered) return;
-  try {
-    observer.onRefreshWaiterRegistered(event);
-  } catch {
-    // Test observers must never alter production request behavior.
-  }
-}
-
 function apiErrorFromPayload(payload: ApiResponse<unknown>, response: Response): ApiError {
   return new ApiError(
     payload.error?.message ?? `Request failed: ${response.status}`,
@@ -440,9 +414,7 @@ async function request<T>(path: string, init: RequestInit = {}, internal: Intern
       }
       let outcome;
       try {
-        const joinedExistingFlight = vnuRefreshStatuses.get(originatingAccount.id)?.state === "reconnecting";
         const refresh = runVnuRefresh(originatingAccount, init.signal ?? undefined, refreshDeps);
-        notifyRequestTestObserver({ path, joinedExistingFlight });
         outcome = await refresh;
       } catch (refreshError) {
         throw markVnuRefreshAttempted(normalizeRefreshError(refreshError));
