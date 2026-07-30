@@ -4,6 +4,9 @@ export { deriveVnuRefreshPrincipal } from "@hyeboard/core";
 
 export const VNU_REFRESH_ATTEMPT_LIMIT = 5;
 export const VNU_REFRESH_WINDOW_MS = 15 * 60 * 1000;
+export const VNU_MANUAL_ACTIVATION_LIMIT = 5 as const;
+export const VNU_MANUAL_ACTIVATION_WINDOW_SECONDS = 900 as const;
+export const VNU_MANUAL_ACTIVATION_WINDOW_MS = VNU_MANUAL_ACTIVATION_WINDOW_SECONDS * 1000;
 export const VNU_REFRESH_LEASE_MS = 2 * 60 * 1000;
 export const VNU_REFRESH_STATE_KEY = "vnu-refresh-control";
 
@@ -11,7 +14,9 @@ export type LinkedPair = { accessTokenId: string; accessExpiresAt: number; grant
 export type AccessDescriptorRef = LinkedPair;
 export type RefreshLease = { pair: LinkedPair; expiresAt: number };
 export type RefreshWindow = { count: number; resetAt: number };
-export type LinkedGrantTombstone = { accessTokenId: string; accessExpiresAt: number; grantExpiresAt: number };
+export type PreProvenanceLinkedGrantTombstone = { accessTokenId: string; accessExpiresAt: number; grantExpiresAt: number };
+export type RefreshSuccessorLinkedGrantTombstone = PreProvenanceLinkedGrantTombstone & { refreshSuccessor: LinkedPair };
+export type LinkedGrantTombstone = PreProvenanceLinkedGrantTombstone | RefreshSuccessorLinkedGrantTombstone;
 export type RevokedGrantTombstone = number | LinkedGrantTombstone;
 export type VnuRefreshControlState = {
   active?: LinkedPair;
@@ -19,6 +24,7 @@ export type VnuRefreshControlState = {
   revokedAccess: Record<string, number>;
   revokedGrants: Record<string, RevokedGrantTombstone>;
   window: RefreshWindow;
+  activationWindow?: RefreshWindow;
 };
 
 export type BeginRefreshResult =
@@ -26,6 +32,9 @@ export type BeginRefreshResult =
   | { kind: "in-progress"; retryAfterSeconds: number }
   | { kind: "rate-limited"; retryAfterSeconds: number; limit: 5; windowSeconds: 900 }
   | { kind: "revoked" };
+export type ActivatePairResult =
+  | { kind: "activated" }
+  | { kind: "rate-limited"; retryAfterSeconds: number; limit: 5; windowSeconds: 900 };
 export type MutationResult = { kind: "activated" | "completed" | "aborted" | "revoked" | "mismatch" | "expired" };
 export type AccessCheckResult = { kind: "active" } | { kind: "revoked" };
 export type TransitionOutput<T> = { state: VnuRefreshControlState; result: T; changed: boolean };
@@ -48,7 +57,7 @@ export function parseVnuRefreshControlState(value: unknown): VnuRefreshControlSt
   if (value === undefined) return undefined;
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid VNU refresh state");
   const state = value as Record<string, unknown>;
-  const allowed = new Set(["active", "lease", "revokedAccess", "revokedGrants", "window"]);
+  const allowed = new Set(["active", "lease", "revokedAccess", "revokedGrants", "window", "activationWindow"]);
   if (Object.keys(state).some((key) => !allowed.has(key))) throw new Error("Invalid VNU refresh state");
   if (state.active !== undefined) assertLinkedPair(state.active);
   if (state.lease !== undefined) {
@@ -67,28 +76,49 @@ export function parseVnuRefreshControlState(value: unknown): VnuRefreshControlSt
       if (!Number.isSafeInteger(tombstone) || tombstone <= 0) throw new Error("Invalid VNU refresh state");
       continue;
     }
-    assertLinkedGrantTombstone(tombstone);
+    assertLinkedGrantTombstone(tombstone, grantId);
   }
   if (!state.window || typeof state.window !== "object" || Array.isArray(state.window)) throw new Error("Invalid VNU refresh state");
   const window = state.window as Record<string, unknown>;
   if (Object.keys(window).sort().join(",") !== "count,resetAt" || !Number.isSafeInteger(window.count) || (window.count as number) < 0 || (window.count as number) > VNU_REFRESH_ATTEMPT_LIMIT || !Number.isSafeInteger(window.resetAt) || (window.resetAt as number) <= 0) throw new Error("Invalid VNU refresh state");
+  if (state.activationWindow !== undefined) assertActivationWindow(state.activationWindow);
   const parsed = state as VnuRefreshControlState;
   if (parsed.lease && (!parsed.active || !samePair(parsed.active, parsed.lease.pair) || parsed.lease.expiresAt > parsed.lease.pair.grantExpiresAt)) throw new Error("Invalid VNU refresh state");
   if (parsed.active && (parsed.revokedAccess[parsed.active.accessTokenId] !== undefined || parsed.revokedGrants[parsed.active.grantId] !== undefined)) throw new Error("Invalid VNU refresh state");
   return parsed;
 }
 
-function assertLinkedGrantTombstone(value: unknown): asserts value is LinkedGrantTombstone {
+function assertActivationWindow(value: unknown): asserts value is RefreshWindow {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid VNU refresh state");
+  const window = value as Record<string, unknown>;
+  if (Object.keys(window).sort().join(",") !== "count,resetAt"
+    || !Number.isSafeInteger(window.count)
+    || (window.count as number) <= 0
+    || (window.count as number) > VNU_MANUAL_ACTIVATION_LIMIT
+    || !Number.isSafeInteger(window.resetAt)
+    || (window.resetAt as number) <= 0) throw new Error("Invalid VNU refresh state");
+}
+
+function assertLinkedGrantTombstone(value: unknown, revokedGrantId: string): asserts value is LinkedGrantTombstone {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid VNU refresh state");
   const tombstone = value as Record<string, unknown>;
-  if (Object.keys(tombstone).sort().join(",") !== "accessExpiresAt,accessTokenId,grantExpiresAt") throw new Error("Invalid VNU refresh state");
+  const keys = Object.keys(tombstone).sort().join(",");
+  if (keys !== "accessExpiresAt,accessTokenId,grantExpiresAt" && keys !== "accessExpiresAt,accessTokenId,grantExpiresAt,refreshSuccessor") throw new Error("Invalid VNU refresh state");
   if (typeof tombstone.accessTokenId !== "string" || !/^[A-Za-z0-9_-]{22}$/.test(tombstone.accessTokenId)) throw new Error("Invalid VNU refresh state");
   if (!Number.isSafeInteger(tombstone.accessExpiresAt) || (tombstone.accessExpiresAt as number) <= 0) throw new Error("Invalid VNU refresh state");
   if (!Number.isSafeInteger(tombstone.grantExpiresAt) || (tombstone.grantExpiresAt as number) <= 0) throw new Error("Invalid VNU refresh state");
+  if (tombstone.refreshSuccessor === undefined) return;
+  assertLinkedPair(tombstone.refreshSuccessor);
+  const successor = tombstone.refreshSuccessor;
+  if (successor.accessTokenId === tombstone.accessTokenId || successor.grantId === revokedGrantId || successor.grantExpiresAt !== tombstone.grantExpiresAt) throw new Error("Invalid VNU refresh state");
 }
 
 function linkedGrantTombstone(pair: LinkedPair): LinkedGrantTombstone {
   return { accessTokenId: pair.accessTokenId, accessExpiresAt: pair.accessExpiresAt, grantExpiresAt: pair.grantExpiresAt };
+}
+
+function refreshSuccessorGrantTombstone(old: LinkedPair, next: LinkedPair): RefreshSuccessorLinkedGrantTombstone {
+  return { ...linkedGrantTombstone(old), refreshSuccessor: next };
 }
 
 function grantTombstoneExpiresAt(tombstone: RevokedGrantTombstone | undefined): number | undefined {
@@ -101,6 +131,10 @@ function exactlyLinksGrantTombstone(tombstone: RevokedGrantTombstone | undefined
     && tombstone.accessTokenId === pair.accessTokenId
     && tombstone.accessExpiresAt === pair.accessExpiresAt
     && tombstone.grantExpiresAt === pair.grantExpiresAt;
+}
+
+function refreshSuccessor(tombstone: RevokedGrantTombstone | undefined): LinkedPair | undefined {
+  return typeof tombstone === "object" && "refreshSuccessor" in tombstone ? tombstone.refreshSuccessor : undefined;
 }
 
 export function samePair(left: LinkedPair | undefined, right: LinkedPair): boolean {
@@ -122,7 +156,10 @@ export function cleanVnuRefreshState(input: VnuRefreshControlState | undefined, 
   const active = source.active && source.active.grantExpiresAt > now ? source.active : undefined;
   const lease = source.lease && source.lease.expiresAt > now && source.lease.pair.grantExpiresAt > now ? source.lease : undefined;
   const window = now >= source.window.resetAt ? { count: 0, resetAt: now + VNU_REFRESH_WINDOW_MS } : source.window;
-  return { active, lease, revokedAccess, revokedGrants, window };
+  const activationWindow = source.activationWindow && source.activationWindow.count > 0 && now < source.activationWindow.resetAt
+    ? source.activationWindow
+    : undefined;
+  return { active, lease, revokedAccess, revokedGrants, window, ...(activationWindow ? { activationWindow } : {}) };
 }
 
 function unchanged<T>(stored: VnuRefreshControlState | undefined, now: number, result: T): TransitionOutput<T> {
@@ -133,22 +170,33 @@ function changed<T>(stored: VnuRefreshControlState | undefined, state: VnuRefres
   return { state, result, changed: !sameVnuRefreshState(stored, state) };
 }
 
-function revokeExact(state: VnuRefreshControlState, pair: LinkedPair): VnuRefreshControlState {
+function revokeExact(state: VnuRefreshControlState, pair: LinkedPair, grantTombstone: LinkedGrantTombstone = linkedGrantTombstone(pair)): VnuRefreshControlState {
   return {
     ...state,
     active: undefined,
     lease: state.lease && samePair(state.lease.pair, pair) ? undefined : state.lease,
     revokedAccess: { ...state.revokedAccess, [pair.accessTokenId]: pair.accessExpiresAt },
-    revokedGrants: { ...state.revokedGrants, [pair.grantId]: linkedGrantTombstone(pair) },
+    revokedGrants: { ...state.revokedGrants, [pair.grantId]: grantTombstone },
   };
 }
 
-export function applyActivatePair(stored: VnuRefreshControlState | undefined, pair: LinkedPair, now: number): TransitionOutput<{ kind: "activated" }> {
+export function applyActivatePair(stored: VnuRefreshControlState | undefined, pair: LinkedPair, now: number): TransitionOutput<ActivatePairResult> {
   assertLinkedPair(pair);
   if (samePair(stored?.active, pair) && stored?.lease === undefined) return unchanged(stored, now, { kind: "activated" });
   const state = cleanVnuRefreshState(stored, now);
+  if (state.activationWindow && state.activationWindow.count >= VNU_MANUAL_ACTIVATION_LIMIT) {
+    return unchanged(stored, now, {
+      kind: "rate-limited",
+      retryAfterSeconds: Math.max(1, Math.ceil((state.activationWindow.resetAt - now) / 1000)),
+      limit: VNU_MANUAL_ACTIVATION_LIMIT,
+      windowSeconds: VNU_MANUAL_ACTIVATION_WINDOW_SECONDS,
+    });
+  }
   const replaced = state.active && !samePair(state.active, pair) ? revokeExact(state, state.active) : state;
-  return changed(stored, { ...replaced, active: pair, lease: undefined }, { kind: "activated" });
+  const activationWindow = state.activationWindow
+    ? { ...state.activationWindow, count: state.activationWindow.count + 1 }
+    : { count: 1, resetAt: now + VNU_MANUAL_ACTIVATION_WINDOW_MS };
+  return changed(stored, { ...replaced, active: pair, lease: undefined, activationWindow }, { kind: "activated" });
 }
 
 export function applyBeginRefresh(stored: VnuRefreshControlState | undefined, pair: LinkedPair, now: number): TransitionOutput<BeginRefreshResult> {
@@ -169,7 +217,7 @@ export function applyCompleteRefresh(stored: VnuRefreshControlState | undefined,
   if (stored?.revokedAccess[input.next.accessTokenId] !== undefined || stored?.revokedGrants[input.next.grantId] !== undefined) throw new Error("Invalid VNU refresh rotation collision");
   const state = cleanVnuRefreshState(stored, now);
   if (input.old.grantExpiresAt <= now || !samePair(state.active, input.old) || !state.lease || !samePair(state.lease.pair, input.old)) return unchanged(stored, now, { kind: "revoked" });
-  const revoked = revokeExact(state, input.old);
+  const revoked = revokeExact(state, input.old, refreshSuccessorGrantTombstone(input.old, input.next));
   return changed(stored, { ...revoked, active: input.next }, { kind: "completed" });
 }
 
@@ -201,9 +249,17 @@ export function applyRevokePrincipalByLinkedGrant(stored: VnuRefreshControlState
   if (proof.grantExpiresAt <= now) return unchanged(stored, now, { kind: "expired" });
   const state = cleanVnuRefreshState(stored, now);
   const exactActiveProof = samePair(state.active, proof);
-  const exactGrantTombstone = exactlyLinksGrantTombstone(state.revokedGrants[proof.grantId], proof);
+  const tombstone = state.revokedGrants[proof.grantId];
+  const exactGrantTombstone = exactlyLinksGrantTombstone(tombstone, proof);
   if (!exactActiveProof && !exactGrantTombstone) return unchanged(stored, now, { kind: "mismatch" });
   if (!state.active) return unchanged(stored, now, { kind: "revoked" });
+  if (!exactActiveProof) {
+    const successor = refreshSuccessor(tombstone);
+    const exactSuccessorAuthority = successor !== undefined
+      && samePair(state.active, successor)
+      && (!state.lease || samePair(state.lease.pair, successor));
+    if (!exactSuccessorAuthority) return unchanged(stored, now, { kind: "mismatch" });
+  }
 
   const current = state.active;
   const revoked = revokeExact({
@@ -231,6 +287,7 @@ export function nextVnuRefreshAlarm(state: VnuRefreshControlState): number | und
     state.active?.grantExpiresAt,
     state.lease?.expiresAt,
     state.window.count > 0 ? state.window.resetAt : undefined,
+    state.activationWindow && state.activationWindow.count > 0 ? state.activationWindow.resetAt : undefined,
   ].filter((value): value is number => typeof value === "number");
   return values.length ? Math.min(...values) : undefined;
 }
@@ -245,7 +302,8 @@ export function isQuiescentVnuRefreshState(state: VnuRefreshControlState): boole
     && state.lease === undefined
     && Object.keys(state.revokedAccess).length === 0
     && Object.keys(state.revokedGrants).length === 0
-    && state.window.count === 0;
+    && state.window.count === 0
+    && state.activationWindow === undefined;
 }
 
 export async function checkAccessAuthoritatively(storage: VnuRefreshControlStorage, access: AccessDescriptorRef, now: number): Promise<AccessCheckResult> {
@@ -265,7 +323,7 @@ export async function checkAccessAuthoritatively(storage: VnuRefreshControlStora
 }
 
 export interface VnuRefreshControlStub {
-  activatePair(pair: LinkedPair): Promise<{ kind: "activated" }>;
+  activatePair(pair: LinkedPair): Promise<ActivatePairResult>;
   checkAccess(access: AccessDescriptorRef): Promise<AccessCheckResult>;
   beginRefresh(pair: LinkedPair): Promise<BeginRefreshResult>;
   completeRefresh(input: { old: LinkedPair; next: LinkedPair }): Promise<{ kind: "completed" } | { kind: "revoked" }>;
@@ -277,7 +335,7 @@ export interface VnuRefreshControlStub {
 
 export interface VnuRefreshControlNamespace { getByName(name: string): VnuRefreshControlStub }
 export interface VnuRefreshControlCoordinator {
-  activatePair(principalKey: string, pair: LinkedPair): Promise<void>;
+  activatePair(principalKey: string, pair: LinkedPair): Promise<ActivatePairResult>;
   checkAccess(principalKey: string, access: AccessDescriptorRef): Promise<AccessCheckResult>;
   beginRefresh(principalKey: string, pair: LinkedPair): Promise<BeginRefreshResult>;
   completeRefresh(principalKey: string, input: { old: LinkedPair; next: LinkedPair }): Promise<"completed" | "revoked">;
@@ -303,7 +361,7 @@ export class DurableObjectVnuRefreshControlCoordinator implements VnuRefreshCont
     try { return await operation(this.stub(principalKey)); } catch { throw vnuRefreshUnavailable(); }
   }
 
-  activatePair(principalKey: string, pair: LinkedPair) { return this.call(principalKey, async (stub) => { assertLinkedPair(pair); await stub.activatePair(pair); }); }
+  activatePair(principalKey: string, pair: LinkedPair) { return this.call(principalKey, async (stub) => { assertLinkedPair(pair); return stub.activatePair(pair); }); }
   checkAccess(principalKey: string, access: AccessDescriptorRef) { return this.call(principalKey, async (stub) => { assertAccessDescriptorRef(access); return stub.checkAccess(access); }); }
   beginRefresh(principalKey: string, pair: LinkedPair) { return this.call(principalKey, async (stub) => { assertLinkedPair(pair); return stub.beginRefresh(pair); }); }
   completeRefresh(principalKey: string, input: { old: LinkedPair; next: LinkedPair }) { return this.call(principalKey, async (stub) => { assertLinkedPair(input.old); assertLinkedPair(input.next); return (await stub.completeRefresh(input)).kind; }); }

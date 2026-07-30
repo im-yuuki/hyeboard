@@ -999,4 +999,21 @@ describe("frontend session-death policy", () => {
     expect(listAccounts()).toEqual([replacement]);
     expect(readVnuRefreshGrant(ACCOUNT.id)).toBe("newer-grant");
   });
+
+  it("leaves a newer same-account token and grant untouched after old revocation fails", async () => {
+    storeVnuRefreshGrant(ACCOUNT.id, "old-grant");
+    let release!: (response: Response) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((resolve) => { release = resolve; })));
+
+    const pending = api.revokeAndRemoveAccount(ACCOUNT.id);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    const replacement = { ...ACCOUNT, token: "newer-token" };
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([replacement]));
+    storeVnuRefreshGrant(ACCOUNT.id, "newer-grant");
+    release(new Response(JSON.stringify({ data: null, error: { code: "VNU_REFRESH_GRANT_REVOKED", message: "Synthetic old logout rejected" } }), { status: 401 }));
+
+    await expect(pending).rejects.toMatchObject({ code: "VNU_REFRESH_GRANT_REVOKED" });
+    expect(listAccounts()).toEqual([replacement]);
+    expect(readVnuRefreshGrant(ACCOUNT.id)).toBe("newer-grant");
+  });
 });

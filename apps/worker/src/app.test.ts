@@ -19,6 +19,7 @@ import { selfHostedRuntimeConfig } from "./start";
 import type { VnuProbeBudgetCoordinator } from "./vnu-probe-budget";
 import {
   applyAbortRefresh,
+  applyActivatePair,
   applyBeginRefresh,
   applyCompleteRefresh,
   applyRevokeExactLinkedPair,
@@ -26,9 +27,13 @@ import {
   applyRevokePrincipalByLinkedGrant,
   checkAccessAuthoritatively,
   DurableObjectVnuRefreshControlCoordinator,
+  VNU_MANUAL_ACTIVATION_LIMIT,
+  VNU_MANUAL_ACTIVATION_WINDOW_MS,
+  VNU_MANUAL_ACTIVATION_WINDOW_SECONDS,
   nextVnuRefreshAlarm,
   parseVnuRefreshControlState,
   type AccessCheckResult,
+  type ActivatePairResult,
   type AccessDescriptorRef,
   type BeginRefreshResult,
   type LinkedPair,
@@ -127,21 +132,37 @@ class TestVnuImportRefreshControl implements VnuRefreshControlCoordinator {
   cleanupWriteCount = 0;
   alarmUpdateCount = 0;
   staleCleanupPending = false;
+  readonly activationWindows = new Map<string, { count: number; resetAt: number }>();
 
   private throwIfUnavailable(operation?: RefreshControlOperation): void {
     if (!this.failureMode || (this.failureOperation && this.failureOperation !== operation)) return;
     throw new Error(`SYNTHETIC_${this.failureMode.toUpperCase()}_SENTINEL`);
   }
 
-  async activatePair(principalKey: string, pair: LinkedPair): Promise<void> {
+  async activatePair(principalKey: string, pair: LinkedPair): Promise<ActivatePairResult> {
     this.throwIfUnavailable();
     const previous = this.activePairs.get(principalKey);
+    const storedWindow = this.activationWindows.get(principalKey);
+    const window = !storedWindow || Date.now() >= storedWindow.resetAt
+      ? { count: 0, resetAt: Date.now() + VNU_MANUAL_ACTIVATION_WINDOW_MS }
+      : storedWindow;
+    if (previous && JSON.stringify(previous) === JSON.stringify(pair)) return { kind: "activated" };
+    if (window.count >= VNU_MANUAL_ACTIVATION_LIMIT) {
+      return {
+        kind: "rate-limited",
+        retryAfterSeconds: Math.max(1, Math.ceil((window.resetAt - Date.now()) / 1000)),
+        limit: VNU_MANUAL_ACTIVATION_LIMIT,
+        windowSeconds: VNU_MANUAL_ACTIVATION_WINDOW_SECONDS,
+      };
+    }
     if (previous && JSON.stringify(previous) !== JSON.stringify(pair)) {
       this.revokedPairs.set(principalKey, [...(this.revokedPairs.get(principalKey) ?? []), previous]);
     }
     this.activations.push({ principalKey, pair });
     this.activePairs.set(principalKey, pair);
+    this.activationWindows.set(principalKey, { ...window, count: window.count + 1 });
     this.mutationCount += 1;
+    return { kind: "activated" };
   }
 
   async checkAccess(principalKey: string, pair: AccessDescriptorRef): Promise<AccessCheckResult> {
@@ -324,7 +345,7 @@ function productionRefreshAuthorityHarness(
   };
   const unsupported = async (): Promise<never> => { throw new Error("not used"); };
   const stub: VnuRefreshControlStub = {
-    activatePair: unsupported,
+    activatePair: (pair) => mutate((state, now) => applyActivatePair(state, pair, now)),
     checkAccess: (pair) => checkAccessAuthoritatively(storage, pair, Date.now()),
     beginRefresh: async (pair) => { calls.begin += 1; return mutate((state, now) => applyBeginRefresh(state, pair, now)); },
     completeRefresh: async (input) => {
@@ -398,6 +419,10 @@ class TestCache {
     const url = [...this.store.keys()].find((key) => key.includes("/cache/vnu/import/"));
     if (!url) throw new Error("VNU import cache entry was not written");
     return url;
+  }
+
+  importUrls(): string[] {
+    return [...this.store.keys()].filter((key) => key.includes("/cache/vnu/import/"));
   }
 
   async importEntry(): Promise<{
@@ -584,6 +609,7 @@ describe("request-log privacy", () => {
 async function importVnu(app: ReturnType<typeof createApp>): Promise<CoordinatorVnuImportResponse> {
   const response = await requestVnuImport(app);
   expect(response.status).toBe(200);
+  expect(response.headers.get("Cache-Control")).toBe("no-store");
   const body = await response.json() as { data: CoordinatorVnuImportResponse; error: null };
   expect(body.error).toBeNull();
   expect(Object.keys(body.data).sort()).toEqual(["refreshGrant", "session", "token"]);
@@ -1264,6 +1290,62 @@ describe("VNU import session cache", () => {
     }]);
   });
 
+  it("returns sanitized 429 without artifacts on the sixth manual activation and succeeds after reset", async () => {
+    const privatePassword = "PRIVATE_MANUAL_ACTIVATION_PASSWORD";
+    const requestImport = (password = privatePassword) => app.handle(new Request("http://localhost/api/vnu/auth/import-session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ vnuUsername: "SYNTHETIC-VNU-USER", vnuPassword: password }),
+    }));
+
+    for (let activation = 0; activation < VNU_MANUAL_ACTIVATION_LIMIT; activation += 1) {
+      expect((await requestImport()).status).toBe(200);
+    }
+    expect(cache.importUrls()).toHaveLength(1);
+    const importUrlsBeforeRejected = cache.importUrls();
+    const mutationCount = refreshControl.mutationCount;
+    const principalKey = refreshControl.activations[0]!.principalKey;
+    const activePairBefore = structuredClone(refreshControl.activePairs.get(principalKey));
+    const revokedPairsBefore = structuredClone(refreshControl.revokedPairs.get(principalKey));
+    const activationWindowBefore = structuredClone(refreshControl.activationWindows.get(principalKey));
+    const logLines: string[] = [];
+    configureLogger({ level: "warn", mode: "node", destination: { write: (line) => logLines.push(line) } });
+    const rejected = await requestImport("PRIVATE_FRESH_RATE_LIMITED_PASSWORD");
+    const rejectedText = await rejected.text();
+    expect(rejected.status).toBe(429);
+    expect(rejected.headers.get("Cache-Control")).toBe("no-store");
+    expect(JSON.parse(rejectedText)).toEqual({
+      data: null,
+      error: {
+        code: "VNU_MANUAL_ACTIVATION_RATE_LIMITED",
+        message: "Too many VNU sign-ins. Wait before trying again.",
+        details: { retryAfterSeconds: VNU_MANUAL_ACTIVATION_WINDOW_MS / 1000 },
+      },
+    });
+    expect(rejectedText).not.toMatch(/token|grant|PRIVATE_(?:MANUAL_ACTIVATION|FRESH_RATE_LIMITED)_PASSWORD/i);
+    expect(refreshControl.mutationCount).toBe(mutationCount);
+    expect(refreshControl.activations).toHaveLength(VNU_MANUAL_ACTIVATION_LIMIT);
+    expect(refreshControl.activePairs.get(principalKey)).toEqual(activePairBefore);
+    expect(refreshControl.revokedPairs.get(principalKey)).toEqual(revokedPairsBefore);
+    expect(refreshControl.activationWindows.get(principalKey)).toEqual(activationWindowBefore);
+    expect(adapterMocks.importSession).toHaveBeenCalledTimes(2);
+    expect(cache.importUrls()).toHaveLength(1);
+    expect(logLines.join("\n")).toContain("VNU_MANUAL_ACTIVATION_RATE_LIMITED");
+    expect(logLines.join("\n")).not.toMatch(/PRIVATE_(?:MANUAL_ACTIVATION|FRESH_RATE_LIMITED)_PASSWORD|SYNTHETIC-VNU-USER/i);
+
+    syntheticTime += VNU_MANUAL_ACTIVATION_WINDOW_MS;
+    const reset = await requestImport("PRIVATE_FRESH_RATE_LIMITED_PASSWORD");
+    expect(reset.status).toBe(200);
+    expect(refreshControl.activations).toHaveLength(VNU_MANUAL_ACTIVATION_LIMIT + 1);
+    expect(adapterMocks.importSession).toHaveBeenCalledTimes(3);
+    expect(cache.importUrls()).toHaveLength(2);
+    const acceptedCacheUrl = cache.importUrls().find((url) => !importUrlsBeforeRejected.includes(url));
+    expect(acceptedCacheUrl).toBeDefined();
+    const acceptedCacheEntry = await cache.store.get(acceptedCacheUrl!)!.response.clone().json() as { seed: string; session: CoordinatorVnuImportResponse["session"] };
+    await expect(decryptSession(acceptedCacheEntry.seed, SESSION_SECRET)).resolves.toEqual(normalizedVnuSession());
+    expect(acceptedCacheEntry.session).toMatchObject({ universityId: "vnu", studentCode: VNU_STUDENT_CODE, authenticated: true });
+  });
+
   it.each([
     ["refresh", "/api/vnu/auth/refresh", {}],
     ["refresh extras", "/api/vnu/auth/refresh", { refreshGrant: "x", extra: true }],
@@ -1695,6 +1777,38 @@ describe("VNU import session cache", () => {
     expect(adapterMocks.importSession).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps a manual relogin authoritative when delayed old linked logout resumes", async () => {
+    const oldLogin = await importVnu(app);
+    const oldPayload = await decryptSession(oldLogin.token, SESSION_SECRET);
+    const principalKey = oldPayload.vnuRefresh!.principalKey;
+    const gate = enteredOperation<void>();
+    const authority = productionRefreshAuthorityHarness(activeAuthorityState(descriptorPairFixture(oldPayload)), principalKey, {
+      markEntered: gate.markEntered,
+      release: gate.result,
+    });
+    setVnuRefreshControlCoordinator(authority.coordinator);
+    const delayedLogout = requestVnuLogout(app, oldLogin.token, oldLogin.refreshGrant);
+    await gate.entered;
+
+    const newLogin = await importVnu(app);
+    const newPayload = await decryptSession(newLogin.token, SESSION_SECRET);
+    const newPair = descriptorPairFixture(newPayload);
+    expect((authority.storage.stored as VnuRefreshControlState).active).toEqual(newPair);
+    authority.storage.resetCounts();
+
+    gate.release();
+    const oldLogout = await delayedLogout;
+    expect(oldLogout.status).toBe(401);
+    expect(oldLogout.headers.get("Cache-Control")).toBe("no-store");
+    await expect(oldLogout.json()).resolves.toMatchObject({ error: { code: "VNU_REFRESH_GRANT_REVOKED" } });
+    expect(authority.storage.putCount).toBe(0);
+    expect(authority.storage.alarmUpdateCount).toBe(0);
+    expect((authority.storage.stored as VnuRefreshControlState).active).toEqual(newPair);
+
+    expect((await getVnuSession(app, newLogin.token)).status).toBe(200);
+    await expect(authority.coordinator.checkAccess(principalKey, newPair)).resolves.toEqual({ kind: "active" });
+  });
+
   it("keeps committed rotation authoritative when completion delivery fails", async () => {
     const imported = await importVnu(app);
     const oldPayload = await decryptSession(imported.token, SESSION_SECRET);
@@ -1722,6 +1836,7 @@ describe("VNU import session cache", () => {
       accessTokenId: oldPayload.vnuRefresh!.accessTokenId,
       accessExpiresAt: Date.parse(oldPayload.vnuRefresh!.accessExpiresAt),
       grantExpiresAt: Date.parse(oldPayload.vnuRefresh!.grantExpiresAt),
+      refreshSuccessor: state.active,
     });
     expect(authority.calls).toEqual({ begin: 1, complete: 1, abort: 1, revokeLinked: 0 });
     await expect(authority.coordinator.checkAccess(principalKey, state.active!)).resolves.toEqual({ kind: "active" });
@@ -2155,9 +2270,14 @@ describe("VNU import session cache", () => {
     const activePair = descriptorPairFixture(activePayload);
     const revokedBefore = structuredClone(refreshControl.revokedPairs.get(activePayload.vnuRefresh!.principalKey) ?? []);
     const mutationCountBefore = refreshControl.mutationCount;
+    const importCacheCountBefore = cache.importUrls().length;
     refreshControl.failureMode = "outage";
 
-    const response = await requestVnuImport(app);
+    const response = await app.handle(new Request("http://localhost/api/vnu/auth/import-session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ vnuUsername: "SYNTHETIC_VNU_USER", vnuPassword: "PRIVATE_FRESH_OUTAGE_PASSWORD" }),
+    }));
     const text = await response.text();
 
     expect(response.status).toBe(503);
@@ -2172,7 +2292,9 @@ describe("VNU import session cache", () => {
     expect(refreshControl.activePairs.get(activePayload.vnuRefresh!.principalKey)).toEqual(activePair);
     expect(refreshControl.revokedPairs.get(activePayload.vnuRefresh!.principalKey) ?? []).toEqual(revokedBefore);
     expect(refreshControl.mutationCount).toBe(mutationCountBefore);
-    for (const privateValue of ["token", "refreshGrant", "session", "SYNTHETIC_VNU_COOKIE", "SYNTHETIC_VNU_USER", "SYNTHETIC_VNU_PASSWORD"]) {
+    expect(adapterMocks.importSession).toHaveBeenCalledTimes(2);
+    expect(cache.importUrls()).toHaveLength(importCacheCountBefore);
+    for (const privateValue of ["token", "refreshGrant", "session", "SYNTHETIC_VNU_COOKIE", "SYNTHETIC_VNU_USER", "SYNTHETIC_VNU_PASSWORD", "PRIVATE_FRESH_OUTAGE_PASSWORD"]) {
       expect(text).not.toContain(privateValue);
     }
   });

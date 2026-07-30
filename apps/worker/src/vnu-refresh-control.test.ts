@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   DurableObjectVnuRefreshControlCoordinator,
+  VNU_MANUAL_ACTIVATION_LIMIT,
+  VNU_MANUAL_ACTIVATION_WINDOW_MS,
+  VNU_REFRESH_ATTEMPT_LIMIT,
   VNU_REFRESH_LEASE_MS,
   VNU_REFRESH_STATE_KEY,
   VNU_REFRESH_WINDOW_MS,
@@ -26,14 +29,23 @@ const NOW = Date.parse("2036-02-03T04:05:06.000Z");
 const EXPIRY = NOW + 8 * 60 * 60 * 1000;
 const OLD: LinkedPair = { accessTokenId: "A".repeat(22), accessExpiresAt: EXPIRY - 60_000, grantId: "B".repeat(22), grantExpiresAt: EXPIRY };
 const NEXT: LinkedPair = { accessTokenId: "C".repeat(22), accessExpiresAt: EXPIRY + 60_000, grantId: "D".repeat(22), grantExpiresAt: EXPIRY };
+const NEWER: LinkedPair = { accessTokenId: "E".repeat(22), accessExpiresAt: EXPIRY + 120_000, grantId: "F".repeat(22), grantExpiresAt: EXPIRY };
 const grantTombstone = (pair: LinkedPair) => ({ accessTokenId: pair.accessTokenId, accessExpiresAt: pair.accessExpiresAt, grantExpiresAt: pair.grantExpiresAt });
+const refreshTombstone = (old: LinkedPair, next: LinkedPair) => ({ ...grantTombstone(old), refreshSuccessor: next });
 const stale = (state: VnuRefreshControlState): VnuRefreshControlState => ({ ...state, revokedAccess: { ...state.revokedAccess, ["S".repeat(22)]: NOW } });
 
 describe("normative VNU refresh contracts", () => {
   it("uses exact state key and optional active/lease shape", () => {
     expect(VNU_REFRESH_STATE_KEY).toBe("vnu-refresh-control");
     const state = applyActivatePair(undefined, OLD, NOW).state;
-    expect(state).toEqual({ active: OLD, revokedAccess: {}, revokedGrants: {}, window: { count: 0, resetAt: NOW + VNU_REFRESH_WINDOW_MS } });
+    expect(state).toEqual({
+      active: OLD,
+      lease: undefined,
+      revokedAccess: {},
+      revokedGrants: {},
+      window: { count: 0, resetAt: NOW + VNU_REFRESH_WINDOW_MS },
+      activationWindow: { count: 1, resetAt: NOW + VNU_MANUAL_ACTIVATION_WINDOW_MS },
+    });
     const leased = applyBeginRefresh(state, OLD, NOW).state;
     expect(leased.lease).toEqual({ pair: OLD, expiresAt: NOW + VNU_REFRESH_LEASE_MS });
   });
@@ -49,6 +61,24 @@ describe("normative VNU refresh contracts", () => {
       { ...state, revokedGrants: { ["E".repeat(22)]: { ...grantTombstone(NEXT), extra: true } } },
       { ...state, window: { count: -1, resetAt: NOW } },
     ]) expect(() => parseVnuRefreshControlState(invalid)).toThrow(/Invalid VNU refresh (state|pair)/);
+  });
+
+  it("strictly parses bounded refresh successor provenance", () => {
+    const completed = applyCompleteRefresh(
+      applyBeginRefresh(applyActivatePair(undefined, OLD, NOW).state, OLD, NOW).state,
+      { old: OLD, next: NEXT },
+      NOW + 1,
+    ).state;
+    expect(parseVnuRefreshControlState(completed)).toEqual(completed);
+    for (const invalidSuccessor of [
+      { ...NEXT, extra: true },
+      { ...NEXT, accessTokenId: OLD.accessTokenId },
+      { ...NEXT, grantId: OLD.grantId },
+      { ...NEXT, grantExpiresAt: NEXT.grantExpiresAt + 1 },
+    ]) {
+      const invalid = { ...completed, revokedGrants: { [OLD.grantId]: { ...grantTombstone(OLD), refreshSuccessor: invalidSuccessor } } };
+      expect(() => parseVnuRefreshControlState(invalid)).toThrow(/Invalid VNU refresh (state|pair)/);
+    }
   });
 
   it("rejects impossible relational authority states", () => {
@@ -125,6 +155,163 @@ describe("normative VNU refresh contracts", () => {
 });
 
 describe("VNU refresh transitions", () => {
+  it("derives the phase-aware retention maximum across every minute offset", () => {
+    const retentionLifetimeMs = EXPIRY - NOW;
+    const phaseStepMs = 60_000;
+    const fullBoundaryCount = retentionLifetimeMs / VNU_MANUAL_ACTIVATION_WINDOW_MS;
+    const preBoundaryManualCapacity = VNU_MANUAL_ACTIVATION_LIMIT - 1;
+    const preBoundaryRefreshCapacity = VNU_REFRESH_ATTEMPT_LIMIT;
+    const phaseAwareManualMaximum = fullBoundaryCount * VNU_MANUAL_ACTIVATION_LIMIT + preBoundaryManualCapacity;
+    const phaseAwareRefreshMaximum = fullBoundaryCount * VNU_REFRESH_ATTEMPT_LIMIT + preBoundaryRefreshCapacity;
+    const phaseAwareAggregateMaximum = phaseAwareManualMaximum + phaseAwareRefreshMaximum;
+    expect(VNU_MANUAL_ACTIVATION_WINDOW_MS).toBe(VNU_REFRESH_WINDOW_MS);
+
+    const retainedAtPhase = (seedBeforeRetentionBoundaryMs: number) => {
+      const firstResetAfterRetentionBoundaryMs = VNU_MANUAL_ACTIVATION_WINDOW_MS - seedBeforeRetentionBoundaryMs;
+      const hasPreBoundaryBurst = firstResetAfterRetentionBoundaryMs > 0;
+      let manual = hasPreBoundaryBurst ? preBoundaryManualCapacity : 0;
+      let refresh = hasPreBoundaryBurst ? preBoundaryRefreshCapacity : 0;
+      for (
+        let boundary = firstResetAfterRetentionBoundaryMs;
+        boundary <= retentionLifetimeMs;
+        boundary += VNU_MANUAL_ACTIVATION_WINDOW_MS
+      ) {
+        if (boundary <= 0) continue;
+        manual += VNU_MANUAL_ACTIVATION_LIMIT;
+        refresh += VNU_REFRESH_ATTEMPT_LIMIT;
+      }
+      return { manual, refresh, total: manual + refresh };
+    };
+
+    const phaseCounts = Array.from(
+      { length: VNU_MANUAL_ACTIVATION_WINDOW_MS / phaseStepMs + 1 },
+      (_, phaseMinutes) => retainedAtPhase(phaseMinutes * phaseStepMs),
+    );
+    expect(phaseAwareManualMaximum).toBe(164);
+    expect(phaseAwareRefreshMaximum).toBe(165);
+    expect(phaseAwareAggregateMaximum).toBe(329);
+    expect(Math.max(...phaseCounts.map(({ total }) => total))).toBe(phaseAwareAggregateMaximum);
+    expect(phaseCounts.every(({ manual, refresh, total }) => manual <= phaseAwareManualMaximum && refresh <= phaseAwareRefreshMaximum && total <= phaseAwareAggregateMaximum)).toBe(true);
+  });
+
+  it("bounds manual activations independently from refresh attempts and resets exactly", () => {
+    const pairs = Array.from({ length: VNU_MANUAL_ACTIVATION_LIMIT + 1 }, (_, index): LinkedPair => ({
+      accessTokenId: String(index).padStart(22, "A"),
+      accessExpiresAt: EXPIRY,
+      grantId: String(index).padStart(22, "B"),
+      grantExpiresAt: EXPIRY,
+    }));
+    let state: VnuRefreshControlState | undefined;
+    for (const pair of pairs.slice(0, VNU_MANUAL_ACTIVATION_LIMIT)) {
+      const activated = applyActivatePair(state, pair, NOW);
+      expect(activated).toMatchObject({ result: { kind: "activated" }, changed: true });
+      state = activated.state;
+    }
+
+    const rejected = applyActivatePair(state, pairs.at(-1)!, NOW + 1);
+    expect(rejected).toEqual({
+      state,
+      result: { kind: "rate-limited", retryAfterSeconds: 900, limit: VNU_MANUAL_ACTIVATION_LIMIT, windowSeconds: VNU_MANUAL_ACTIVATION_WINDOW_MS / 1000 },
+      changed: false,
+    });
+    expect(Object.keys(rejected.state.revokedGrants)).toHaveLength(VNU_MANUAL_ACTIVATION_LIMIT - 1);
+
+    let refreshState = state!;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const begun = applyBeginRefresh(refreshState, refreshState.active!, NOW + attempt);
+      expect(begun.result.kind).toBe("accepted");
+      refreshState = applyAbortRefresh(begun.state, { pair: begun.state.active!, terminal: false }, NOW + attempt).state;
+    }
+    expect(refreshState.window.count).toBe(5);
+
+    const reset = applyActivatePair(state, pairs.at(-1)!, NOW + VNU_MANUAL_ACTIVATION_WINDOW_MS);
+    expect(reset).toMatchObject({ result: { kind: "activated" }, changed: true, state: { activationWindow: { count: 1, resetAt: NOW + 2 * VNU_MANUAL_ACTIVATION_WINDOW_MS } } });
+  });
+
+  it("parses missing activation windows for compatibility and rejects corrupt windows", () => {
+    const legacy = applyActivatePair(undefined, OLD, NOW).state;
+    const withoutActivationWindow = { ...legacy, activationWindow: undefined };
+    delete withoutActivationWindow.activationWindow;
+    expect(parseVnuRefreshControlState(withoutActivationWindow)).toEqual(withoutActivationWindow);
+    expect(applyActivatePair(withoutActivationWindow, NEXT, NOW + 1).state.activationWindow).toEqual({
+      count: 1,
+      resetAt: NOW + 1 + VNU_MANUAL_ACTIVATION_WINDOW_MS,
+    });
+    for (const activationWindow of [
+      { count: -1, resetAt: NOW + 1 },
+      { count: VNU_MANUAL_ACTIVATION_LIMIT + 1, resetAt: NOW + 1 },
+      { count: 1, resetAt: 0 },
+      { count: 1, resetAt: NOW + 1, extra: true },
+    ]) expect(() => parseVnuRefreshControlState({ ...legacy, activationWindow })).toThrow("Invalid VNU refresh state");
+  });
+
+  it("cleans the manual window at its exact boundary without a perpetual alarm", () => {
+    const activated = applyActivatePair(undefined, OLD, NOW).state;
+    const authorityFree = { ...activated, active: undefined };
+    const cleaned = cleanVnuRefreshState(authorityFree, NOW + VNU_MANUAL_ACTIVATION_WINDOW_MS);
+    expect(cleaned.activationWindow).toBeUndefined();
+    expect(nextVnuRefreshAlarm(cleaned)).toBeUndefined();
+  });
+
+  it("does not let a replaced manual pair authorize revocation of its successor", () => {
+    const replaced = applyActivatePair(applyActivatePair(undefined, OLD, NOW).state, NEXT, NOW + 1).state;
+
+    expect(applyRevokePrincipalByLinkedGrant(replaced, OLD, NOW + 2)).toEqual({
+      state: replaced,
+      result: { kind: "mismatch" },
+      changed: false,
+    });
+    expect(applyCheckAccess(replaced, NEXT, NOW + 2).result).toEqual({ kind: "active" });
+  });
+
+  it.each([false, true])("revokes only the exact refresh successor with lease=%s", (withLease) => {
+    const leasedOld = applyBeginRefresh(applyActivatePair(undefined, OLD, NOW).state, OLD, NOW).state;
+    const completed = applyCompleteRefresh(leasedOld, { old: OLD, next: NEXT }, NOW + 1).state;
+    const successor = withLease ? applyBeginRefresh(completed, NEXT, NOW + 2).state : completed;
+    const revoked = applyRevokePrincipalByLinkedGrant(successor, OLD, NOW + 3);
+
+    expect(revoked).toMatchObject({ result: { kind: "revoked" }, changed: true, state: { active: undefined, lease: undefined } });
+    expect(applyRevokePrincipalByLinkedGrant(revoked.state, OLD, NOW + 4)).toEqual({
+      state: revoked.state,
+      result: { kind: "revoked" },
+      changed: false,
+    });
+  });
+
+  it.each([false, true])("does not revoke a manual pair that replaced a refresh successor with lease=%s", (leaseSuccessor) => {
+    const leasedOld = applyBeginRefresh(applyActivatePair(undefined, OLD, NOW).state, OLD, NOW).state;
+    const completed = applyCompleteRefresh(leasedOld, { old: OLD, next: NEXT }, NOW + 1).state;
+    const successor = leaseSuccessor ? applyBeginRefresh(completed, NEXT, NOW + 2).state : completed;
+    const replaced = applyActivatePair(successor, NEWER, NOW + 3).state;
+
+    expect(applyRevokePrincipalByLinkedGrant(replaced, OLD, NOW + 4)).toEqual({
+      state: replaced,
+      result: { kind: "mismatch" },
+      changed: false,
+    });
+    expect(applyCheckAccess(replaced, NEWER, NOW + 4).result).toEqual({ kind: "active" });
+  });
+
+  it("fails closed for pre-provenance linked tombstones while preserving idempotence without active authority", () => {
+    const preProvenance: VnuRefreshControlState = {
+      active: NEXT,
+      revokedAccess: { [OLD.accessTokenId]: OLD.accessExpiresAt },
+      revokedGrants: { [OLD.grantId]: grantTombstone(OLD) },
+      window: { count: 0, resetAt: EXPIRY + 1 },
+    };
+    expect(applyRevokePrincipalByLinkedGrant(preProvenance, OLD, NOW + 1)).toEqual({
+      state: preProvenance,
+      result: { kind: "mismatch" },
+      changed: false,
+    });
+    const withoutActive = { ...preProvenance, active: undefined };
+    expect(applyRevokePrincipalByLinkedGrant(withoutActive, OLD, NOW + 1)).toEqual({
+      state: withoutActive,
+      result: { kind: "revoked" },
+      changed: false,
+    });
+  });
+
   it("activates and atomically revokes a replaced pair", () => {
     const first = applyActivatePair(undefined, OLD, NOW);
     const second = applyActivatePair(first.state, NEXT, NOW + 1);
@@ -326,7 +513,7 @@ describe("VNU refresh transitions", () => {
     const rotated = applyCompleteRefresh(leased, { old, next: NEXT }, NOW).state;
     const cleaned = cleanVnuRefreshState(rotated, NOW + 1);
     expect(cleaned.revokedAccess).toEqual({});
-    expect(cleaned.revokedGrants).toEqual({ [old.grantId]: grantTombstone(old) });
+    expect(cleaned.revokedGrants).toEqual({ [old.grantId]: refreshTombstone(old, NEXT) });
     expect(applyRevokeLinkedPairByAccess(cleaned, old, NOW + 1)).toEqual({ state: cleaned, result: { kind: "revoked" }, changed: false });
     for (const wrong of [
       { ...old, accessTokenId: "Y".repeat(22) },
@@ -418,7 +605,7 @@ describe("VNU refresh coordinator", () => {
     const getByName = vi.fn(() => allMethods(calls));
     const coordinator = new DurableObjectVnuRefreshControlCoordinator({ getByName });
     const principal = "a".repeat(64);
-    await coordinator.activatePair(principal, OLD);
+    await expect(coordinator.activatePair(principal, OLD)).resolves.toEqual({ kind: "activated" });
     await coordinator.checkAccess(principal, OLD);
     await coordinator.beginRefresh(principal, OLD);
     await coordinator.completeRefresh(principal, { old: OLD, next: NEXT });

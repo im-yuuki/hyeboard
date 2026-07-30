@@ -919,18 +919,26 @@ async function issueVnuAuthResult(input: {
     grantExpiresAt: grant.expiresAt,
     secret: input.secret,
   });
-  const [token, refreshGrant] = await Promise.all([
-    encryptSession({ ...input.payload, vnuRefresh: descriptor }, input.secret),
-    encryptVnuRefreshGrant(grant, input.secret),
-  ]);
-
+  let activation: Awaited<ReturnType<VnuRefreshControlCoordinator["activatePair"]>>;
   try {
-    await coordinator.activatePair(descriptor.principalKey, descriptorPair(descriptor));
+    activation = await coordinator.activatePair(descriptor.principalKey, descriptorPair(descriptor));
   } catch {
     const unavailable = vnuRefreshUnavailable();
     getLogger().error({ operation: "manual-import-activation", code: unavailable.code, status: unavailable.status }, "VNU refresh pair activation failed");
     throw unavailable;
   }
+  if (activation.kind === "rate-limited") {
+    throw new HyeboardError(
+      "VNU_MANUAL_ACTIVATION_RATE_LIMITED",
+      "Too many VNU sign-ins. Wait before trying again.",
+      429,
+      { retryAfterSeconds: activation.retryAfterSeconds },
+    );
+  }
+  const [token, refreshGrant] = await Promise.all([
+    encryptSession({ ...input.payload, vnuRefresh: descriptor }, input.secret),
+    encryptVnuRefreshGrant(grant, input.secret),
+  ]);
   return { token, refreshGrant, session: input.session };
 }
 
@@ -1095,7 +1103,7 @@ export function createApp(adapter: any) {
       req._hyebReqId = requestId();
       req._hyebStart = Date.now();
       const path = new URL(request.url).pathname;
-      if (path.startsWith("/api/vnu/cross-lookup/") || path === "/api/vnu/auth/refresh" || path === "/api/vnu/auth/logout") set.headers["Cache-Control"] = "no-store";
+      if (path.startsWith("/api/vnu/cross-lookup/") || path === "/api/vnu/auth/import-session" || path === "/api/vnu/auth/refresh" || path === "/api/vnu/auth/logout") set.headers["Cache-Control"] = "no-store";
       // Set HYEB_LOG_LEVEL=debug (Node/Bun .env, or a Cloudflare secret/var)
       // to see one line per incoming request here.
       getLogger().debug({ reqId: req._hyebReqId, method: request.method, path: requestLogPath(request.url) }, "request received");
@@ -1209,10 +1217,11 @@ export function createApp(adapter: any) {
             studentCode: imported.studentCode ?? imported.session.studentCode,
           };
           if (!normalizedSession.studentCode) throw incompleteVnuProfile();
-          const seed = await encryptSession(normalizedSession, secret);
           const session = { universityId: normalizedSession.universityId, studentCode: normalizedSession.studentCode, expiresAt: normalizedSession.expiresAt, authenticated: true as const };
+          const authResult = await issueVnuAuthResult({ username, password, payload: normalizedSession, session, secret });
+          const seed = await encryptSession(normalizedSession, secret);
           await cachePut(cacheKey, { seed, session }, Math.floor((Date.parse(normalizedSession.expiresAt) - Date.now()) / 1000));
-          return ok(await issueVnuAuthResult({ username, password, payload: normalizedSession, session, secret }));
+          return ok(authResult);
         };
 
         const cached = await restoreCachedVnuImport(await cacheGet<unknown>(cacheKey), secret);

@@ -4,6 +4,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { VnuRefreshControlDurableObject } from "../src/vnu-refresh-control-durable-object";
 import {
   DurableObjectVnuRefreshControlCoordinator,
+  VNU_MANUAL_ACTIVATION_LIMIT,
+  VNU_MANUAL_ACTIVATION_WINDOW_MS,
+  VNU_REFRESH_ATTEMPT_LIMIT,
   VNU_REFRESH_STATE_KEY,
   VNU_REFRESH_WINDOW_MS,
   vnuRefreshUnavailable,
@@ -19,6 +22,8 @@ const NOW = Date.parse("2036-02-03T04:05:06.000Z");
 const EXPIRY = NOW + 8 * 60 * 60 * 1000;
 const OLD: LinkedPair = { accessTokenId: "A".repeat(22), accessExpiresAt: EXPIRY - 60_000, grantId: "B".repeat(22), grantExpiresAt: EXPIRY };
 const NEXT: LinkedPair = { accessTokenId: "C".repeat(22), accessExpiresAt: EXPIRY + 60_000, grantId: "D".repeat(22), grantExpiresAt: EXPIRY };
+const NEWER: LinkedPair = { accessTokenId: "E".repeat(22), accessExpiresAt: EXPIRY + 120_000, grantId: "F".repeat(22), grantExpiresAt: EXPIRY };
+const RETENTION_MS = EXPIRY - NOW;
 type Counters = { get: number; transaction: number; put: number; deleteState: number; setAlarm: number; deleteAlarm: number };
 type InstrumentedInstance = VnuRefreshControlDurableObject & { __counters?: Counters };
 const zero = (): Counters => ({ get: 0, transaction: 0, put: 0, deleteState: 0, setAlarm: 0, deleteAlarm: 0 });
@@ -285,9 +290,13 @@ describe("real Durable Object persistence matrix", () => {
     expect(before.alarm).toBe(grantExpiry);
     vi.setSystemTime(grantExpiry);
     await runInDurableObject(stub, async (instance) => instance.alarm());
-    expect(await counters(stub, true)).toEqual({ get: 0, transaction: 1, put: 0, deleteState: 1, setAlarm: 0, deleteAlarm: 1 });
+    expect(await counters(stub, true)).toEqual({ get: 0, transaction: 1, put: 1, deleteState: 0, setAlarm: 1, deleteAlarm: 0 });
     const cleaned = await snapshot(stub);
     expect(cleaned.bytes).not.toContain(pair.accessTokenId);
+    expect(cleaned.alarm).toBe(NOW + VNU_MANUAL_ACTIVATION_WINDOW_MS);
+    vi.setSystemTime(NOW + VNU_MANUAL_ACTIVATION_WINDOW_MS);
+    await runInDurableObject(stub, async (instance) => instance.alarm());
+    expect(await counters(stub, true)).toEqual({ get: 0, transaction: 1, put: 0, deleteState: 1, setAlarm: 0, deleteAlarm: 1 });
     await runInDurableObject(stub, async (instance) => instance.alarm());
     expect(await counters(stub)).toEqual({ get: 0, transaction: 1, put: 0, deleteState: 0, setAlarm: 0, deleteAlarm: 0 });
   });
@@ -333,6 +342,7 @@ describe("real Durable Object persistence matrix", () => {
       accessTokenId: old.accessTokenId,
       accessExpiresAt: old.accessExpiresAt,
       grantExpiresAt: old.grantExpiresAt,
+      refreshSuccessor: NEXT,
     });
     expect(await authority.revokeLinkedPairByAccess(principal, old)).toBe("revoked");
     expect(await counters(stub, true)).toEqual({ get: 0, transaction: 1, put: 0, deleteState: 0, setAlarm: 0, deleteAlarm: 0 });
@@ -523,6 +533,57 @@ describe("entered-operation races", () => {
     expect(first).toBeDefined();
   });
 
+  it("manual replacement makes stale old linked logout byte-identical and write-free", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(NOW);
+    const principal = "13".repeat(32);
+    const stub = env.VNU_REFRESH_CONTROL.getByName(principal);
+    const auth = coordinator();
+    await auth.activatePair(principal, OLD);
+    await auth.activatePair(principal, NEXT);
+    await instrument(stub);
+    const before = await snapshot(stub);
+
+    expect(await auth.revokePrincipalByLinkedGrant(principal, OLD)).toBe("mismatch");
+    expect(await counters(stub)).toEqual({ get: 0, transaction: 1, put: 0, deleteState: 0, setAlarm: 0, deleteAlarm: 0 });
+    expect(await snapshot(stub)).toEqual(before);
+    expect(await auth.checkAccess(principal, NEXT)).toEqual({ kind: "active" });
+  });
+
+  it("manual replacement wins either concurrent ordering against old linked logout", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(NOW);
+    const principal = "14".repeat(32);
+    const stub = env.VNU_REFRESH_CONTROL.getByName(principal);
+    const auth = coordinator();
+    await auth.activatePair(principal, OLD);
+    const release = await gateTransactions(stub, 2);
+    const activation = auth.activatePair(principal, NEWER);
+    const logout = auth.revokePrincipalByLinkedGrant(principal, OLD);
+    await release();
+
+    await expect(activation).resolves.toEqual({ kind: "activated" });
+    await expect(logout).resolves.toMatch(/^(revoked|mismatch)$/);
+    await expect(auth.checkAccess(principal, NEWER)).resolves.toEqual({ kind: "active" });
+  });
+
+  it("old refresh proof cannot cross a later manual successor replacement", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(NOW);
+    const principal = "15".repeat(32);
+    const stub = env.VNU_REFRESH_CONTROL.getByName(principal);
+    const auth = coordinator();
+    await auth.activatePair(principal, OLD);
+    await auth.beginRefresh(principal, OLD);
+    await auth.completeRefresh(principal, { old: OLD, next: NEXT });
+    await auth.beginRefresh(principal, NEXT);
+    await auth.activatePair(principal, NEWER);
+    await instrument(stub);
+    const before = await snapshot(stub);
+
+    expect(await auth.revokePrincipalByLinkedGrant(principal, OLD)).toBe("mismatch");
+    expect(await counters(stub)).toEqual({ get: 0, transaction: 1, put: 0, deleteState: 0, setAlarm: 0, deleteAlarm: 0 });
+    expect(await snapshot(stub)).toEqual(before);
+    expect(await auth.checkAccess(principal, NEWER)).toEqual({ kind: "active" });
+  });
+
   it("concurrent refresh completion and logout serialize to a complete valid outcome", async () => {
     vi.useFakeTimers(); vi.setSystemTime(NOW);
     const principal = "a1".repeat(32);
@@ -568,6 +629,7 @@ describe("entered-operation races", () => {
       accessTokenId: OLD.accessTokenId,
       accessExpiresAt: OLD.accessExpiresAt,
       grantExpiresAt: OLD.grantExpiresAt,
+      refreshSuccessor: NEXT,
     });
     expect(await normal.revokePrincipalByLinkedGrant(principal, OLD)).toBe("revoked");
     expect(await normal.checkAccess(principal, NEXT)).toEqual({ kind: "revoked" });
@@ -592,6 +654,135 @@ describe("entered-operation races", () => {
     expect(state).toMatchObject({ window: { count: 5 } });
     expect(state?.lease).toBeUndefined();
     expect(await auth.beginRefresh(principal, OLD)).toMatchObject({ kind: "rate-limited", limit: 5 });
+  });
+
+  it("serializes concurrent manual activations and writes only the bounded winners", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(NOW);
+    const principal = "21".repeat(32);
+    const stub = env.VNU_REFRESH_CONTROL.getByName(principal);
+    await instrument(stub);
+    const callCount = VNU_MANUAL_ACTIVATION_LIMIT + 7;
+    const pairs = Array.from({ length: callCount }, (_, index): LinkedPair => ({
+      accessTokenId: index.toString(36).padStart(22, "a"),
+      accessExpiresAt: EXPIRY,
+      grantId: index.toString(36).padStart(22, "b"),
+      grantExpiresAt: EXPIRY,
+    }));
+    const release = await gateTransactions(stub, callCount);
+    const pending = pairs.map((pair) => coordinator().activatePair(principal, pair));
+    await release();
+    const results = await Promise.all(pending);
+
+    expect(results.filter((result) => result.kind === "activated")).toHaveLength(VNU_MANUAL_ACTIVATION_LIMIT);
+    expect(results.filter((result) => result.kind === "rate-limited")).toHaveLength(callCount - VNU_MANUAL_ACTIVATION_LIMIT);
+    expect(results.filter((result) => result.kind === "rate-limited")).toEqual(
+      Array(callCount - VNU_MANUAL_ACTIVATION_LIMIT).fill({ kind: "rate-limited", retryAfterSeconds: 900, limit: 5, windowSeconds: 900 }),
+    );
+    expect(await counters(stub)).toEqual({
+      get: 0,
+      transaction: callCount,
+      put: VNU_MANUAL_ACTIVATION_LIMIT,
+      deleteState: 0,
+      setAlarm: VNU_MANUAL_ACTIVATION_LIMIT,
+      deleteAlarm: 0,
+    });
+    const state = await runInDurableObject(stub, async (_instance, context) => context.storage.get<VnuRefreshControlState>(VNU_REFRESH_STATE_KEY));
+    expect(state?.activationWindow).toEqual({ count: VNU_MANUAL_ACTIVATION_LIMIT, resetAt: NOW + VNU_MANUAL_ACTIVATION_WINDOW_MS });
+    expect(Object.keys(state?.revokedGrants ?? {})).toHaveLength(VNU_MANUAL_ACTIVATION_LIMIT - 1);
+  });
+});
+
+describe("combined activation and refresh retention bound", () => {
+  it("retains the exact aggregate maximum below the conservative value-size ceiling and then quiesces", async () => {
+    vi.useFakeTimers();
+    const principal = "22".repeat(32);
+    const stub = env.VNU_REFRESH_CONTROL.getByName(principal);
+    const authority = coordinator();
+    const fullRetentionWindowCount = RETENTION_MS / VNU_MANUAL_ACTIVATION_WINDOW_MS;
+    const retainedManualGenerationBound = fullRetentionWindowCount * VNU_MANUAL_ACTIVATION_LIMIT + VNU_MANUAL_ACTIVATION_LIMIT - 1;
+    const retainedRefreshGenerationBound = ((RETENTION_MS / VNU_REFRESH_WINDOW_MS) + 1) * VNU_REFRESH_ATTEMPT_LIMIT;
+    const retainedGenerationBound = retainedManualGenerationBound + retainedRefreshGenerationBound;
+    const conservativeSerializedStateCeiling = 96 * 1024;
+    const observationTime = NOW + RETENTION_MS + 14 * 60 * 1000;
+    const retentionBoundary = observationTime - RETENTION_MS;
+    const firstWindowReset = NOW + VNU_MANUAL_ACTIVATION_WINDOW_MS;
+    const lastFullBoundary = observationTime - 14 * 60 * 1000;
+    let sequence = 0;
+    const pair = (now: number, grantExpiresAt = now + RETENTION_MS): LinkedPair => {
+      const id = sequence.toString(36);
+      sequence += 1;
+      return {
+        accessTokenId: id.padStart(22, "a"),
+        accessExpiresAt: now + RETENTION_MS,
+        grantId: id.padStart(22, "b"),
+        grantExpiresAt,
+      };
+    };
+    const consumeManualBudget = async (now: number, count = VNU_MANUAL_ACTIVATION_LIMIT) => {
+      vi.setSystemTime(now);
+      for (let activation = 0; activation < count; activation += 1) {
+        await expect(authority.activatePair(principal, pair(now))).resolves.toEqual({ kind: "activated" });
+      }
+    };
+    const consumeRefreshBudget = async (now: number) => {
+      vi.setSystemTime(now);
+      for (let refresh = 0; refresh < VNU_REFRESH_ATTEMPT_LIMIT; refresh += 1) {
+        const active = await runInDurableObject(stub, async (_instance, context) => (await context.storage.get<VnuRefreshControlState>(VNU_REFRESH_STATE_KEY))!.active!);
+        await expect(authority.beginRefresh(principal, active)).resolves.toMatchObject({ kind: "accepted" });
+        await expect(authority.completeRefresh(principal, { old: active, next: pair(now, active.grantExpiresAt) })).resolves.toBe("completed");
+      }
+    };
+
+    await consumeManualBudget(NOW, 1);
+    await consumeManualBudget(retentionBoundary + 1, VNU_MANUAL_ACTIVATION_LIMIT - 1);
+    await consumeRefreshBudget(retentionBoundary + 1);
+    for (let boundary = firstWindowReset; boundary <= lastFullBoundary; boundary += VNU_MANUAL_ACTIVATION_WINDOW_MS) {
+      await consumeManualBudget(boundary);
+      await consumeRefreshBudget(boundary);
+    }
+    vi.setSystemTime(observationTime);
+
+    const bounded = await runInDurableObject(stub, async (_instance, context) => ({
+      state: await context.storage.get<VnuRefreshControlState>(VNU_REFRESH_STATE_KEY),
+      alarm: await context.storage.getAlarm(),
+    }));
+    const serializedByteLength = new TextEncoder().encode(JSON.stringify(bounded.state)).byteLength;
+    expect(retainedManualGenerationBound).toBe(164);
+    expect(retainedRefreshGenerationBound).toBe(165);
+    expect(Object.keys(bounded.state?.revokedAccess ?? {})).toHaveLength(retainedGenerationBound - 1);
+    expect(Object.keys(bounded.state?.revokedGrants ?? {})).toHaveLength(retainedGenerationBound - 1);
+    expect(serializedByteLength).toBe(82_447);
+    expect(serializedByteLength).toBeLessThanOrEqual(conservativeSerializedStateCeiling);
+    expect(bounded.state?.activationWindow).toEqual({ count: VNU_MANUAL_ACTIVATION_LIMIT, resetAt: lastFullBoundary + VNU_MANUAL_ACTIVATION_WINDOW_MS });
+    expect(bounded.state?.window).toEqual({ count: VNU_REFRESH_ATTEMPT_LIMIT, resetAt: lastFullBoundary + VNU_REFRESH_WINDOW_MS });
+    expect(bounded.alarm).toBe(observationTime + 1);
+
+    vi.setSystemTime(observationTime + 1);
+    await runInDurableObject(stub, async (instance) => instance.alarm());
+    const afterExtendedAccessCleanup = await runInDurableObject(stub, async (_instance, context) => ({
+      state: await context.storage.get<VnuRefreshControlState>(VNU_REFRESH_STATE_KEY),
+      alarm: await context.storage.getAlarm(),
+    }));
+    expect(Object.keys(afterExtendedAccessCleanup.state?.revokedAccess ?? {})).toHaveLength(retainedGenerationBound - 1 - (VNU_MANUAL_ACTIVATION_LIMIT - 1) - VNU_REFRESH_ATTEMPT_LIMIT);
+    expect(Object.keys(afterExtendedAccessCleanup.state?.revokedGrants ?? {})).toHaveLength(retainedGenerationBound - 1 - (VNU_MANUAL_ACTIVATION_LIMIT - 1) - VNU_REFRESH_ATTEMPT_LIMIT);
+    expect(afterExtendedAccessCleanup.alarm).toBe(observationTime + 60_000);
+
+    vi.setSystemTime(observationTime + 60_000);
+    await runInDurableObject(stub, async (instance) => instance.alarm());
+    const afterWindowCleanup = await runInDurableObject(stub, async (_instance, context) => ({
+      state: await context.storage.get<VnuRefreshControlState>(VNU_REFRESH_STATE_KEY),
+      alarm: await context.storage.getAlarm(),
+    }));
+    expect(afterWindowCleanup.state?.activationWindow).toBeUndefined();
+    expect(afterWindowCleanup.state?.window.count).toBe(0);
+    expect(afterWindowCleanup.alarm).toBe(observationTime + 16 * 60_000);
+
+    vi.setSystemTime(lastFullBoundary + RETENTION_MS);
+    await runInDurableObject(stub, async (instance) => instance.alarm());
+    expect(await runInDurableObject(stub, async (_instance, context) => ({
+      state: await context.storage.get(VNU_REFRESH_STATE_KEY),
+      alarm: await context.storage.getAlarm(),
+    }))).toEqual({ state: undefined, alarm: null });
   });
 });
 
