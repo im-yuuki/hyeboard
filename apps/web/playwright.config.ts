@@ -1,37 +1,42 @@
 import { defineConfig, devices } from "@playwright/test";
-
-function env(key: string, fallback: string): string {
-  return process.env[key] ?? fallback;
-}
-
-const PW_VITE_HOST = env("PW_VITE_HOST", "127.0.0.1");
-const PW_VITE_PORT = env("PW_VITE_PORT", "5173");
-const PW_WORKER_PORT = env("PW_WORKER_PORT", "8787");
+import { playwrightRuntimeConfig as runtime } from "./src/lib/playwright-runtime-config.mjs";
 
 export default defineConfig({
   testDir: "./tests",
+  outputDir: "./test-results/playwright",
+  testMatch: /.*\.spec\.ts/,
+  testIgnore: /smoke\.spec\.ts/,
+  fullyParallel: true,
+  workers: runtime.workers,
+  retries: 0,
+  reporter: process.env.PLAYWRIGHT_JSON_OUTPUT_FILE ? [["json"]] : [["line"]],
   timeout: 30_000,
   expect: { timeout: 10_000 },
   use: {
-    baseURL: `http://${PW_VITE_HOST}:${PW_VITE_PORT}`,
+    baseURL: runtime.baseUrl,
     trace: "retain-on-failure",
   },
   webServer: [
     {
-      command: `pnpm --filter @hyeboard/worker dev --port ${PW_WORKER_PORT}`,
-      url: `http://127.0.0.1:${PW_WORKER_PORT}/api/health`,
-      reuseExistingServer: true,
+      command: `pnpm --filter @hyeboard/worker dev --port ${runtime.workerPort}`,
+      url: `${runtime.proxyTarget}/api/health`,
+      reuseExistingServer: false,
       timeout: 60_000,
+      env: {
+        ...process.env,
+        HYEB_SESSION_SECRET: process.env.HYEB_SESSION_SECRET ?? "synthetic-playwright-session-secret-32-bytes",
+      },
     },
     {
-      command: `pnpm --filter @hyeboard/web dev --host ${PW_VITE_HOST} --strictPort --port ${PW_VITE_PORT}`,
-      url: `http://${PW_VITE_HOST}:${PW_VITE_PORT}`,
-      reuseExistingServer: true,
+      command: `pnpm --filter @hyeboard/web dev --host ${runtime.host} --strictPort --port ${runtime.vitePort}`,
+      url: runtime.baseUrl,
+      reuseExistingServer: false,
+      env: { ...process.env, VITE_PROXY_TARGET: runtime.proxyTarget },
       timeout: 60_000,
     },
   ],
   projects: [
-    { name: "chromium", use: { ...devices["Desktop Chrome"] } },
-    { name: "mobile-safari", use: { ...devices["iPhone 13"] } },
+    { name: "chromium", grepInvert: /@webkit/, use: { ...devices["Desktop Chrome"] } },
+    { name: "webkit", grep: /@webkit/, use: { ...devices["iPhone 13"] } },
   ],
 });

@@ -76,6 +76,7 @@ describe("CaptchaRelayDurableObject", () => {
     const stub = relay("timed-out");
     await stub.prepare(Date.now() + 60_000);
     const waiting = stub.wait();
+    await expect(storedRows(stub)).resolves.toBe(1);
 
     await expect(runDurableObjectAlarm(stub)).resolves.toBe(true);
     await expect(waiting).resolves.toEqual({ kind: "timeout" });

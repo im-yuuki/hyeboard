@@ -3,17 +3,11 @@ import { createContext, useContext, useEffect, useRef, useState, type ReactNode 
 import { ACCOUNT_SWITCHED_EVENT, api, clearSessionToken, getActiveAccount, getActiveAccountId, getSessionToken, listAccounts, revokeAndRemoveAccount, shouldInvalidateVnuRefreshQuery, type StoredAccount, switchAccount, VNU_REFRESH_COMMITTED_EVENT, VNU_REFRESH_STATUS_EVENT } from "@/lib/api";
 import { useLocale } from "@/lib/i18n";
 import { UET_REAUTH_CREDENTIAL_KEYS } from "@/lib/reauth";
+import { operationMayClearOwner, operationOwnsFailure, operationOwnsPendingEntry, type AccountActionOperation, type AccountActionSource } from "@/lib/account-action-state";
 
 export type Palette = "geist" | "uet" | "vnu";
 export type Mode = "light" | "dark";
-export type AccountActionSource = "account-menu" | "settings";
-
-type AccountActionOperation = {
-  generation: symbol;
-  accountId: string;
-  accountToken: string;
-  source: AccountActionSource;
-};
+export type { AccountActionSource } from "@/lib/account-action-state";
 
 export type HyeboardState = ReturnType<typeof useHyeboardState>;
 const HyeboardContext = createContext<HyeboardState | null>(null);
@@ -226,11 +220,14 @@ function useHyeboardState() {
       setActiveAccountId(getActiveAccountId());
     } catch (error) {
       const account = listAccounts().find((candidate) => candidate.id === accountId);
-      const operationStillOwnsError = currentAccountActionRef.current?.generation === operation.generation
-        && pendingAccountActionsRef.current.get(accountId) === operation.generation
-        && account?.token === operation.accountToken
-        && (source !== "settings" || getActiveAccountId() === accountId);
-      if (operationStillOwnsError) {
+      const operationStillOwnsError = operationOwnsFailure({
+        operation,
+        currentOperation: currentAccountActionRef.current,
+        pendingGeneration: pendingAccountActionsRef.current.get(accountId),
+        currentAccountToken: account?.token,
+        activeAccountId: getActiveAccountId(),
+      });
+      if (operationStillOwnsError && account) {
         publishedError = true;
         setAccountActionError(account.universityId === "vnu" ? t.common.vnuRevocationFailed : error instanceof Error ? error.message : t.common.vnuRevocationFailed);
         setAccountActionErrorAccountId(accountId);
@@ -238,7 +235,7 @@ function useHyeboardState() {
       }
       throw error;
     } finally {
-      if (pendingAccountActionsRef.current.get(accountId) === operation.generation) {
+      if (operationOwnsPendingEntry(operation, pendingAccountActionsRef.current.get(accountId))) {
         pendingAccountActionsRef.current.delete(accountId);
         setRemovingAccountIds((ids) => {
           const next = new Set(ids);
@@ -246,7 +243,7 @@ function useHyeboardState() {
           return next;
         });
       }
-      if (!publishedError && currentAccountActionRef.current?.generation === operation.generation) {
+      if (operationMayClearOwner(operation, currentAccountActionRef.current, publishedError)) {
         currentAccountActionRef.current = undefined;
         accountActionErrorSourceRef.current = undefined;
         setAccountActionErrorSource(undefined);

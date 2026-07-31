@@ -8,63 +8,13 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Skeleton } from "@/components/ui/skeleton";
 import { Empty, FeatureFrame, SummaryStat, SummaryStrip } from "@/components/shared";
 import { api } from "@/lib/api";
-import { createGradesExport, type ExportDerivedTerm } from "@/lib/data-export";
+import { createGradesExport } from "@/lib/data-export";
+import { ALL_GRADE_TERMS, createGradeExportTerm, decodeGradeTermKey, encodeGradeTermKey, isSummerGrade, selectVisibleGradeSummaries, sortGrades, type GradeSortKey, type GradeSortState } from "@/lib/grade-view-model";
 import { useLocale } from "@/lib/i18n";
 import { formatTermLabel, letterForGrade, letterTone } from "@/lib/presentation";
-import { calculateTermAcademicSummaries, newestAcademicTermsFirst, type AcademicTermSummary } from "@/lib/term-academic-summary";
+import { calculateTermAcademicSummaries, newestAcademicTermsFirst } from "@/lib/term-academic-summary";
 import { cn } from "@/lib/utils";
 import { useFeatureQuery, useHyeboard } from "@/state";
-
-const MISSING_TERM_KEY = "~hyeboard:missing";
-const ALL_TERMS = "~hyeboard:all";
-const ESCAPED_TERM_PREFIX = "~hyeboard:known:";
-
-function encodeGradeTermKey(termCode: string | undefined): string {
-  const trimmedTermCode = termCode?.trim();
-  if (!trimmedTermCode) return MISSING_TERM_KEY;
-
-  const rawTermCode = termCode!;
-  if (rawTermCode !== trimmedTermCode || rawTermCode === MISSING_TERM_KEY || rawTermCode === ALL_TERMS || rawTermCode.startsWith(ESCAPED_TERM_PREFIX)) {
-    return `${ESCAPED_TERM_PREFIX}${encodeURIComponent(rawTermCode)}`;
-  }
-  return rawTermCode;
-}
-
-function decodeGradeTermKey(termKey: string): string | undefined {
-  if (termKey === MISSING_TERM_KEY) return undefined;
-  if (termKey.startsWith(ESCAPED_TERM_PREFIX)) return decodeURIComponent(termKey.slice(ESCAPED_TERM_PREFIX.length));
-  return termKey;
-}
-
-function usesUetTermRules(universityId: string) {
-  return universityId === "uet" || universityId === "mock";
-}
-
-function isSummerGrade(grade: Grade, universityId: string) {
-  return usesUetTermRules(universityId) && Boolean(grade.termCode?.endsWith("3"));
-}
-
-type GradeSortKey = "name" | "credits" | "point10" | "point4";
-type GradeSortState = { key: GradeSortKey; direction: "asc" | "desc" };
-
-function sortGradeValue(grade: Grade, key: GradeSortKey): string | number {
-  if (key === "name") return grade.courseName;
-  if (key === "credits") return grade.credits ?? -1;
-  if (key === "point10") return grade.point10 ?? -1;
-  return grade.point4 ?? -1;
-}
-
-function sortGrades(grades: Grade[], sort: GradeSortState) {
-  return [...grades].sort((a, b) => {
-    const left = sortGradeValue(a, sort.key);
-    const right = sortGradeValue(b, sort.key);
-    const base = typeof left === "number" && typeof right === "number"
-      ? left - right
-      : String(left).localeCompare(String(right));
-    const ordered = sort.direction === "asc" ? base : -base;
-    return ordered || a.courseName.localeCompare(b.courseName);
-  });
-}
 
 function CompactAcademicMetric({ label, value }: { label: string; value: string }) {
   return (
@@ -73,32 +23,6 @@ function CompactAcademicMetric({ label, value }: { label: string; value: string 
       <span className="font-semibold tabular-nums">{value}</span>
     </span>
   );
-}
-
-export function gradeExportTerm(
-  summary: AcademicTermSummary<Grade>,
-  universityId: string,
-  label: string,
-  sortedCourses: Grade[],
-): ExportDerivedTerm {
-  const rawTermCode = decodeGradeTermKey(summary.termKey);
-  return {
-    termCode: rawTermCode ?? "unknown",
-    termLabel: label,
-    estimateKind: "derived",
-    listedCredits: summary.listedCredits,
-    includedCredits: summary.includedCredits,
-    termGpa4: summary.termGpa4,
-    derivedCpa4: summary.cpa4,
-    courses: sortedCourses.map((grade) => ({
-      courseCode: grade.courseCode,
-      courseName: grade.courseName,
-      credits: grade.credits,
-      point10: grade.point10 ?? undefined,
-      letter: letterForGrade(grade, universityId),
-      point4: grade.point4 ?? undefined,
-    })),
-  };
 }
 
 function SummerBadge() {
@@ -296,17 +220,12 @@ export function GradesPage() {
   const termLabel = (rawTermCode: string | undefined) => rawTermCode
     ? formatTermLabel(rawTermCode, state.universityId, t.terms)
     : t.grades.unknownTerm;
-  const newestTerm = summaries[0]?.termKey;
-  const selectedSummaryExists = summaries.some((summary) => summary.termKey === selectedTerm);
-  const effectiveTerm = selectedTerm === ALL_TERMS || selectedSummaryExists ? selectedTerm : newestTerm;
-  const visibleSummaries = effectiveTerm === ALL_TERMS
-    ? summaries
-    : summaries.filter((summary) => summary.termKey === effectiveTerm);
+  const { effectiveTerm, visibleSummaries } = selectVisibleGradeSummaries(summaries, selectedTerm);
   const visibleTermViews = visibleSummaries.map((summary) => {
     const rawTermCode = decodeGradeTermKey(summary.termKey);
     const label = termLabel(rawTermCode);
     const sortedCourses = sortGrades(summary.courses, sort);
-    const exportTerm = gradeExportTerm(summary, state.universityId, label, sortedCourses);
+    const exportTerm = createGradeExportTerm(summary, state.universityId, label, sortedCourses);
     return { summary, rawTermCode, label, sortedCourses, exportTerm };
   });
   const exportIdentity = state.dashboard.data?.student ? {
@@ -348,7 +267,7 @@ export function GradesPage() {
                   <SelectValue placeholder={t.exams.term} />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value={ALL_TERMS}>{t.grades.allTerms}</SelectItem>
+                  <SelectItem value={ALL_GRADE_TERMS}>{t.grades.allTerms}</SelectItem>
                   {summaries.map((summary) => (
                     <SelectItem key={summary.termKey} value={summary.termKey}>{termLabel(decodeGradeTermKey(summary.termKey))}</SelectItem>
                   ))}

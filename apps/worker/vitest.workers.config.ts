@@ -27,5 +27,6 @@ export default defineConfig({
   ],
   test: {
     include: ["test/**/*.workers.ts"],
+    maxWorkers: process.env.HYEB_COMBINED_GATE === "1" ? 1 : undefined,
   },
 });

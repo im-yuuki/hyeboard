@@ -65,6 +65,7 @@ function parseRfc4180Csv(input: string): { rows: string[][]; recordSeparators: s
   let row: string[] = [];
   let field = "";
   let quoted = false;
+  let quoteClosed = false;
   let index = 1;
 
   while (index < input.length) {
@@ -77,12 +78,16 @@ function parseRfc4180Csv(input: string): { rows: string[][]; recordSeparators: s
       }
       if (character === '"') {
         quoted = false;
+        quoteClosed = true;
         index += 1;
         continue;
       }
       field += character;
       index += 1;
       continue;
+    }
+    if (quoteClosed && character !== "," && character !== "\r") {
+      throw new Error("Unexpected character after closing CSV quote");
     }
     if (character === '"') {
       expect(field).toBe("");
@@ -93,6 +98,7 @@ function parseRfc4180Csv(input: string): { rows: string[][]; recordSeparators: s
     if (character === ",") {
       row.push(field);
       field = "";
+      quoteClosed = false;
       index += 1;
       continue;
     }
@@ -103,6 +109,7 @@ function parseRfc4180Csv(input: string): { rows: string[][]; recordSeparators: s
       recordSeparators.push("\r\n");
       row = [];
       field = "";
+      quoteClosed = false;
       index += 2;
       continue;
     }
@@ -115,6 +122,23 @@ function parseRfc4180Csv(input: string): { rows: string[][]; recordSeparators: s
   expect(row).toEqual([]);
   expect(field).toBe("");
   return { rows, recordSeparators };
+}
+
+type CsvContractRecord = Record<string, string>;
+
+function assertExactCsvRecords(actual: readonly CsvContractRecord[], expected: readonly CsvContractRecord[]): void {
+  if (actual.length !== expected.length) {
+    throw new Error(`CSV record count mismatch: expected ${expected.length}, received ${actual.length}`);
+  }
+  expected.forEach((expectedRecord, index) => {
+    const actualRecord = actual[index];
+    if (!actualRecord) throw new Error(`CSV record ${index} is missing`);
+    for (const [field, expectedValue] of Object.entries(expectedRecord)) {
+      if (actualRecord[field] !== expectedValue) {
+        throw new Error(`CSV record ${index} field ${field} mismatch`);
+      }
+    }
+  });
 }
 
 describe("export models", () => {
@@ -304,6 +328,30 @@ describe("export models", () => {
 });
 
 describe("CSV", () => {
+  it("rejects characters after a closing quote", () => {
+    expect(() => parseRfc4180Csv('\ufeff"value"junk\r\n')).toThrow("Unexpected character after closing CSV quote");
+  });
+
+  it("preserves quoted controls and doubled quotes", () => {
+    expect(parseRfc4180Csv('\ufeff"LF\nCR\rCRLF\r\nQuote ""ok""",tail\r\n"EOF"\r\n').rows)
+      .toEqual([["LF\nCR\rCRLF\r\nQuote \"ok\"", "tail"], ["EOF"]]);
+  });
+
+  it("detects injected records against the exact export model", () => {
+    const expected = [{ record_type: "query" }, { record_type: "result" }];
+    const injected = [{ record_type: "query" }, { record_type: "injected" }, { record_type: "result" }];
+    expect(() => assertExactCsvRecords(injected, expected)).toThrow("CSV record count mismatch");
+  });
+
+  it("detects reordered bulk item groups", () => {
+    const expected = [
+      { item_index: "1", target: `'${SYNTHETIC_INTERNAL_ID}` },
+      { item_index: "2", target: `'${SYNTHETIC_NEIGHBOR_INTERNAL_ID}` },
+    ];
+    const reordered = [expected[1]!, expected[0]!];
+    expect(() => assertExactCsvRecords(reordered, expected)).toThrow("CSV record 0 field item_index mismatch");
+  });
+
   it("uses fixed headers, deterministic order, Unicode, formula defense, and numeric values", () => {
     const model = createTranscriptExport({
       universityId: "vnu",
