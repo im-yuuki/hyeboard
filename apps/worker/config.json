@@ -8,8 +8,8 @@
     "idle_eviction_minutes": 20160
   },
   "vnu": {
-    "code_lookup_concurrency": 16,
-    "cross_lookup_bulk_max_targets": 50
+    "code_lookup_concurrency": 64,
+    "cross_lookup_bulk_max_targets": 500
   },
   "log_level": "info",
   "host": "127.0.0.1",

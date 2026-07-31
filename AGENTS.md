@@ -4,7 +4,7 @@ Multi-university student dashboard. UET (VNU-UET) first, StudentHub + Canvas ada
 
 ## Stack
 
-- `apps/web`: React 19, Vite, TanStack Router (code-based routes, no file-based codegen), TanStack Query, Tailwind CSS v4, shadcn-style local UI primitives (`apps/web/src/components/ui/*`, not the shadcn CLI).
+- `apps/web`: React 19, Vite, TanStack Router (code-based routes, no file-based codegen), TanStack Query, Tailwind CSS v4, shadcn-style local UI primitives (`apps/web/src/components/ui/*`, not the shadcn CLI). `apps/web/src/routes/` is an empty placeholder — the entire app (root layout, all feature pages, all shared components) lives in the single `apps/web/src/main.tsx` file. Keep this in mind when searching for a component/page; it's not spread across files.
 - `apps/worker`: Elysia on Cloudflare Workers (via `wrangler`), thin BFF/proxy serving the React app as static assets and API under `/api/*`. Single deployment target.
 - `packages/schemas`: zod schemas + inferred TS types, shared by web/api/adapters.
 - `packages/core`: Worker-safe helpers — `ok`/`fail` envelopes, `HyeboardError`, AES-GCM encrypted session token helpers (`encryptSession`/`decryptSession`), `assertSupported`.
@@ -28,6 +28,8 @@ pnpm --filter @hyeboard/worker exec wrangler deploy --dry-run   # verify without
 ```
 
 `apps/worker`'s `dev` script must keep the `--show-interactive-dev-session=false --log-level info` flags — wrangler's default interactive session redraws the terminal and hides log output when run under `pnpm --parallel`.
+
+**`pnpm deploy` does NOT rebuild the frontend.** It only runs `wrangler deploy`, which uploads whatever is already in `apps/web/dist`. Always run `pnpm build:web` immediately before `pnpm deploy` when frontend source changed — otherwise wrangler reports "No updated asset files to upload" and silently ships a stale build. This has caused a real production incident (i18n launch initially deployed with no visible language changes because `dist` was stale).
 
 There is no separate lint tool wired up; `lint`/`typecheck`/`test` all alias to `tsc -p tsconfig.json --noEmit` per package. Treat a clean `pnpm build` + `pnpm test` + Playwright pass as the bar for "done," not just a green typecheck.
 
@@ -71,6 +73,16 @@ Raw `.har` files may be present in the repo root during investigation (currently
 - E2e coverage lives in `apps/web/tests/smoke.spec.ts` (Playwright). It exercises: login-gate redirect, login school-picker sections, account menu, demo login, dark/light toggle, sidebar collapse, mobile nav drawer, header search, notifications, grades term-grouping, and that every feature route renders real UI (no raw JSON dumps, no leftover `<pre>`).
 - Config: `apps/web/playwright.config.ts` starts both `wrangler dev` and `vite dev` as `webServer`s with `reuseExistingServer: true` — if a test run behaves like it's using stale code, check for orphaned processes on ports 5173/8787 first (`Get-NetTCPConnection -LocalPort 5173,8787 | Stop-Process -Force`) before assuming a real bug.
 - When adding a feature that changes visible DOM structure (icons, labels, aria-labels), update the smoke spec in the same change — several past regressions were only caught by real bounding-box/CSS assertions, not just "element exists" checks.
+
+## Internationalization (i18n)
+
+- `apps/web/src/lib/i18n.tsx` is the single source of truth: `type Locale = "en" | "vi"`, `LOCALES` array (`{id, label}`), `LocaleProvider` (persists to `localStorage` key `hyeboard.locale`, auto-detects from `navigator.language` on first visit, sets `document.documentElement.lang`), and `useLocale()` returning `{ locale, setLocale, t }`.
+- `t` is a typed nested object tree (`t.nav.dashboard`, `t.dashboard.welcomeBack(name)`), not a string-key lookup function — never write `t("nav.dashboard")`. Some leaf values are functions for interpolation; call them directly, don't wrap in another `t()`.
+- Every new user-facing string in `main.tsx` must go through `t.*`, added to both the `en` dict and the `vi()` dict in `i18n.tsx` (TS enforces `vi()` returns `typeof en`, so a missing key is a compile error). No hardcoded English string literals in JSX.
+- Data-driven enum values from the backend (assignment `status`, exam `examMethod`, etc.) are intentionally left untranslated — only app-authored copy goes through `t.*`.
+- Language switcher UI: `SettingsPage` has a `Select` row in the "Display" card; `LoginPage` has a bottom-right fixed toggle button (flag icon + label, flips directly between `en`/`vi` since only two locales exist — not a dropdown there).
+- Flag icons use inline SVG (`FlagIcon` component near the top of `main.tsx`), not emoji — Windows Chrome's font stack lacks flag emoji glyphs and falls back to literal "GB"/"VN" text, which also breaks baseline alignment with adjacent labels. Keep using `FlagIcon` for any future locale flag, don't reintroduce emoji.
+- `apps/web/src/lib/utils.ts`'s `formatDateTime` is still hardcoded to `Intl.DateTimeFormat("en", ...)` regardless of app locale — known gap, not yet wired to `useLocale()`. `formatCurrency` is intentionally hardcoded `vi-VN`/VND (it's the actual currency, not a UI-language choice) — don't "fix" that one.
 
 ## UI/design conventions
 

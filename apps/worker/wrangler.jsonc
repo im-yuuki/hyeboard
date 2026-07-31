@@ -11,9 +11,8 @@
   "vars": {
     "HYEB_ALLOWED_ORIGINS": "",
     "HYEB_BROWSER_WS_ENDPOINT": "",
-    "HYEB_LOG_LEVEL": "info",
-    "VNU_CODE_LOOKUP_CONCURRENCY": "16",
-    "VNU_CROSS_LOOKUP_BULK_MAX_TARGETS": "50"
+    "HYEB_LOG_LEVEL": "trace",
+    "VNU_FAR_WALK_ENABLED": "true"
   },
   "assets": {
     "directory": "../web/dist",
