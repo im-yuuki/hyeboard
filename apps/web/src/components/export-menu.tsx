@@ -2,7 +2,7 @@ import { ChevronDown, Download } from "lucide-react";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
-import { downloadExport, type ExportDocument, type ExportFormat } from "@/lib/data-export";
+import { downloadExport, printExport, type ExportDocument, type ExportFormat } from "@/lib/data-export";
 import { useLocale } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
@@ -15,14 +15,22 @@ export function nextExportAttemptState(state: ExportAttemptState, outcome: "succ
 
 export function ExportMenu({ model, className }: { model: ExportDocument; className?: string }) {
   const { t } = useLocale();
-  const [attemptState, setAttemptState] = useState<ExportAttemptState>({ failed: false, attempt: 0 });
+  const [attemptState, setAttemptState] = useState<{ kind?: "download" | "print"; attempt: number }>({ attempt: 0 });
 
   const chooseFormat = (format: ExportFormat) => {
     try {
       downloadExport(model, format);
-      setAttemptState((state) => nextExportAttemptState(state, "success"));
+      setAttemptState((state) => ({ attempt: state.attempt }));
     } catch {
-      setAttemptState((state) => nextExportAttemptState(state, "failure"));
+      setAttemptState((state) => ({ kind: "download", attempt: state.attempt + 1 }));
+    }
+  };
+  const choosePrint = () => {
+    try {
+      printExport(model, document.documentElement.lang || "en", t.exports.printLabels);
+      setAttemptState((state) => ({ attempt: state.attempt }));
+    } catch {
+      setAttemptState((state) => ({ kind: "print", attempt: state.attempt + 1 }));
     }
   };
 
@@ -39,11 +47,12 @@ export function ExportMenu({ model, className }: { model: ExportDocument; classN
         <DropdownMenuContent align="end" className="min-w-44">
           <DropdownMenuItem className="min-h-11" onSelect={() => chooseFormat("json")}>{t.exports.json}</DropdownMenuItem>
           <DropdownMenuItem className="min-h-11" onSelect={() => chooseFormat("csv")}>{t.exports.csv}</DropdownMenuItem>
+          <DropdownMenuItem className="min-h-11" onSelect={choosePrint}>{t.exports.print}</DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
-      {attemptState.failed ? (
+      {attemptState.kind ? (
         <p key={attemptState.attempt} className="mt-1 max-w-72 text-xs text-destructive" role="status" aria-live="polite">
-          {t.exports.failed}
+          {attemptState.kind === "print" ? t.exports.printFailed : t.exports.failed}
         </p>
       ) : null}
     </div>

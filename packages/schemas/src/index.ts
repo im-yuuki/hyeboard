@@ -119,6 +119,8 @@ export const gradeSchema = z.object({
   point4: z.number().nullable().optional(),
   point10: z.number().nullable().optional(),
   letter: z.string().optional(),
+  classId: z.string().optional(),
+  termOrdinal: z.string().optional(),
 });
 
 export const gpaSummarySchema = z.object({

@@ -24,6 +24,8 @@ export function mapGradeRow(row: VnuGradesResult["rows"][number], index: number)
     point4: row.point4 ?? null,
     point10: row.point10 ?? null,
     letter: row.letter,
+    classId: row.classId,
+    termOrdinal: row.termOrdinal,
   };
 }
 

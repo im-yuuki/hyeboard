@@ -988,7 +988,7 @@ async function vnuRawHtml(session: EncryptedSessionPayload, page: string, params
   // branches below derive both ids from the session's own profile. Strip them
   // before cache keying too, so a smuggled value cannot even fragment this
   // session's cache entries.
-  const { selStd: _ignoredSelStd, selUniv: _ignoredSelUniv, ...trustedParams } = params;
+  const { selStd: _ignoredSelStd, selUniv: _ignoredSelUniv, val: _ignoredVal, ...trustedParams } = params;
   const cacheKey = await vnuRawCacheKey(session, page, trustedParams);
   const cached = await cacheGet<{ html: string }>(cacheKey);
   if (cached) {
@@ -1029,7 +1029,7 @@ async function vnuRawHtml(session: EncryptedSessionPayload, page: string, params
     // path, keyed per session cookie.
     const ownProfile = parseProfileHtml(await vnuRawHtml(session, "profile", {}));
     if (!VNU_PORTAL_STD_ID_PATTERN.test(ownProfile.internalStudentId ?? "")) throw incompleteVnuProfile();
-    html = await client.getPointDetailHtml({ id: trustedParams.id, stdId: ownProfile.internalStudentId!, term: trustedParams.Term, val: trustedParams.val });
+    html = await client.getPointDetailHtml({ id: trustedParams.id, stdId: ownProfile.internalStudentId!, term: trustedParams.Term });
   } else {
     throw new HyeboardError("VNU_RAW_PAGE_UNKNOWN", `Unknown VNU raw page: ${page}`, 404);
   }

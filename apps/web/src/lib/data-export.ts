@@ -51,6 +51,37 @@ export type ExportDocument = {
   results?: Array<ExportResult | ExportBulkItem>;
 };
 
+export type PrintableExportLabels = {
+  title: string;
+  surface: string;
+  university: string;
+  query: string;
+  run: string;
+  identity: string;
+  reported: string;
+  terms: string;
+  results: string;
+  target: string;
+  error: string;
+  course: string;
+  credits: string;
+  score: string;
+  gpa: string;
+  cpa: string;
+  studentCode: string;
+  name: string;
+  managingClass: string;
+  classCode: string;
+  classId: string;
+  internalStudentId: string;
+  probes: string;
+  accumulatedCredits: string;
+  mode: string;
+  value: string;
+  status: string;
+  processed: string;
+};
+
 type IdentityInput = ExportIdentity & Record<string, unknown>;
 
 function copyIdentity(input: ExportIdentity | IdentityInput | undefined): ExportIdentity | undefined {
@@ -191,6 +222,58 @@ export function sanitizeExportDocument(model: ExportDocument): ExportDocument {
     derivedTerms: model.derivedTerms?.map(copyDerivedTerm),
     results: copyDocumentResults(model.surface, model.results),
   };
+}
+
+function escapePrintableHtml(value: string | number | undefined): string {
+  if (value === undefined) return "";
+  return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+function printableDefinitionList(value: Record<string, string | number | undefined>): string {
+  const entries = Object.entries(value).filter(([, field]) => field !== undefined);
+  if (!entries.length) return "";
+  return `<dl>${entries.map(([label, field]) => `<dt>${escapePrintableHtml(label)}</dt><dd>${escapePrintableHtml(field)}</dd>`).join("")}</dl>`;
+}
+
+function printableTerms(terms: readonly ExportDerivedTerm[], labels: PrintableExportLabels): string {
+  if (!terms.length) return "";
+  return `<section><h2>${escapePrintableHtml(labels.terms)}</h2>${terms.map((term) => `<article><h3>${escapePrintableHtml(term.termLabel)}</h3>${printableDefinitionList({ [labels.credits]: `${term.includedCredits} / ${term.listedCredits}`, [labels.gpa]: term.termGpa4, [labels.cpa]: term.derivedCpa4 })}<table><thead><tr><th>${escapePrintableHtml(labels.course)}</th><th>${escapePrintableHtml(labels.credits)}</th><th>${escapePrintableHtml(labels.score)}</th></tr></thead><tbody>${term.courses.map((course) => `<tr><td>${escapePrintableHtml(`${course.courseCode} — ${course.courseName}`)}</td><td>${escapePrintableHtml(course.credits)}</td><td>${escapePrintableHtml(course.point10 ?? course.point4 ?? course.letter)}</td></tr>`).join("")}</tbody></table></article>`).join("")}</section>`;
+}
+
+function printableResult(result: ExportResult, labels: PrintableExportLabels): string {
+  return [
+    result.identity && printableDefinitionList({ [labels.name]: result.identity.studentName, [labels.studentCode]: result.identity.studentCode, [labels.managingClass]: result.identity.managingClass }),
+    result.classResult && printableDefinitionList({ [labels.course]: result.classResult.courseName, [labels.classCode]: result.classResult.classCode, [labels.classId]: result.classResult.classId }),
+    result.resolver && printableDefinitionList({ [labels.studentCode]: result.resolver.resolvedStudentCode, [labels.internalStudentId]: result.resolver.resolvedInternalStudentId, [labels.probes]: result.resolver.probes }),
+    result.reported && printableDefinitionList({ [labels.gpa]: result.reported.cumulativeGpa4, [labels.credits]: result.reported.totalCredits, [labels.accumulatedCredits]: result.reported.accumulatedCredits }),
+    result.derivedTerms && printableTerms(result.derivedTerms, labels),
+  ].filter(Boolean).join("");
+}
+
+export function serializePrintableExport(model: ExportDocument, locale: string, labels: PrintableExportLabels): string {
+  const document = sanitizeExportDocument(model);
+  const sections = [
+    printableDefinitionList({ [labels.surface]: document.surface, [labels.university]: document.universityId }),
+    document.query && `<section><h2>${escapePrintableHtml(labels.query)}</h2>${printableDefinitionList({ [labels.mode]: document.query.mode, [labels.value]: document.query.value })}</section>`,
+    document.run && `<section><h2>${escapePrintableHtml(labels.run)}</h2>${printableDefinitionList({ [labels.status]: document.run.status, [labels.mode]: document.run.mode, [labels.processed]: `${document.run.processedCount} / ${document.run.totalCount}` })}</section>`,
+    document.identity && `<section><h2>${escapePrintableHtml(labels.identity)}</h2>${printableDefinitionList({ [labels.studentCode]: document.identity.studentCode, [labels.name]: document.identity.studentName, [labels.managingClass]: document.identity.managingClass })}</section>`,
+    document.reported && `<section><h2>${escapePrintableHtml(labels.reported)}</h2>${printableDefinitionList({ [labels.gpa]: document.reported.cumulativeGpa4, [labels.credits]: document.reported.totalCredits, [labels.accumulatedCredits]: document.reported.accumulatedCredits })}</section>`,
+    document.derivedTerms && printableTerms(document.derivedTerms, labels),
+    document.results && `<section><h2>${escapePrintableHtml(labels.results)}</h2>${document.results.map((item) => "status" in item ? `<article><h3>${escapePrintableHtml(item.target)}</h3>${item.status === "error" ? printableDefinitionList({ [labels.error]: item.errorCode }) : printableResult(item.result, labels)}</article>` : `<article>${printableResult(item, labels)}</article>`).join("")}</section>`,
+  ].filter(Boolean).join("");
+  return `<!doctype html><html lang="${escapePrintableHtml(locale)}"><head><meta charset="utf-8"><title>${escapePrintableHtml(labels.title)}</title><style>body{font:14px/1.45 sans-serif;color:#111;margin:32px}h1{font-size:24px}h2{font-size:18px;margin-top:28px}h3{font-size:15px}section,article{break-inside:avoid}dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 16px}dt{font-weight:600}dd{margin:0}table{border-collapse:collapse;width:100%;margin-top:8px}th,td{border:1px solid #aaa;padding:6px;text-align:left}@media print{body{margin:16px}}</style></head><body><h1>${escapePrintableHtml(labels.title)}</h1>${sections}</body></html>`;
+}
+
+export type PrintPopup = { document: { write(html: string): void; close(): void }; print(): void; opener?: unknown };
+export type PrintEnvironment = { open(url?: string, target?: string, features?: string): PrintPopup | null };
+
+export function printExport(model: ExportDocument, locale: string, labels: PrintableExportLabels, environment: PrintEnvironment = window): void {
+  const popup = environment.open("", "_blank", "noopener,noreferrer");
+  if (!popup) throw new Error("Print window was blocked");
+  try { popup.opener = null; } catch { /* Browser may make opener read-only. */ }
+  popup.document.write(serializePrintableExport(model, locale, labels));
+  popup.document.close();
+  popup.print();
 }
 
 export function createClassLookupExport(input: {

@@ -28,8 +28,8 @@ export type VnuGradeRow = {
   point4?: number;
   // Both lifted from the row's "Chi tiết" cell <img onClick="detailPoint(
   // '{classId}','{grade10}','{stdId}','{termOrdinal}')"> — absent when the
-  // row renders no detail link. Only the cross-transcript parser consumes
-  // these; the own-grades mapper ignores them.
+   // row renders no detail link. Own grades preserve these only to request
+   // the authenticated student's component breakdown.
   classId?: string;
   termOrdinal?: string;
 };

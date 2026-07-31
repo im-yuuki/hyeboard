@@ -8,6 +8,8 @@ import {
   createResolverLookupExport,
   createTranscriptExport,
   downloadExport,
+  printExport,
+  serializePrintableExport,
   sanitizeAsciiFilenameComponent,
   serializeExportCsv,
   serializeExportJson,
@@ -465,5 +467,77 @@ describe("filenames and browser lifecycle", () => {
     const model: ExportDocument = { schemaVersion: 1, surface: "grades-page", universityId: "mock", derivedTerms: [] };
     expect(() => downloadExport(model, "csv", new Date(), environment as never)).toThrow("synthetic URL failure");
     expect(revokeObjectURL).not.toHaveBeenCalled();
+  });
+});
+
+describe("print export", () => {
+  const labels = {
+    title: "Export",
+    surface: "Surface",
+    university: "University",
+    query: "Query",
+    run: "Run",
+    identity: "Identity",
+    reported: "Reported",
+    terms: "Terms",
+    results: "Results",
+    target: "Target",
+    error: "Error",
+    course: "Course",
+    credits: "Credits",
+    score: "Score",
+    gpa: "GPA",
+    cpa: "CPA",
+    studentCode: "Student code",
+    name: "Name",
+    managingClass: "Managing class",
+    classCode: "Class code",
+    classId: "Class ID",
+    internalStudentId: "Internal student ID",
+    probes: "Probes",
+    accumulatedCredits: "Accumulated credits",
+    mode: "Mode",
+    value: "Value",
+    status: "Status",
+    processed: "Processed",
+  };
+
+  it("serializes only allowlisted values into escaped standalone HTML", () => {
+    const html = serializePrintableExport({
+      schemaVersion: 1,
+      surface: "grades-page",
+      universityId: "<unsafe>",
+      identity: { studentName: "<img src=x onerror=alert(1)>" },
+      derivedTerms: [{ ...term, courses: [{ ...term.courses[0]!, courseName: "<script>bad()</script>" }] }],
+      extra: SENTINEL,
+    } as ExportDocument, "en", labels);
+
+    expect(html).toContain('<html lang="en">');
+    expect(html).toContain("&lt;unsafe&gt;");
+    expect(html).toContain("&lt;img src=x onerror=alert(1)&gt;");
+    expect(html).toContain("&lt;script&gt;bad()&lt;/script&gt;");
+    expect(html).not.toContain(SENTINEL);
+    expect(html).not.toContain("<img");
+    expect(html).not.toContain("<script>");
+  });
+
+  it("writes, closes, detaches, and prints a popup", () => {
+    const write = vi.fn();
+    const close = vi.fn();
+    const print = vi.fn();
+    const popup = { document: { write, close }, print, opener: {} };
+    const open = vi.fn(() => popup);
+
+    printExport({ schemaVersion: 1, surface: "grades-page", universityId: "mock" }, "en", labels, { open });
+
+    expect(open).toHaveBeenCalledOnce();
+    expect(write).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+    expect(print).toHaveBeenCalledOnce();
+    expect(popup.opener).toBeNull();
+  });
+
+  it("fails when a popup is blocked", () => {
+    expect(() => printExport({ schemaVersion: 1, surface: "grades-page", universityId: "mock" }, "en", labels, { open: () => null })).toThrow("Print window was blocked");
   });
 });

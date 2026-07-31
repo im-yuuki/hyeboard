@@ -24,7 +24,7 @@ const DAOTAO_ORIGIN = "https://daotao.vnu.edu.vn";
 const DAOTAO_LOGIN_PATH = "/dkmh/login.asp";
 const DAOTAO_SESSION_ENDED_SENTENCE = "Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.";
 const HTML_ENTITY_RE = /&(?:nbsp|amp|lt|gt|quot|#[^;&\s]*);/gi;
-const VNU_COURSE_CODE_SOURCE = "[A-Za-zĐđ]{2,6} ?\\d{3,4}[A-Za-zĐđ]*";
+const VNU_COURSE_CODE_SOURCE = "[A-Za-zĐđ]{2,6} ?\\d{3,4}[A-Za-zĐđ]*(?:-[A-Za-zĐđ]+)?";
 const VNU_COURSE_CODE_RE = new RegExp(`^${VNU_COURSE_CODE_SOURCE}$`);
 const VNU_EXAM_COMPOSITE_RE = new RegExp(
   `^(\\d{3})-(${VNU_COURSE_CODE_SOURCE})(?:[ -]+(\\d+|[A-Za-zĐđ]+\\d+))?$`,
@@ -296,6 +296,9 @@ function parseCatalogCode(raw: string): { termCode?: string; courseCode: string;
   const strict = parseExamCompositeCode(raw);
   if (strict) {
     return strict;
+  }
+  if (/^\d{3}-[A-Za-zĐđ]{2,6} ?\d{3,4}[A-Za-zĐđ]*-(?:$|[^\sA-Za-zĐđ]|[A-Za-zĐđ]+-)/.test(raw)) {
+    return { courseCode: raw };
   }
   // Fallback for shapes that don't fit the common pattern: still split off a
   // recognizable "NNN-" term prefix if present, and never throw on an odd row.

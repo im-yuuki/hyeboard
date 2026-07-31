@@ -2461,6 +2461,34 @@ describe("VNU import session cache", () => {
     pointSpy.mockRestore();
   });
 
+  it("derives own exam identity server-side and ignores browser overrides", async () => {
+    const imported = await importVnu(app);
+    profileSpy.mockResolvedValueOnce(`<input name="hidStdID" value="99000000001"><select name="UnivID"><option value="77" selected>SYNTHETIC FACULTY</option></select>`);
+    const examSpy = vi.spyOn(DaotaoClient.prototype, "getExamsHtml").mockResolvedValue("<table></table>");
+
+    const response = await app.handle(new Request("http://localhost/api/vnu/raw/exams?vTermID=42&selStd=ATTACKER&selUniv=666", {
+      headers: { Authorization: `Bearer ${imported.token}` },
+    }));
+
+    expect(response.status).toBe(200);
+    expect(examSpy).toHaveBeenCalledWith({ selUniv: "77", selStd: "99000000001", vTermID: "42" });
+    examSpy.mockRestore();
+  });
+
+  it("derives own point-detail identity server-side and ignores browser overrides", async () => {
+    const imported = await importVnu(app);
+    profileSpy.mockResolvedValueOnce(`<input name="hidStdID" value="99000000001">`);
+    const pointSpy = vi.spyOn(DaotaoClient.prototype, "getPointDetailHtml").mockResolvedValue("<table></table>");
+
+    const response = await app.handle(new Request("http://localhost/api/vnu/raw/point-detail?id=123456&Term=42&selStd=ATTACKER&val=9.9", {
+      headers: { Authorization: `Bearer ${imported.token}` },
+    }));
+
+    expect(response.status).toBe(200);
+    expect(pointSpy).toHaveBeenCalledWith({ id: "123456", stdId: "99000000001", term: "42", val: undefined });
+    pointSpy.mockRestore();
+  });
+
   it("returns the exact profile-incomplete envelope when verified import identity is missing", async () => {
     adapterMocks.importSession.mockResolvedValue({
       universityId: "vnu",

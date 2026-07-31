@@ -136,6 +136,9 @@ async function openMockedLookup(page: import("@playwright/test").Page, bulkMaxim
     const html = `<table><tr><td>1</td><td>252-SYN9900-99</td><td>Synthetic Export Systems</td><td>31/12/2099</td><td>9(09:00)</td><td>Synthetic</td><td>LAB-99</td><td>99</td><td><input name="hidCrdID" value="${SYNTHETIC_CLASS_ID}"></td></tr></table>`;
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { html } }) });
   });
+  await page.route("**/api/vnu/raw/point-detail**", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { html: `<table><tr><td>1</td><td>Giữa kỳ</td><td>0.4</td><td>1</td><td>8.5</td></tr><tr><td>2</td><td>Thi cuối kỳ</td><td>0.6</td><td>1</td><td>9</td></tr><tr><td>Tổng điểm: 8.8</td></tr></table>` }, error: null }) });
+  });
   await page.route("**/api/vnu/cross-lookup/student-code**", async (route) => {
     requestCounts.studentCode += 1;
     const isError = new URL(route.request().url()).searchParams.get("stdId") === SYNTHETIC_ERROR_INTERNAL_ID;
@@ -1743,6 +1746,22 @@ test("lookup groups use progressive modes, accessible labels, and responsive tou
   }
 });
 
+test("lookup renders only own-session point-detail components", async ({ page }) => {
+  await openMockedLookup(page);
+  await page.getByLabel("Course code").fill("SYN9900");
+  await page.getByLabel("Term").click();
+  await page.getByRole("option").first().click();
+  const result = page.getByTestId("lookup-results");
+  await expect(result.getByText("Synthetic Export Systems")).toBeVisible();
+  await result.getByRole("button", { name: "Grade breakdown" }).click();
+  await expect(result.getByText("Giữa kỳ")).toBeVisible();
+  await expect(result.getByText("Thi cuối kỳ")).toBeVisible();
+  await expect(result.getByText("Weight 0.4 · Attempt 1")).toBeVisible();
+  await expect(result.getByText("8.5", { exact: true })).toBeVisible();
+  await expect(result.getByText("Tổng điểm")).toHaveCount(0);
+  await expect(result.getByText("Portal footer total")).toHaveCount(0);
+});
+
 test("bulk hides when maximum is zero or missing while single cross lookup remains", async ({ page }) => {
   for (const maximum of [0, null] as const) {
     await openMockedLookup(page, maximum);
@@ -2628,6 +2647,21 @@ test("export menu reports local failures, remains responsive, and localizes with
   expect(uetMenuTheme.itemForeground).not.toBe(darkMenuTheme.itemForeground);
   await page.keyboard.press("Escape");
 
+  const apiRequestsBeforePrint = await page.evaluate(() => performance.getEntriesByType("resource").filter((entry) => entry.name.includes("/api/")).length);
+  await page.evaluate(() => {
+    const events: string[] = [];
+    Object.defineProperty(window, "open", {
+      configurable: true,
+      value: () => ({ document: { write: () => events.push("write"), close: () => events.push("close") }, print: () => events.push("print"), opener: window }),
+    });
+    (window as typeof window & { __printExportEvents?: string[] }).__printExportEvents = events;
+  });
+  await themedTrigger.click();
+  await page.getByRole("menuitem", { name: "Print / Save PDF" }).click();
+  await expect.poll(() => page.evaluate(() => (window as typeof window & { __printExportEvents?: string[] }).__printExportEvents)).toEqual(["write", "close", "print"]);
+  expect(await page.evaluate(() => performance.getEntriesByType("resource").filter((entry) => entry.name.includes("/api/")).length)).toBe(apiRequestsBeforePrint);
+  await expect(resultText).toBeVisible();
+
   await page.evaluate(() => {
     Object.defineProperty(URL, "createObjectURL", {
       configurable: true,
@@ -2658,8 +2692,9 @@ test("export menu reports local failures, remains responsive, and localizes with
   await localizedTrigger.click();
   const localizedJson = page.getByRole("menuitem", { name: "Tải JSON" });
   const localizedCsv = page.getByRole("menuitem", { name: "Tải CSV" });
+  const localizedPrint = page.getByRole("menuitem", { name: "In / Lưu PDF" });
   await expect(localizedJson).toBeVisible();
-  for (const menuItem of [localizedJson, localizedCsv]) {
+  for (const menuItem of [localizedJson, localizedCsv, localizedPrint]) {
     const menuItemBox = await menuItem.boundingBox();
     expect(menuItemBox).not.toBeNull();
     expect(menuItemBox!.height).toBeGreaterThanOrEqual(43.9);

@@ -4,6 +4,7 @@ import {
   parseExamCatalogHtml,
   parseExamsHtml,
   parseGradesHtml,
+  parsePointDetailHtml,
   parsePortalNotice,
   parseSyllabusHtml,
   parseTranscriptHtml,
@@ -50,6 +51,8 @@ describe("VNU course-code cells", () => {
     ["decimal NBSP", "INT&#160;3103A", "INT 3103A"],
     ["hex NBSP", "đt&#xA0;3103b", "đt 3103b"],
     ["multi-letter suffix", "INT 3103AB", "INT 3103AB"],
+    ["hyphen letter suffix", "INE2102-E", "INE2102-E"],
+    ["multi-letter hyphen suffix", "INE2102-EF", "INE2102-EF"],
     ["repeated spaces", "INT   3103", "INT 3103"],
     ["tabs and newlines", "INT\t\n3103Z", "INT 3103Z"],
     ["intervening tags", "INT<span></span>3103", "INT 3103"],
@@ -73,6 +76,8 @@ describe("VNU course-code cells", () => {
     ["malformed internal split", "IN T 3103"],
     ["trailing prose", "INT 3103 synthetic prose"],
     ["punctuation", "INT-3103"],
+    ["bare hyphen suffix", "INE2102-"],
+    ["multiple hyphen suffixes", "INE2102-E-F"],
   ])("skips malformed %s grade and syllabus rows", (_case, source) => {
     expect(parseGradesHtml(`<table>${gradeRow(source)}</table>`).rows).toEqual([]);
     expect(parseSyllabusHtml(`<table>${syllabusRow(source)}</table>`)).toEqual([]);
@@ -85,6 +90,9 @@ describe("VNU exam composite codes", () => {
     ["241-FLF1107-01", { termCode: "241", courseCode: "FLF1107", classNo: "01" }],
     ["252-INT 3103A CN7", { termCode: "252", courseCode: "INT 3103A", classNo: "CN7" }],
     ["252-INT 3103A", { termCode: "252", courseCode: "INT 3103A", classNo: undefined }],
+    ["252-INE2102-E 6", { termCode: "252", courseCode: "INE2102-E", classNo: "6" }],
+    ["252-INE2102-E", { termCode: "252", courseCode: "INE2102-E", classNo: undefined }],
+    ["252-INE2102-EF 6", { termCode: "252", courseCode: "INE2102-EF", classNo: "6" }],
     ["252-INT 3103AB CN7", { termCode: "252", courseCode: "INT 3103AB", classNo: "CN7" }],
     ["252-INT 3103 - CN7", { termCode: "252", courseCode: "INT 3103", classNo: "CN7" }],
     ["252-INT 3103--71", { termCode: "252", courseCode: "INT 3103", classNo: "71" }],
@@ -134,6 +142,11 @@ describe("VNU exam composite codes", () => {
       termCode: "252",
       classNo: undefined,
     });
+  });
+
+  it.each(["252-INE2102-", "252-INE2102-E-F"]) ("does not split malformed hyphen suffix %s in schedule or catalog", (source) => {
+    expect(parseExamsHtml(`<table>${examRow(source)}</table>`)[0]).toMatchObject({ courseCode: source, termCode: undefined, classNo: undefined });
+    expect(parseExamCatalogHtml(`<table>${examRow(source, "CLASS-SYNTHETIC")}</table>`)[0]).toMatchObject({ courseCode: source, termCode: undefined, classNo: undefined });
   });
 
   it("requires both hidden course identity and eight-column evidence for catalog rows", () => {
@@ -199,6 +212,23 @@ describe("parseTranscriptHtml", () => {
     </tr></table>`);
 
     expect(grades.rows[0]?.courseName).toBe("&#xEA;");
+  });
+});
+
+describe("parsePointDetailHtml", () => {
+  it("parses synthetic component rows and preserves the cosmetic footer separately", () => {
+    const detail = parsePointDetailHtml(`<table>
+      <tr><td>STT</td><td>Bản chất kỳ thi</td><td>TS</td><td>Lần thi</td><td>Điểm</td><td>Ghi chú</td></tr>
+      <tr><td>1</td><td>Giữa kỳ</td><td>0.4</td><td>1</td><td>8.5</td><td></td></tr>
+      <tr><td>2</td><td>Thi cuối kỳ</td><td>0.6</td><td>1</td><td>9</td><td></td></tr>
+      <tr><td colspan="6">Tổng điểm: 8.8</td></tr>
+    </table>`);
+
+    expect(detail.components).toEqual([
+      { index: 1, nature: "Giữa kỳ", weight: 0.4, attempt: 1, score: 8.5, notes: undefined },
+      { index: 2, nature: "Thi cuối kỳ", weight: 0.6, attempt: 1, score: 9, notes: undefined },
+    ]);
+    expect(detail.displayTotalEcho).toBe("8.8");
   });
 });
 

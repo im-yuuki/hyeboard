@@ -1,9 +1,11 @@
 import type { Grade } from "@hyeboard/schemas";
 import { ChevronDown } from "lucide-react";
 import { Fragment, useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { ExportMenu } from "@/components/export-menu";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Empty, FeatureFrame, SummaryStat, SummaryStrip } from "@/components/shared";
 import { api } from "@/lib/api";
 import { createGradesExport, type ExportDerivedTerm } from "@/lib/data-export";
@@ -117,8 +119,42 @@ function LetterBadge({ letter, large }: { letter: string | undefined; large?: bo
   );
 }
 
+function VnuGradeDetail({ classId, termOrdinal }: { classId: string; termOrdinal: string }) {
+  const { t } = useLocale();
+  const state = useHyeboard();
+  const detailQuery = useQuery({
+    queryKey: ["vnu-point-detail", state.universityId, state.sessionNonce, classId, termOrdinal],
+    queryFn: async () => {
+      await state.ensureSession();
+      return api.vnuPointDetail({ id: classId, Term: termOrdinal });
+    },
+  });
+  if (detailQuery.isLoading) return <div className="px-4 py-3" role="status"><Skeleton className="h-12" /><span className="sr-only">{t.grades.componentDetailLoading}</span></div>;
+  if (detailQuery.error) return <div className="px-4 py-3" role="alert"><p className="text-sm text-muted-foreground">{t.grades.componentDetailError}</p></div>;
+  if (!detailQuery.data?.components.length) return <div className="px-4 py-3"><Empty text={t.grades.componentDetailEmpty} /></div>;
+  return (
+    <div className="divide-y divide-border bg-muted/30 px-4">
+      {detailQuery.data.components.map((component) => (
+        <div key={component.index} className="list-row">
+          <div className="min-w-0">
+            <p className="break-words text-sm font-medium">{component.nature || "-"}</p>
+            <p className="text-xs text-muted-foreground">{[
+              component.weight != null ? t.grades.componentWeight(component.weight) : undefined,
+              component.attempt != null ? t.grades.componentAttempt(component.attempt) : undefined,
+            ].filter(Boolean).join(" · ") || "-"}</p>
+          </div>
+          <Badge className="shrink-0 border border-border bg-background font-normal tabular-nums text-foreground">{component.score ?? "-"}</Badge>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function GradeDetail({ grade, universityId }: { grade: Grade; universityId: string }) {
   const { t } = useLocale();
+  const hasVnuDetailIdentity = universityId === "vnu" && Boolean(grade.classId && grade.termOrdinal);
+  if (hasVnuDetailIdentity) return <VnuGradeDetail classId={grade.classId!} termOrdinal={grade.termOrdinal!} />;
+  if (universityId === "vnu") return <div className="px-4 py-3"><Empty text={t.grades.componentDetailUnavailable} /></div>;
   const termLabel = grade.termCode ? formatTermLabel(grade.termCode, universityId, t.terms) : t.grades.unknownTerm;
   const stats: Array<{ label: string; value: string }> = [
     { label: t.grades.point10, value: grade.point10 != null ? String(grade.point10) : "-" },

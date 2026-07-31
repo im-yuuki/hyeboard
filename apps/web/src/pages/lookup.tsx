@@ -109,7 +109,6 @@ function PointDetailPanel({ classId, termOrdinal }: { classId: string; termOrdin
           </div>
         ))}
       </div>
-      {detail.displayTotalEcho ? <p className="text-xs text-muted-foreground">{t.lookup.displayTotalEcho(detail.displayTotalEcho)}</p> : null}
     </div>
   );
 }
