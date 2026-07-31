@@ -156,7 +156,7 @@ export type VnuTranscriptHeader = {
 // class (live-verified shape, see har-notes.md). One row per exam component.
 export type VnuPointDetailComponent = {
   index: number; // STT column ordinal
-  nature: string; // "Bản chất kỳ thi", e.g. "Thi cuối kỳ" / "Giữa kỳ"
+  nature: string; // portal's "Bản chất kỳ thi", e.g. "Thi cuối kỳ" / "Kiểm tra"
   weight?: number; // TS column, e.g. 0.6
   attempt?: number; // "Lần thi" column
   score?: number; // "Điểm" column

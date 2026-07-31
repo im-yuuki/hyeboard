@@ -391,29 +391,46 @@ export function parsePointDetailHtml(html: string): VnuPointDetail {
   const termCodeMatch = plain.match(/Mã học kỳ\s*([0-9A-Za-z]+)/i);
   const components: VnuPointDetailComponent[] = [];
   let displayTotalEcho: string | undefined;
+  let componentColumns: { index: number; nature: number; weight: number; attempt: number; score: number; notes?: number } | undefined;
   const trRe = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
   let match: RegExpExecArray | null;
   while ((match = trRe.exec(html))) {
     const cells = tdCells(match[1]);
     if (!cells.length) continue;
     const joined = cells.join(" ");
+    const normalizedCells = cells.map((cell) => cell.trim().toLocaleLowerCase("vi-VN"));
+    const headerIndexes = {
+      index: normalizedCells.indexOf("stt"),
+      nature: normalizedCells.indexOf("bản chất kỳ thi"),
+      weight: normalizedCells.indexOf("ts"),
+      attempt: normalizedCells.indexOf("lần thi"),
+      score: normalizedCells.indexOf("điểm"),
+      notes: normalizedCells.indexOf("ghi chú"),
+    };
+    if (headerIndexes.index >= 0 && headerIndexes.nature >= 0 && headerIndexes.weight >= 0 && headerIndexes.attempt >= 0 && headerIndexes.score >= 0) {
+      componentColumns = {
+        ...headerIndexes,
+        notes: headerIndexes.notes >= 0 ? headerIndexes.notes : undefined,
+      };
+      continue;
+    }
     if (/Tổng điểm/i.test(joined)) {
       displayTotalEcho = joined.match(/Tổng điểm\s*[:\-]?\s*([\d.,]+)/i)?.[1]?.trim() || undefined;
       continue;
     }
-    // Header rows render their column titles as text ("STT", ...), so a
-    // numeric first cell is what distinguishes a real component row.
-    if (cells.length < 5 || !/^\d+$/.test(cells[0] ?? "")) continue;
-    const weight = Number.parseFloat(cells[2] ?? "");
-    const attempt = Number.parseFloat(cells[3] ?? "");
-    const score = Number.parseFloat(cells[4] ?? "");
+    if (!componentColumns) continue;
+    const index = Number.parseInt(cells[componentColumns.index] ?? "", 10);
+    if (!Number.isInteger(index)) continue;
+    const weight = parseOptionalNumber(cells[componentColumns.weight]);
+    const attempt = parseOptionalNumber(cells[componentColumns.attempt]);
+    const score = parseOptionalNumber(cells[componentColumns.score]);
     components.push({
-      index: Number.parseInt(cells[0] ?? "0", 10),
-      nature: (cells[1] ?? "").trim(),
-      weight: Number.isFinite(weight) ? weight : undefined,
-      attempt: Number.isFinite(attempt) ? attempt : undefined,
-      score: Number.isFinite(score) ? score : undefined,
-      notes: cells[5]?.trim() || undefined,
+      index,
+      nature: (cells[componentColumns.nature] ?? "").trim(),
+      weight,
+      attempt,
+      score,
+      notes: componentColumns.notes === undefined ? undefined : cells[componentColumns.notes]?.trim() || undefined,
     });
   }
   return { headerLabel: headerMatch?.[0], termCode: termCodeMatch?.[1], components, displayTotalEcho };

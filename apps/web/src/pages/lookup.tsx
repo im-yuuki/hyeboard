@@ -67,7 +67,7 @@ function ClassResultRow({ row, expanded, onToggleDetail, exportModel }: { row: V
 }
 
 // Inline drilldown for one resolved class row: the per-component grade
-// breakdown (Thi cuối kỳ / Giữa kỳ, weights, attempts, scores) for the
+// breakdown (portal-provided assessment types, weights, attempts, scores) for the
 // student's OWN class. The worker scopes StdID to the session owner — this
 // panel can never be pointed at another student.
 function PointDetailPanel({ classId, termOrdinal }: { classId: string; termOrdinal: string }) {
