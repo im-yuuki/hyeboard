@@ -599,6 +599,7 @@ function CrossTranscriptSection({ profile }: { profile: VnuProfile }) {
     universityId: state.universityId,
     query: { mode: submitted.mode, value: submitted.mode === "stdId" ? submitted.stdId : submitted.stdCode },
     identity: {
+      internalStudentId: submitted.mode === "stdId" ? submitted.stdId : undefined,
       studentCode: transcriptView.transcript.header.studentCode,
       studentName: transcriptView.transcript.header.studentName,
       managingClass: transcriptView.transcript.header.className,

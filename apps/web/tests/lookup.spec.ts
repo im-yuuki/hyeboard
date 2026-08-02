@@ -669,7 +669,7 @@ test("lookup successful single results export both formats without refetch and c
   expect(transcriptDocument).toMatchObject({
     surface: "cross-transcript",
     query: { mode: "stdId", value: SYNTHETIC_TARGET_INTERNAL_ID },
-    identity: { studentCode: SYNTHETIC_TARGET_STUDENT_CODE, studentName: "Synthetic Target", managingClass: "SYNTHETIC-99" },
+    identity: { studentCode: SYNTHETIC_TARGET_STUDENT_CODE, internalStudentId: SYNTHETIC_TARGET_INTERNAL_ID, studentName: "Synthetic Target", managingClass: "SYNTHETIC-99" },
     reported: { cumulativeGpa4: 3.91 },
   });
   const transcriptTerms = transcriptDocument.derivedTerms as Array<Record<string, unknown>>;
