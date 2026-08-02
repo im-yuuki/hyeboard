@@ -679,6 +679,21 @@ test("lookup successful single results export both formats without refetch and c
   expect(transcriptTerms[1]).toMatchObject({ termCode: "251", estimateKind: "derived", listedCredits: 3, includedCredits: 3, termGpa4: 3, derivedCpa4: 3 });
   await transcriptInput.fill(SYNTHETIC_ERROR_INTERNAL_ID);
   await expect(transcriptSection.getByRole("button", { name: "Export" })).toHaveCount(0);
+
+  await transcriptSection.getByRole("button", { name: "Student code" }).click();
+  const transcriptCodeInput = transcriptSection.getByLabel("Target student code");
+  await transcriptCodeInput.fill(SYNTHETIC_TARGET_STUDENT_CODE);
+  await transcriptSection.getByRole("button", { name: "View transcript" }).click();
+  await expect(transcriptSection.getByRole("button", { name: "Export" })).toHaveCount(1);
+  const transcriptCodeDocument = await expectExportFormats(page, "cross-transcript", apiRequestCount, {
+    sourcePath: "/api/vnu/cross-lookup/transcript",
+    assertCsv: expectAcademicCsvMatchesJson,
+  });
+  expect(transcriptCodeDocument).toMatchObject({
+    query: { mode: "stdCode", value: SYNTHETIC_TARGET_STUDENT_CODE },
+    identity: { studentCode: SYNTHETIC_TARGET_STUDENT_CODE, studentName: "Synthetic Target", managingClass: "SYNTHETIC-99" },
+  });
+  expect(transcriptCodeDocument.identity).not.toHaveProperty("internalStudentId");
   await expectNoPageOverflow(page);
 });
 
