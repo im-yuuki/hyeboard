@@ -124,19 +124,20 @@ test("grades render derived term GPA and CPA and export current page and term st
   expect(uetMenuTheme.itemForeground).not.toBe(darkMenuTheme.itemForeground);
   await page.keyboard.press("Escape");
 
-  const requestsBeforePrint = apiRequestCount.snapshot();
+  const requestsBeforePdf = apiRequestCount.snapshot();
   await page.evaluate(() => {
-    const events: string[] = [];
     Object.defineProperty(window, "open", {
       configurable: true,
-      value: () => ({ document: { write: () => events.push("write"), close: () => events.push("close") }, print: () => events.push("print"), opener: window }),
+      value: () => { throw new Error("PDF export must not open a window"); },
     });
-    (window as typeof window & { __printExportEvents?: string[] }).__printExportEvents = events;
   });
+  const pdfDownload = page.waitForEvent("download");
   await themedTrigger.click();
-  await page.getByRole("menuitem", { name: "Print / Save PDF" }).click();
-  await expect.poll(() => page.evaluate(() => (window as typeof window & { __printExportEvents?: string[] }).__printExportEvents)).toEqual(["write", "close", "print"]);
-  expect(apiRequestCount.snapshot()).toEqual(requestsBeforePrint);
+  await page.getByRole("menuitem", { name: "Download PDF" }).click();
+  const pdf = await pdfDownload;
+  expect(pdf.suggestedFilename()).toMatch(/^hyeboard-grades-page-\d{4}-\d{2}-\d{2}\.pdf$/);
+  expect((await downloadText(pdf)).slice(0, 5)).toBe("%PDF-");
+  expect(apiRequestCount.snapshot()).toEqual(requestsBeforePdf);
   await expect(resultText).toBeVisible();
 
   await page.evaluate(() => {
@@ -168,7 +169,7 @@ test("grades render derived term GPA and CPA and export current page and term st
   await localizedRoot.getByRole("button", { name: "Xuất dữ liệu" }).click();
   await expect(page.getByRole("menuitem", { name: "Tải JSON" })).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "Tải CSV" })).toBeVisible();
-  await expect(page.getByRole("menuitem", { name: "In / Lưu PDF" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Tải PDF" })).toBeVisible();
   await page.getByRole("menuitem", { name: "Tải JSON" }).click();
   await expect(localizedRoot.getByRole("status"))
     .toContainText("Không thể tải dữ liệu xuất. Kết quả vẫn được giữ nguyên; hãy thử lại.");

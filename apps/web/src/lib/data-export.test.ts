@@ -5,10 +5,12 @@ import {
   createBulkExport,
   createClassLookupExport,
   createGradesExport,
+  createPdfExportDefinition,
   createResolverLookupExport,
   createTranscriptExport,
   downloadExport,
-  printExport,
+  downloadPdfExport,
+  resolvePdfPageOrientation,
   serializePrintableExport,
   sanitizeAsciiFilenameComponent,
   serializeExportCsv,
@@ -518,9 +520,12 @@ describe("filenames and browser lifecycle", () => {
   });
 });
 
-describe("print export", () => {
+describe("PDF export", () => {
   const labels = {
+    heading: "Hyeboard",
     title: "Export",
+    exportedAt: "Exported",
+    page: "Page",
     surface: "Surface",
     university: "University",
     query: "Query",
@@ -534,12 +539,15 @@ describe("print export", () => {
     course: "Course",
     credits: "Credits",
     score: "Score",
+    letter: "Letter grade",
+    point4: "4-point score",
     gpa: "GPA",
     cpa: "CPA",
     studentCode: "Student code",
     name: "Name",
     managingClass: "Managing class",
     classCode: "Class code",
+    classNumber: "Class number",
     classId: "Class ID",
     internalStudentId: "Internal student ID",
     probes: "Probes",
@@ -569,23 +577,149 @@ describe("print export", () => {
     expect(html).not.toContain("<script>");
   });
 
-  it("writes, closes, detaches, and prints a popup", () => {
-    const write = vi.fn();
-    const close = vi.fn();
-    const print = vi.fn();
-    const popup = { document: { write, close }, print, opener: {} };
-    const open = vi.fn(() => popup);
+  it("downloads a generated PDF without opening a window", async () => {
+    let downloadedBlob: Blob | undefined;
+    const createObjectURL = vi.fn((blob: Blob) => {
+      downloadedBlob = blob;
+      return "blob:synthetic-pdf";
+    });
+    const revokeObjectURL = vi.fn();
+    const remove = vi.fn();
+    const anchor = { href: "", download: "", click: vi.fn(), remove };
+    const environment = { createObjectURL, revokeObjectURL, createAnchor: vi.fn(() => anchor), appendAnchor: vi.fn() };
+    const createPdf = vi.fn(() => ({ getBlob: (callback: (blob: Blob) => void) => callback(new Blob(["%PDF-1.7\\nsynthetic"], { type: "application/pdf" })) }));
+    const open = vi.fn();
+    vi.stubGlobal("open", open);
 
-    printExport({ schemaVersion: 1, surface: "grades-page", universityId: "mock" }, "en", labels, { open });
+    await downloadPdfExport(
+      createGradesExport({ surface: "grades-page", universityId: "mock", identity: { studentName: "Sinh viên thử nghiệm" }, derivedTerms: [term] }),
+      "vi",
+      labels,
+      new Date("2026-08-02T12:00:00Z"),
+      environment,
+      async () => ({ createPdf }),
+    );
 
-    expect(open).toHaveBeenCalledOnce();
-    expect(write).toHaveBeenCalledOnce();
-    expect(close).toHaveBeenCalledOnce();
-    expect(print).toHaveBeenCalledOnce();
-    expect(popup.opener).toBeNull();
+    expect(downloadedBlob).toBeDefined();
+    const blob = downloadedBlob!;
+    expect(blob.type).toBe("application/pdf");
+    expect(await blob.text()).toMatch(/^%PDF-/);
+    expect(createPdf).toHaveBeenCalledOnce();
+    expect(open).not.toHaveBeenCalled();
+    expect(anchor.download).toBe("hyeboard-grades-page-2026-08-02.pdf");
+    expect(remove).toHaveBeenCalledOnce();
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:synthetic-pdf");
   });
 
-  it("fails when a popup is blocked", () => {
-    expect(() => printExport({ schemaVersion: 1, surface: "grades-page", universityId: "mock" }, "en", labels, { open: () => null })).toThrow("Print window was blocked");
+  it("uses landscape only when the report table needs six or more columns", () => {
+    expect(resolvePdfPageOrientation(createClassLookupExport({
+      surface: "class-forward", universityId: "vnu", query: { mode: "class-id", value: "000001" }, result: { classCode: "INT1001", classId: "000001" },
+    }))).toBe("portrait");
+    expect(resolvePdfPageOrientation(createGradesExport({ surface: "grades-page", universityId: "mock", derivedTerms: [term] }))).toBe("landscape");
+  });
+
+  it("maps grades into a seven-column landscape course table without conflating letter and 4-point scores", () => {
+    const definition = JSON.stringify(createPdfExportDefinition(
+      createGradesExport({
+        surface: "grades-page",
+        universityId: "mock",
+        identity: { studentCode: SYNTHETIC_STUDENT_CODE, internalStudentId: SYNTHETIC_INTERNAL_ID, studentName: "Synthetic Student" },
+        derivedTerms: [term],
+      }),
+      "en",
+      labels,
+      new Date("2026-08-02T12:00:00Z"),
+    ));
+
+    expect(definition).toContain('"pageOrientation":"landscape"');
+    expect(definition).toContain(labels.title);
+    expect(definition).toContain("Synthetic Student");
+    expect(definition).toContain(term.courses[0]!.courseCode);
+    expect(definition).toContain(labels.letter);
+    expect(definition).toContain(labels.point4);
+    expect(definition).toContain("B+");
+    expect(definition).toContain("3.5");
+    expect(definition).toContain(SYNTHETIC_INTERNAL_ID);
+  });
+
+  it("maps lookup class numbers and Vietnamese identity labels into report metadata", () => {
+    const vietnameseLabels = { ...labels, title: "Báo cáo xuất dữ liệu", classNumber: "Số lớp", internalStudentId: "ID sinh viên nội bộ" };
+    const definition = JSON.stringify(createPdfExportDefinition(
+      createClassLookupExport({
+        surface: "class-forward",
+        universityId: "vnu",
+        query: { mode: "class-id", value: "000001" },
+        result: { classCode: "INT1001", classNumber: "01", classId: "000001", courseName: "Lập trình" },
+      }),
+      "vi",
+      vietnameseLabels,
+      new Date("2026-08-02T12:00:00Z"),
+    ));
+
+    expect(definition).toContain("Số lớp");
+    expect(definition).toContain("Báo cáo xuất dữ liệu");
+    expect(definition).toContain('"pageOrientation":"portrait"');
+    expect(definition).toContain("01");
+    expect(definition).toContain("Lập trình");
+  });
+
+  it("maps transcript and bulk lookup identities, results, and course tables into reports", () => {
+    const transcript = JSON.stringify(createPdfExportDefinition(
+      createTranscriptExport({
+        universityId: "vnu",
+        query: { mode: "stdId", value: SYNTHETIC_INTERNAL_ID },
+        identity: { internalStudentId: SYNTHETIC_INTERNAL_ID, studentCode: SYNTHETIC_STUDENT_CODE, studentName: "Synthetic Student" },
+        derivedTerms: [term],
+      }),
+      "en",
+      labels,
+      new Date("2026-08-02T12:00:00Z"),
+    ));
+    const bulk = JSON.stringify(createPdfExportDefinition(
+      createBulkExport({
+        surface: "bulk-id-to-transcript",
+        universityId: "vnu",
+        mode: "stdid-to-transcript",
+        total: 1,
+        items: [{ target: SYNTHETIC_INTERNAL_ID, status: "ok", result: { identity: { internalStudentId: SYNTHETIC_INTERNAL_ID, studentName: "Synthetic Student" }, derivedTerms: [term] } }],
+      }),
+      "en",
+      labels,
+      new Date("2026-08-02T12:00:00Z"),
+    ));
+
+    for (const definition of [transcript, bulk]) {
+      expect(definition).toContain(labels.title);
+      expect(definition).toContain('"pageOrientation":"landscape"');
+      expect(definition).toContain("Synthetic Student");
+      expect(definition).toContain(labels.internalStudentId);
+      expect(definition).toContain(SYNTHETIC_INTERNAL_ID);
+      expect(definition).toContain("Reliable, \\\"Systems\\\"");
+      expect(definition).toContain(labels.letter);
+      expect(definition).toContain(labels.point4);
+    }
+  });
+
+  it("renders a real pdfmake Blob from the formal report definition", async () => {
+    const [pdfMakeModule, pdfVfsModule] = await Promise.all([
+      import("pdfmake/build/pdfmake"),
+      import("pdfmake/build/vfs_fonts"),
+    ]);
+    const pdfMake = (pdfMakeModule.default ?? pdfMakeModule) as { vfs?: unknown; createPdf(definition: unknown): { getBlob(callback: (blob: Blob) => void): void } };
+    const vfs = (pdfVfsModule.default ?? pdfVfsModule) as unknown;
+    pdfMake.vfs = vfs;
+    const definition = createPdfExportDefinition(
+      createGradesExport({ surface: "grades-page", universityId: "mock", identity: { studentName: "Sinh viên thử nghiệm" }, derivedTerms: [term] }),
+      "vi",
+      { ...labels, heading: "Hyeboard", title: "Báo cáo xuất dữ liệu", letter: "Điểm chữ", point4: "Điểm hệ 4" },
+      new Date("2026-08-02T12:00:00Z"),
+    );
+    // pdfmake does not expose stable text extraction. Assert structured report content above;
+    // here verify real renderer output without snapshotting volatile PDF bytes.
+    const blob = await new Promise<Blob>((resolve) => pdfMake.createPdf(definition).getBlob(resolve));
+
+    expect(blob.type).toBe("application/pdf");
+    expect((await blob.text()).slice(0, 5)).toBe("%PDF-");
+    expect(blob.size).toBeGreaterThan(1_000);
   });
 });

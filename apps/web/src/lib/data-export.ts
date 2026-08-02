@@ -1,4 +1,5 @@
-export type ExportFormat = "json" | "csv";
+export type ExportFormat = "json" | "csv" | "pdf";
+export type TextExportFormat = Exclude<ExportFormat, "pdf">;
 
 export type ExportSurface =
   | "class-forward"
@@ -66,12 +67,15 @@ export type PrintableExportLabels = {
   course: string;
   credits: string;
   score: string;
+  letter: string;
+  point4: string;
   gpa: string;
   cpa: string;
   studentCode: string;
   name: string;
   managingClass: string;
   classCode: string;
+  classNumber: string;
   classId: string;
   internalStudentId: string;
   probes: string;
@@ -80,6 +84,12 @@ export type PrintableExportLabels = {
   value: string;
   status: string;
   processed: string;
+};
+
+export type PdfExportLabels = PrintableExportLabels & {
+  heading: string;
+  exportedAt: string;
+  page: string;
 };
 
 type IdentityInput = ExportIdentity & Record<string, unknown>;
@@ -264,16 +274,150 @@ export function serializePrintableExport(model: ExportDocument, locale: string, 
   return `<!doctype html><html lang="${escapePrintableHtml(locale)}"><head><meta charset="utf-8"><title>${escapePrintableHtml(labels.title)}</title><style>body{font:14px/1.45 sans-serif;color:#111;margin:32px}h1{font-size:24px}h2{font-size:18px;margin-top:28px}h3{font-size:15px}section,article{break-inside:avoid}dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 16px}dt{font-weight:600}dd{margin:0}table{border-collapse:collapse;width:100%;margin-top:8px}th,td{border:1px solid #aaa;padding:6px;text-align:left}@media print{body{margin:16px}}</style></head><body><h1>${escapePrintableHtml(labels.title)}</h1>${sections}</body></html>`;
 }
 
-export type PrintPopup = { document: { write(html: string): void; close(): void }; print(): void; opener?: unknown };
-export type PrintEnvironment = { open(url?: string, target?: string, features?: string): PrintPopup | null };
+export type PdfPageOrientation = "portrait" | "landscape";
+export type PdfDocumentDefinition = Record<string, unknown>;
+export type PdfGenerator = { getBlob(callback: (blob: Blob) => void): void };
+export type PdfLibrary = { createPdf(definition: PdfDocumentDefinition): PdfGenerator };
+export type PdfLibraryLoader = () => Promise<PdfLibrary>;
 
-export function printExport(model: ExportDocument, locale: string, labels: PrintableExportLabels, environment: PrintEnvironment = window): void {
-  const popup = environment.open("", "_blank", "noopener,noreferrer");
-  if (!popup) throw new Error("Print window was blocked");
-  try { popup.opener = null; } catch { /* Browser may make opener read-only. */ }
-  popup.document.write(serializePrintableExport(model, locale, labels));
-  popup.document.close();
-  popup.print();
+type PdfMakeModule = PdfLibrary & { vfs?: unknown };
+type PdfVfsModule = { pdfMake?: { vfs?: unknown }; default?: unknown };
+
+async function loadPdfMake(): Promise<PdfLibrary> {
+  const [pdfMakeModule, pdfVfsModule] = await Promise.all([
+    import("pdfmake/build/pdfmake") as Promise<PdfMakeModule & { default?: PdfMakeModule }>,
+    import("pdfmake/build/vfs_fonts") as Promise<PdfVfsModule>,
+  ]);
+  const pdfMake = pdfMakeModule.default ?? pdfMakeModule;
+  const defaultVfs = isRecord(pdfVfsModule.default) ? pdfVfsModule.default : undefined;
+  const vfs = pdfVfsModule.pdfMake?.vfs ?? defaultVfs?.vfs ?? (isRecord(defaultVfs?.pdfMake) ? defaultVfs.pdfMake.vfs : undefined) ?? pdfVfsModule.default;
+  if (!isRecord(vfs)) throw new Error("PDF font assets are unavailable");
+  pdfMake.vfs = vfs;
+  return pdfMake;
+}
+
+function pdfValue(value: string | number | undefined): string {
+  return value === undefined || value === "" ? "—" : String(value);
+}
+
+function pdfMetadataTable(value: Record<string, string | number | undefined>): PdfDocumentDefinition | undefined {
+  const body = Object.entries(value)
+    .filter(([, field]) => field !== undefined)
+    .map(([label, field]) => [{ text: label, bold: true }, pdfValue(field)]);
+  return body.length ? { table: { widths: [140, "*"], body }, layout: "lightHorizontalLines", margin: [0, 4, 0, 12] } : undefined;
+}
+
+function pdfCourseTable(terms: readonly ExportDerivedTerm[], labels: PdfExportLabels): PdfDocumentDefinition | undefined {
+  const rows = terms.flatMap((term) => term.courses.map((course) => [
+    term.termLabel,
+    course.courseCode,
+    course.courseName,
+    pdfValue(course.credits),
+    pdfValue(course.point10),
+    pdfValue(course.letter),
+    pdfValue(course.point4),
+  ]));
+  if (!rows.length) return undefined;
+  return {
+    table: {
+      headerRows: 1,
+      widths: ["auto", "auto", "*", "auto", "auto", "auto", "auto"],
+      body: [[labels.terms, labels.course, labels.name, labels.credits, labels.score, labels.letter, labels.point4], ...rows],
+    },
+    layout: "lightHorizontalLines",
+    fontSize: 8,
+    margin: [0, 4, 0, 14],
+  };
+}
+
+function pdfResultContent(result: ExportResult, labels: PdfExportLabels): PdfDocumentDefinition[] {
+  const content: PdfDocumentDefinition[] = [];
+  const identity = result.identity && pdfMetadataTable({ [labels.name]: result.identity.studentName, [labels.studentCode]: result.identity.studentCode, [labels.internalStudentId]: result.identity.internalStudentId, [labels.managingClass]: result.identity.managingClass });
+  const classResult = result.classResult && pdfMetadataTable({ [labels.course]: result.classResult.courseName, [labels.classCode]: result.classResult.classCode, [labels.classNumber]: result.classResult.classNumber, [labels.classId]: result.classResult.classId });
+  const resolver = result.resolver && pdfMetadataTable({ [labels.studentCode]: result.resolver.resolvedStudentCode, [labels.internalStudentId]: result.resolver.resolvedInternalStudentId, [labels.probes]: result.resolver.probes });
+  const reported = result.reported && pdfMetadataTable({ [labels.gpa]: result.reported.cumulativeGpa4, [labels.credits]: result.reported.totalCredits, [labels.accumulatedCredits]: result.reported.accumulatedCredits });
+  for (const section of [identity, classResult, resolver, reported]) if (section) content.push(section);
+  const courses = result.derivedTerms && pdfCourseTable(result.derivedTerms, labels);
+  if (courses) content.push(courses);
+  return content;
+}
+
+function maxPdfTableColumns(model: ExportDocument): number {
+  const document = sanitizeExportDocument(model);
+  const hasCourses = (terms: readonly ExportDerivedTerm[] | undefined) => terms?.some((term) => term.courses.length > 0) ?? false;
+  if (hasCourses(document.derivedTerms)) return 7;
+  if (document.results?.some((item) => hasCourses("status" in item && item.status === "ok" ? item.result.derivedTerms : "status" in item ? undefined : item.derivedTerms))) return 7;
+  return 2;
+}
+
+export function resolvePdfPageOrientation(model: ExportDocument): PdfPageOrientation {
+  return maxPdfTableColumns(model) >= 6 ? "landscape" : "portrait";
+}
+
+function formatPdfTimestamp(locale: string, date: Date): string {
+  try {
+    return new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "medium" }).format(date);
+  } catch {
+    return date.toISOString();
+  }
+}
+
+export function createPdfExportDefinition(model: ExportDocument, locale: string, labels: PdfExportLabels, date = new Date()): PdfDocumentDefinition {
+  const document = sanitizeExportDocument(model);
+  const content: PdfDocumentDefinition[] = [
+    { text: labels.heading, style: "heading" },
+    { text: labels.title, style: "title" },
+    { text: `${labels.exportedAt}: ${formatPdfTimestamp(locale, date)}`, style: "timestamp" },
+  ];
+  const context = pdfMetadataTable({
+    [labels.surface]: document.surface,
+    [labels.university]: document.universityId,
+    [labels.mode]: document.query?.mode,
+    [labels.value]: document.query?.value,
+    [labels.studentCode]: document.identity?.studentCode,
+    [labels.internalStudentId]: document.identity?.internalStudentId,
+    [labels.name]: document.identity?.studentName,
+    [labels.managingClass]: document.identity?.managingClass,
+  });
+  if (context) content.push(context);
+  const reported = document.reported && pdfMetadataTable({ [labels.gpa]: document.reported.cumulativeGpa4, [labels.credits]: document.reported.totalCredits, [labels.accumulatedCredits]: document.reported.accumulatedCredits });
+  if (reported) content.push({ text: labels.reported, style: "section" }, reported);
+  if (document.derivedTerms?.length) {
+    content.push({ text: labels.terms, style: "section" });
+    for (const term of document.derivedTerms) {
+      content.push({ text: term.termLabel, style: "subsection" });
+      const summary = pdfMetadataTable({ [labels.credits]: `${term.includedCredits} / ${term.listedCredits}`, [labels.gpa]: term.termGpa4, [labels.cpa]: term.derivedCpa4 });
+      if (summary) content.push(summary);
+    }
+    const courses = pdfCourseTable(document.derivedTerms, labels);
+    if (courses) content.push(courses);
+  }
+  if (document.run) {
+    content.push({ text: labels.run, style: "section" });
+    const run = pdfMetadataTable({ [labels.status]: document.run.status, [labels.mode]: document.run.mode, [labels.processed]: `${document.run.processedCount} / ${document.run.totalCount}` });
+    if (run) content.push(run);
+  }
+  if (document.results?.length) {
+    content.push({ text: labels.results, style: "section" });
+    for (const item of document.results) {
+      if ("status" in item) {
+        content.push({ text: item.target, style: "subsection" });
+        if (item.status === "error") {
+          const error = pdfMetadataTable({ [labels.error]: item.errorCode });
+          if (error) content.push(error);
+        } else content.push(...pdfResultContent(item.result, labels));
+      } else content.push(...pdfResultContent(item, labels));
+    }
+  }
+  return {
+    pageSize: "A4",
+    pageOrientation: resolvePdfPageOrientation(document),
+    pageMargins: [36, 42, 36, 42],
+    defaultStyle: { font: "Roboto", fontSize: 9 },
+    styles: { heading: { fontSize: 14, bold: true }, title: { fontSize: 20, bold: true, margin: [0, 4, 0, 2] }, timestamp: { fontSize: 8, color: "#555555", margin: [0, 0, 0, 14] }, section: { fontSize: 13, bold: true, margin: [0, 8, 0, 4] }, subsection: { fontSize: 10, bold: true, margin: [0, 6, 0, 2] } },
+    content,
+    footer: (currentPage: number, pageCount: number) => ({ text: `${labels.page} ${currentPage} / ${pageCount}`, alignment: "center", fontSize: 8, margin: [0, 8, 0, 0] }),
+  };
 }
 
 export function createClassLookupExport(input: {
@@ -564,9 +708,44 @@ function createBrowserDownloadEnvironment(): DownloadEnvironment {
   };
 }
 
+function createPdfBlob(library: PdfLibrary, definition: PdfDocumentDefinition): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    try {
+      library.createPdf(definition).getBlob((blob) => resolve(new Blob([blob], { type: "application/pdf" })));
+    } catch (error) {
+      reject(error instanceof Error ? error : new Error("PDF generation failed"));
+    }
+  });
+}
+
+export async function downloadPdfExport(
+  model: ExportDocument,
+  locale: string,
+  labels: PdfExportLabels,
+  date = new Date(),
+  environment = createBrowserDownloadEnvironment(),
+  libraryLoader: PdfLibraryLoader = loadPdfMake,
+): Promise<void> {
+  const library = await libraryLoader();
+  const blob = await createPdfBlob(library, createPdfExportDefinition(model, locale, labels, date));
+  let url: string | undefined;
+  let anchor: DownloadAnchor | undefined;
+  try {
+    url = environment.createObjectURL(blob);
+    anchor = environment.createAnchor();
+    anchor.href = url;
+    anchor.download = buildExportFilename(model.surface, date, "pdf");
+    environment.appendAnchor(anchor);
+    anchor.click();
+  } finally {
+    anchor?.remove();
+    if (url) environment.revokeObjectURL(url);
+  }
+}
+
 export function downloadExport(
   model: ExportDocument,
-  format: ExportFormat,
+  format: TextExportFormat,
   date = new Date(),
   environment = createBrowserDownloadEnvironment(),
 ): void {
