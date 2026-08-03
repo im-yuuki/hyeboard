@@ -30,6 +30,8 @@ export type ExecuteBulkLookupOptions = {
   targets: readonly string[];
   signal: AbortSignal;
   initialProgress?: BulkLookupProgress;
+  modeMaxTargets?: Partial<Record<VnuBulkLookupMode, number>>;
+  directChunkMaxTargets?: number;
   requestChunk: (mode: VnuBulkLookupMode, targets: string[], signal: AbortSignal) => Promise<VnuBulkLookupItem[]>;
   onProgress?: (progress: BulkLookupProgress) => void;
 };
@@ -133,8 +135,16 @@ export function parseBulkTargets(raw: string, bulkMaxTargets?: number): ParsedBu
   return { targets };
 }
 
-export function chunkBulkTargets(mode: VnuBulkLookupMode, targets: readonly string[]): string[][] {
-  const size = mode === "code-to-stdid" ? 3 : 5;
+function validChunkMaximum(value: number | undefined): number | undefined {
+  return Number.isSafeInteger(value) && value! > 0 ? value : undefined;
+}
+
+export function chunkBulkTargets(
+  mode: VnuBulkLookupMode,
+  targets: readonly string[],
+  directChunkMaxTargets?: number,
+): string[][] {
+  const size = mode === "code-to-stdid" ? 3 : validChunkMaximum(directChunkMaxTargets) ?? 5;
   const chunks: string[][] = [];
   for (let index = 0; index < targets.length; index += size) chunks.push(targets.slice(index, index + size));
   return chunks;
@@ -151,7 +161,7 @@ export async function executeBulkLookup(options: ExecuteBulkLookupOptions): Prom
   let progress = { ...initialProgress, items: accumulatedItems };
   let completedTargets = 0;
 
-  for (const chunk of chunkBulkTargets(options.mode, options.targets)) {
+  for (const chunk of chunkBulkTargets(options.mode, options.targets, options.directChunkMaxTargets)) {
     if (options.signal.aborted) return { progress, remainingTargets: options.targets.slice(completedTargets), aborted: true, restoredWithoutReplay: false };
 
     let items: VnuBulkLookupItem[];

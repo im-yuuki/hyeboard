@@ -1,7 +1,7 @@
 import type { VnuExamCatalogRow, VnuExamTermInfo, VnuProfile, VnuTranscriptRow } from "@hyeboard/university-adapters/src/vnu/types";
 import { VNU_EXAM_TERMS } from "@hyeboard/university-adapters/src/vnu/exam-terms";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ExportMenu } from "@/components/export-menu";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -12,7 +12,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { Progress } from "@/components/ui/progress";
 import { Empty, FeatureFrame, SummaryStat, SummaryStrip } from "@/components/shared";
-import { ACCOUNT_SWITCHED_EVENT, api, ApiError, type VnuBulkLookupItem, type VnuBulkLookupMode, type VnuCrossTranscript, type VnuCrossTranscriptInput } from "@/lib/api";
+import { ACCOUNT_SWITCHED_EVENT, api, ApiError, type VnuBulkLookupItem, type VnuBulkLookupMode, type VnuCrossDetailComponent, type VnuCrossTranscript, type VnuCrossTranscriptInput } from "@/lib/api";
 import { deriveBulkLookupViewState, executeBulkLookup, parseBulkLookupItems, parseBulkLookupMode, parseBulkTargets, type BulkLookupProgress } from "@/lib/bulk-lookup";
 import { deriveCrossTranscriptInput, deriveCrossTranscriptView } from "@/lib/cross-transcript-view";
 import { createBulkExport, createClassLookupExport, createResolverLookupExport, createTranscriptExport, type ExportBulkItem, type ExportDerivedTerm, type ExportDocument, type ExportSurface } from "@/lib/data-export";
@@ -517,7 +517,7 @@ function transcriptAcademicSummaries(transcript?: VnuCrossTranscript): AcademicT
   ));
 }
 
-function CrossTranscriptTerm({ summary }: { summary: AcademicTermSummary<VnuTranscriptRow> }) {
+function CrossTranscriptTerm({ summary, permits, expandedPermit, details, onToggle }: { summary: AcademicTermSummary<VnuTranscriptRow>; permits: Map<string, string>; expandedPermit?: string; details: Map<string, VnuCrossDetailComponent[]>; onToggle: (permit: string) => void }) {
   const { t } = useLocale();
   const label = formatTermLabel(summary.termKey, "vnu", t.terms);
   return (
@@ -544,8 +544,12 @@ function CrossTranscriptTerm({ summary }: { summary: AcademicTermSummary<VnuTran
             </tr>
           </thead>
           <tbody className="divide-y divide-border">
-            {summary.courses.map((row, index) => (
-              <tr key={`${row.courseCode}-${row.classId ?? index}`}>
+            {summary.courses.map((row, index) => {
+              const permit = permits.get(`${summary.termKey}:${row.courseCode}:${row.classId ?? index}`);
+              const components = permit ? details.get(permit) : undefined;
+              const rowKey = `${row.courseCode}-${row.classId ?? index}`;
+              return <Fragment key={rowKey}>
+              <tr>
                 <td className="min-w-0 px-3 py-2">
                   <p className="break-words font-medium">{row.courseName}</p>
                   <p className="break-all font-mono text-xs text-muted-foreground">{row.courseCode}</p>
@@ -553,9 +557,11 @@ function CrossTranscriptTerm({ summary }: { summary: AcademicTermSummary<VnuTran
                 <td className="px-3 py-2 text-right tabular-nums">{row.credits ?? "-"}</td>
                 <td className="px-3 py-2 text-right tabular-nums">{row.grade10 ?? "-"}</td>
                 <td className="px-3 py-2 text-right"><Badge data-tone={row.letterGrade ? "neutral" : undefined} className="min-w-9 justify-center tabular-nums">{row.letterGrade ?? "-"}</Badge></td>
-                <td className="px-3 py-2 text-right tabular-nums">{row.grade4 ?? "-"}</td>
+                <td className="px-3 py-2 text-right tabular-nums">{row.grade4 ?? "-"}{permit ? <Button type="button" variant="ghost" size="sm" className="ml-1 min-h-8" aria-expanded={expandedPermit === permit} onClick={() => onToggle(permit)}>{t.lookup.crossDetailAction}</Button> : null}</td>
               </tr>
-            ))}
+              {permit && expandedPermit === permit ? <tr key={`${permit}-detail`}><td colSpan={5} className="px-3 py-3"><div className="space-y-1">{components ? components.length ? components.map((component) => <div key={component.index} className="flex justify-between gap-3 text-sm"><span>{component.index}. {component.nature}</span><span className="tabular-nums">{component.score ?? "-"}</span></div>) : <Empty text={t.lookup.pointDetailEmpty} /> : <Skeleton className="h-12" />}</div></td></tr> : null}
+              </Fragment>;
+            })}
           </tbody>
         </table>
       </div>
@@ -563,13 +569,16 @@ function CrossTranscriptTerm({ summary }: { summary: AcademicTermSummary<VnuTran
   );
 }
 
-function CrossTranscriptSection({ profile }: { profile: VnuProfile }) {
+function CrossTranscriptSection({ profile, crossDetailEnabled }: { profile: VnuProfile; crossDetailEnabled: boolean }) {
   const { t } = useLocale();
   const state = useHyeboard();
   const [mode, setMode] = useState<VnuCrossTranscriptInput["mode"]>("stdId");
   const [stdId, setStdId] = useState("");
   const [stdCode, setStdCode] = useState("");
   const [submitted, setSubmitted] = useState<VnuCrossTranscriptInput | null>(null);
+  const [expandedPermit, setExpandedPermit] = useState<string>();
+  const [details, setDetails] = useState<Map<string, VnuCrossDetailComponent[]>>(new Map());
+  const detailRequest = useRef<AbortController | undefined>(undefined);
   const inputState = deriveCrossTranscriptInput(mode, mode === "stdId" ? stdId : stdCode, profile);
 
   const transcriptQuery = useQuery({
@@ -581,9 +590,51 @@ function CrossTranscriptSection({ profile }: { profile: VnuProfile }) {
     enabled: Boolean(submitted),
   });
   const derivedTerms = useMemo(() => transcriptAcademicSummaries(transcriptQuery.data), [transcriptQuery.data]);
+  const permits = useMemo(() => {
+    const mapped = new Map<string, string>();
+    if (!crossDetailEnabled) return mapped;
+    for (const permit of transcriptQuery.data?.detailPermits ?? []) {
+      const term = transcriptQuery.data?.terms[permit.termIndex];
+      const row = term?.rows[permit.rowIndex];
+      if (term && row) mapped.set(`${term.maHK}:${row.courseCode}:${row.classId ?? permit.rowIndex}`, permit.permit);
+    }
+    return mapped;
+  }, [crossDetailEnabled, transcriptQuery.data]);
+
+  const clearDetailState = useCallback(() => {
+    detailRequest.current?.abort();
+    detailRequest.current = undefined;
+    setExpandedPermit(undefined);
+    setDetails(new Map());
+  }, []);
+  useEffect(() => {
+    clearDetailState();
+    const clearForAccount = () => clearDetailState();
+    window.addEventListener(ACCOUNT_SWITCHED_EVENT, clearForAccount);
+    return () => {
+      window.removeEventListener(ACCOUNT_SWITCHED_EVENT, clearForAccount);
+      clearDetailState();
+    };
+  }, [clearDetailState, state.sessionNonce, state.universityId]);
+  const toggleDetail = (permit: string) => {
+    if (expandedPermit === permit) { clearDetailState(); return; }
+    detailRequest.current?.abort();
+    const controller = new AbortController();
+    detailRequest.current = controller;
+    setExpandedPermit(permit);
+    if (details.has(permit)) return;
+    void api.vnuCrossDetail(permit, controller.signal)
+      .then((components) => {
+        if (!controller.signal.aborted) setDetails((current) => new Map(current).set(permit, components));
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) clearDetailState();
+      });
+  };
 
   const submit = () => {
     if (!inputState.target) return;
+    clearDetailState();
     setSubmitted(inputState.target);
   };
   const transcriptView = deriveCrossTranscriptView({
@@ -626,8 +677,8 @@ function CrossTranscriptSection({ profile }: { profile: VnuProfile }) {
         {transcriptExportModel ? <ExportMenu model={transcriptExportModel} /> : null}
       </div>
         <div className="grid min-h-11 grid-cols-2 rounded-lg border border-border p-1 sm:inline-grid" role="group" aria-label={t.lookup.crossTranscriptModeLabel}>
-          <Button type="button" size="sm" variant={mode === "stdId" ? "default" : "ghost"} className="min-h-11" aria-pressed={mode === "stdId"} onClick={() => { setMode("stdId"); setSubmitted(null); }}>{t.lookup.crossTranscriptStdIdMode}</Button>
-          <Button type="button" size="sm" variant={mode === "stdCode" ? "default" : "ghost"} className="min-h-11" aria-pressed={mode === "stdCode"} onClick={() => { setMode("stdCode"); setSubmitted(null); }}>{t.lookup.crossTranscriptStdCodeMode}</Button>
+          <Button type="button" size="sm" variant={mode === "stdId" ? "default" : "ghost"} className="min-h-11" aria-pressed={mode === "stdId"} onClick={() => { clearDetailState(); setMode("stdId"); setSubmitted(null); }}>{t.lookup.crossTranscriptStdIdMode}</Button>
+          <Button type="button" size="sm" variant={mode === "stdCode" ? "default" : "ghost"} className="min-h-11" aria-pressed={mode === "stdCode"} onClick={() => { clearDetailState(); setMode("stdCode"); setSubmitted(null); }}>{t.lookup.crossTranscriptStdCodeMode}</Button>
         </div>
         <form className="grid gap-3 sm:grid-cols-[1fr_auto]" onSubmit={(event) => { event.preventDefault(); submit(); }}>
           <div className="space-y-1.5">
@@ -665,7 +716,7 @@ function CrossTranscriptSection({ profile }: { profile: VnuProfile }) {
                 <SummaryStat label={t.lookup.crossTranscriptAccumulatedCredits} value={transcriptView.transcript.totals.accumulatedCredits ?? "-"} />
                 <SummaryStat label={t.lookup.crossTranscriptGpa4} value={transcriptView.transcript.totals.gpa4 ?? "-"} />
               </SummaryStrip>
-              {transcriptView.derivedTerms.map((summary) => <CrossTranscriptTerm key={summary.termKey} summary={summary} />)}
+              {transcriptView.derivedTerms.map((summary) => <CrossTranscriptTerm key={summary.termKey} summary={summary} permits={permits} expandedPermit={expandedPermit} details={details} onToggle={toggleDetail} />)}
             </div>
           ) : null}</div>
     </section>
@@ -674,7 +725,7 @@ function CrossTranscriptSection({ profile }: { profile: VnuProfile }) {
 
 type StudentLookupMode = "id-to-code" | "code-to-id" | "transcript";
 
-function StudentRecordTools({ profile, crossLookupEnabled }: { profile: VnuProfile; crossLookupEnabled: boolean }) {
+function StudentRecordTools({ profile, crossLookupEnabled, crossDetailEnabled }: { profile: VnuProfile; crossLookupEnabled: boolean; crossDetailEnabled: boolean }) {
   const { t } = useLocale();
   const [mode, setMode] = useState<StudentLookupMode>("id-to-code");
   return (
@@ -700,7 +751,7 @@ function StudentRecordTools({ profile, crossLookupEnabled }: { profile: VnuProfi
                 <Button type="button" variant={mode === "transcript" ? "default" : "ghost"} className="min-h-11 min-w-0 whitespace-normal px-2" aria-pressed={mode === "transcript"} onClick={() => setMode("transcript")}>{t.lookup.studentModeTranscript}</Button>
               </div>
             </div>
-            {mode === "id-to-code" ? <CrossStudentCodeSection profile={profile} /> : mode === "code-to-id" ? <CrossStudentIdSection profile={profile} /> : <CrossTranscriptSection profile={profile} />}
+            {mode === "id-to-code" ? <CrossStudentCodeSection profile={profile} /> : mode === "code-to-id" ? <CrossStudentIdSection profile={profile} /> : <CrossTranscriptSection profile={profile} crossDetailEnabled={crossDetailEnabled} />}
           </>
         ) : null}
       </CardContent>
@@ -810,7 +861,7 @@ function createdBulkExportItems(model: ExportDocument): ExportBulkItem[] {
 
 const BULK_RESULTS_PAGE_SIZE = 50;
 
-function BulkLookupSection({ maximum, freshnessKey }: { maximum: number; freshnessKey: string }) {
+function BulkLookupSection({ maximum, modeMaximums, directChunkMaximum, freshnessKey }: { maximum: number; modeMaximums?: Partial<Record<VnuBulkLookupMode, number>>; directChunkMaximum?: number; freshnessKey: string }) {
   const { locale, t } = useLocale();
   const state = useHyeboard();
   const [mode, setMode] = useState<VnuBulkLookupMode>("stdid-to-code");
@@ -829,7 +880,8 @@ function BulkLookupSection({ maximum, freshnessKey }: { maximum: number; freshne
   const exportItems = useRef<ExportBulkItem[]>([]);
   const termDictionary = useRef(t.terms);
   termDictionary.current = t.terms;
-  const parsed = useMemo(() => parseBulkTargets(rawTargets, maximum), [rawTargets, maximum]);
+  const activeMaximum = modeMaximums?.[mode] ?? maximum;
+  const parsed = useMemo(() => parseBulkTargets(rawTargets, activeMaximum), [rawTargets, activeMaximum]);
   const viewState = deriveBulkLookupViewState(parsed, active, progress.processed);
   const lastPageStart = Math.floor(Math.max(0, progress.items.length - 1) / BULK_RESULTS_PAGE_SIZE) * BULK_RESULTS_PAGE_SIZE;
   const effectivePageStart = Math.min(resultPageStart, lastPageStart);
@@ -930,6 +982,8 @@ function BulkLookupSection({ maximum, freshnessKey }: { maximum: number; freshne
         targets: pendingTargets,
         signal: controller.signal,
         initialProgress,
+        modeMaxTargets: modeMaximums,
+        directChunkMaxTargets: directChunkMaximum,
         requestChunk: async (requestMode, targets, signal) => {
           if (generation.current !== runGeneration || abortController.current !== controller) throw new Error("Stale bulk lookup run");
           return parseBulkLookupItems(requestMode, await api.vnuCrossLookupBulk(requestMode, targets, signal));
@@ -972,7 +1026,7 @@ function BulkLookupSection({ maximum, freshnessKey }: { maximum: number; freshne
   };
 
   const validationMessage = parsed.error === "tooMany"
-    ? t.lookup.bulkTooMany(maximum)
+    ? t.lookup.bulkTooMany(activeMaximum)
     : t.lookup.bulkEmpty;
   const requestErrorMessage = requestError === "VNU_RATE_LIMITED"
     ? t.lookup.bulkRateLimited
@@ -1054,6 +1108,10 @@ export function LookupPage() {
   const activeUniversity = state.universities.data?.find((university) => university.id === state.universityId);
   const crossLookupEnabled = activeUniversity?.capabilities.crossLookup === true;
   const bulkMaximum = activeUniversity?.limits?.crossLookup?.bulkMaxTargets;
+  const bulkDirectChunkMaximum = activeUniversity?.limits?.crossLookup?.bulkDirectChunkMaxTargets;
+  const bulkModeMaximums = activeUniversity?.limits?.crossLookup?.bulkModeMaxTargets;
+  const crossDetailEnabled = Number.isSafeInteger(activeUniversity?.limits?.crossLookup?.crossDetail?.maxRows)
+    && activeUniversity!.limits!.crossLookup!.crossDetail!.maxRows > 0;
   const bulkLookupEnabled = crossLookupEnabled && Number.isSafeInteger(bulkMaximum) && bulkMaximum! > 0;
   const bulkFreshnessKey = `${state.universityId}:${state.activeAccountId ?? "no-account"}`;
 
@@ -1062,8 +1120,8 @@ export function LookupPage() {
       {(profile) => (
         <div className="space-y-6">
           <ClassIdentifierTools />
-          <StudentRecordTools profile={profile} crossLookupEnabled={crossLookupEnabled} />
-          {bulkLookupEnabled ? <BulkLookupSection key={bulkFreshnessKey} maximum={bulkMaximum!} freshnessKey={bulkFreshnessKey} /> : null}
+          <StudentRecordTools profile={profile} crossLookupEnabled={crossLookupEnabled} crossDetailEnabled={crossDetailEnabled} />
+          {bulkLookupEnabled ? <BulkLookupSection key={bulkFreshnessKey} maximum={bulkMaximum!} modeMaximums={bulkModeMaximums} directChunkMaximum={bulkDirectChunkMaximum} freshnessKey={bulkFreshnessKey} /> : null}
         </div>
       )}
     </FeatureFrame>

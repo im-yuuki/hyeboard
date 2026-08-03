@@ -1,5 +1,5 @@
 import { configureLogger, createVnuRefreshGrant, decryptSession, decryptSessionForVnuLogout, decryptVnuRefreshGrant, encryptSession, encryptVnuRefreshGrant, HyeboardError, VNU_REFRESH_GRANT_MAX_LENGTH, type EncryptedSessionPayload } from "@hyeboard/core";
-import { DaotaoClient } from "@hyeboard/university-adapters";
+import { DaotaoClient, parseGradesHtml } from "@hyeboard/university-adapters";
 import { authResultSchema } from "@hyeboard/schemas";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -17,6 +17,7 @@ import { createApp, createCaptchaRelayToken, requestLogPath, resolveSession, set
 import { LocalCaptchaRelayCoordinator, type CaptchaRelayCoordinator } from "./captcha-relay";
 import { selfHostedRuntimeConfig } from "./start";
 import type { VnuProbeBudgetCoordinator } from "./vnu-probe-budget";
+import { createVnuCrossDetailMinter } from "./vnu-cross-detail";
 import {
   applyAbortRefresh,
   applyActivatePair,
@@ -482,14 +483,102 @@ function vnuProfileHtml(studentCode = VNU_STUDENT_CODE): string {
   return studentCode ? `<input name="StdCode" value="${studentCode}">` : "<html><body>Synthetic profile without identity</body></html>";
 }
 
+const XHTML_VNU_NOTIFICATION_EXPIRY_HTML = `
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><title>Thông báo</title></head>
+  <body>
+    <p><br>Bạn chưa đăng nhập hoặc phiên làm việc của bạn đã hết<br><br>Xin vui lòng bấm <a href="http://daotao.vnu.edu.vn/dkmh/login.asp">vào đây</a> để đăng nhập lại<br></p>
+  </body>
+</html>
+`;
+
 class TestVnuProbeBudget implements VnuProbeBudgetCoordinator {
   readonly identities: string[] = [];
   readonly amounts: number[] = [];
   readonly consumedAmounts: number[] = [];
   readonly reservedAmounts: number[] = [];
   readonly counts = new Map<string, number>();
+  readonly activeLeases = new Map<string, { sessionIdentity: string; expiresAt: number }>();
+  readonly releasedLeases: string[] = [];
+  readonly crossDetailPermits = new Map<string, import("./vnu-probe-budget").VnuCrossDetailPermitRecord>();
+  readonly consumedCrossDetailPermits = new Set<string>();
+  readonly releasedCrossDetailLeases: string[] = [];
+  private readonly pendingAcquires: Array<{
+    sessionIdentity: string;
+    resolve: (permit: { leaseId: string; expiresAt: number }) => void;
+    reject: (reason: unknown) => void;
+    signal?: AbortSignal;
+    onAbort?: () => void;
+  }> = [];
+  private nextLeaseNumber = 0;
+  peakActiveLeases = 0;
+  permitCap: number;
+  onPermitQueued?: () => void;
   limit = Number.POSITIVE_INFINITY;
   unavailable = false;
+
+  constructor(permitCap = 6) {
+    this.permitCap = permitCap;
+  }
+
+  async acquireBrc1Permit(sessionIdentity: string, signal?: AbortSignal): Promise<{ leaseId: string; expiresAt: number }> {
+    if (this.unavailable) throw new Error("synthetic budget outage");
+    if (signal?.aborted) throw signal.reason ?? new DOMException("This operation was aborted", "AbortError");
+    if (this.hasPermitCapacity(sessionIdentity)) return this.grantPermit(sessionIdentity);
+
+    return new Promise((resolve, reject) => {
+      const pending: (typeof this.pendingAcquires)[number] = { sessionIdentity, resolve, reject, signal };
+      const onAbort = (): void => {
+        const index = this.pendingAcquires.indexOf(pending);
+        if (index >= 0) this.pendingAcquires.splice(index, 1);
+        reject(signal!.reason ?? new DOMException("This operation was aborted", "AbortError"));
+      };
+      pending.onAbort = onAbort;
+      this.pendingAcquires.push(pending);
+      this.onPermitQueued?.();
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
+  async releaseBrc1Permit(sessionIdentity: string, leaseId: string): Promise<void> {
+    const lease = this.activeLeases.get(leaseId);
+    if (!lease || lease.sessionIdentity !== sessionIdentity) return;
+    this.activeLeases.delete(leaseId);
+    this.releasedLeases.push(leaseId);
+    this.drainSession(sessionIdentity);
+  }
+
+  async issueCrossDetailPermits(_sessionIdentity: string, permits: import("./vnu-probe-budget").VnuCrossDetailIssuedPermit[]): Promise<void> {
+    for (const permit of permits) this.crossDetailPermits.set(permit.permitHash, permit.record);
+  }
+
+  async consumeCrossDetailPermit(_sessionIdentity: string, input: import("./vnu-probe-budget").VnuCrossDetailConsumeInput): Promise<{ leaseId: string; expiresAt: number; envelope: string }> {
+    const record = this.crossDetailPermits.get(input.permitHash);
+    const matches = record !== undefined
+      && !this.consumedCrossDetailPermits.has(input.permitHash)
+      && record.nonce === input.nonce
+      && record.requesterHmac === input.requesterHmac
+      && record.targetHmac === input.targetHmac
+      && record.revisionHmac === input.revisionHmac
+      && record.rowHmac === input.rowHmac
+      && record.policyVersion === input.policyVersion;
+    if (!matches) throw new HyeboardError("VNU_CROSS_DETAIL_PERMIT_INVALID", "The cross-detail permit is invalid or expired.", 403);
+    this.consumedCrossDetailPermits.add(input.permitHash);
+    return { leaseId: (this.consumedCrossDetailPermits.size).toString(16).padStart(32, "0"), expiresAt: Date.now() + 60_000, envelope: record.envelope };
+  }
+
+  async releaseCrossDetailLease(_sessionIdentity: string, leaseId: string): Promise<void> {
+    this.releasedCrossDetailLeases.push(leaseId);
+  }
+
+  get activeLeaseCount(): number {
+    return this.activeLeases.size;
+  }
+
+  get pendingPermitCount(): number {
+    return this.pendingAcquires.length;
+  }
 
   get count(): number {
     return [...this.counts.values()].reduce((total, count) => total + count, 0);
@@ -518,6 +607,32 @@ class TestVnuProbeBudget implements VnuProbeBudgetCoordinator {
       });
     }
     this.counts.set(sessionIdentity, count + amount);
+  }
+
+  private hasPermitCapacity(sessionIdentity: string): boolean {
+    return [...this.activeLeases.values()].filter((lease) => lease.sessionIdentity === sessionIdentity).length < this.permitCap;
+  }
+
+  private grantPermit(sessionIdentity: string): { leaseId: string; expiresAt: number } {
+    const leaseId = (++this.nextLeaseNumber).toString(16).padStart(32, "0");
+    const expiresAt = Date.now() + 65_000;
+    this.activeLeases.set(leaseId, { sessionIdentity, expiresAt });
+    this.peakActiveLeases = Math.max(this.peakActiveLeases, this.activeLeases.size);
+    return { leaseId, expiresAt };
+  }
+
+  private drainSession(sessionIdentity: string): void {
+    while (this.hasPermitCapacity(sessionIdentity)) {
+      const index = this.pendingAcquires.findIndex((pending) => pending.sessionIdentity === sessionIdentity);
+      if (index < 0) return;
+      const pending = this.pendingAcquires.splice(index, 1)[0];
+      pending.signal?.removeEventListener("abort", pending.onAbort!);
+      if (pending.signal?.aborted) {
+        pending.reject(pending.signal.reason ?? new DOMException("This operation was aborted", "AbortError"));
+        continue;
+      }
+      pending.resolve(this.grantPermit(sessionIdentity));
+    }
   }
 
 }
@@ -2444,20 +2559,22 @@ describe("VNU import session cache", () => {
     examSpy.mockRestore();
   });
 
-  it("returns the exact profile-incomplete envelope for point detail without an own internal ID", async () => {
+  it("uses the transcript detail selector instead of the unequal profile identifier", async () => {
     const imported = await importVnu(app);
-    profileSpy.mockResolvedValueOnce(`<input name="StdCode" value="PRIVATE_STUDENT_CODE_SENTINEL">`);
-    const pointSpy = vi.spyOn(DaotaoClient.prototype, "getPointDetailHtml");
+    profileSpy.mockResolvedValueOnce(`<input name="hidStdID" value="99999999999">`);
+    gradesSpy = vi.spyOn(DaotaoClient.prototype, "getGradesHtml").mockResolvedValue(`<table>
+      <tr><td>HỌC KỲ 1. MÃ HỌC KỲ 251</td></tr>
+      <tr><td>1</td><td>INT1001</td><td>Synthetic Course</td><td>3</td><td>8</td><td>B</td><td>3</td><td><img onclick="detailPoint('123456','8','00000000001','42')"></td></tr>
+    </table>`);
+    const pointSpy = vi.spyOn(DaotaoClient.prototype, "getPointDetailHtml").mockResolvedValue("<table></table>");
 
-    const response = await app.handle(new Request("http://localhost/api/vnu/raw/point-detail?id=PRIVATE_CLASS_ID_SENTINEL&Term=1", {
+    const response = await app.handle(new Request("http://localhost/api/vnu/raw/point-detail?id=123456&Term=42", {
       headers: { Authorization: `Bearer ${imported.token}` },
     }));
-    const responseText = await response.text();
 
-    expect(response.status).toBe(500);
-    expect(JSON.parse(responseText)).toEqual({ data: null, error: { code: "VNU_PROFILE_INCOMPLETE", message: "The university portal profile is incomplete." } });
-    for (const privateValue of ["PRIVATE_STUDENT_CODE_SENTINEL", "PRIVATE_CLASS_ID_SENTINEL"]) expect(responseText).not.toContain(privateValue);
-    expect(pointSpy).not.toHaveBeenCalled();
+    expect(response.status).toBe(200);
+    expect(profileSpy).not.toHaveBeenCalled();
+    expect(pointSpy).toHaveBeenCalledWith({ id: "123456", stdId: "00000000001", term: "42", val: undefined });
     pointSpy.mockRestore();
   });
 
@@ -2475,9 +2592,12 @@ describe("VNU import session cache", () => {
     examSpy.mockRestore();
   });
 
-  it("derives own point-detail identity server-side and ignores browser overrides", async () => {
+  it("ignores browser point-detail selector overrides", async () => {
     const imported = await importVnu(app);
-    profileSpy.mockResolvedValueOnce(`<input name="hidStdID" value="99000000001">`);
+    gradesSpy = vi.spyOn(DaotaoClient.prototype, "getGradesHtml").mockResolvedValue(`<table>
+      <tr><td>HỌC KỲ 1. MÃ HỌC KỲ 251</td></tr>
+      <tr><td>1</td><td>INT1001</td><td>Synthetic Course</td><td>3</td><td>8</td><td>B</td><td>3</td><td><img onclick="detailPoint('123456','8','00000000001','42')"></td></tr>
+    </table>`);
     const pointSpy = vi.spyOn(DaotaoClient.prototype, "getPointDetailHtml").mockResolvedValue("<table></table>");
 
     const response = await app.handle(new Request("http://localhost/api/vnu/raw/point-detail?id=123456&Term=42&selStd=ATTACKER&val=9.9", {
@@ -2485,7 +2605,94 @@ describe("VNU import session cache", () => {
     }));
 
     expect(response.status).toBe(200);
-    expect(pointSpy).toHaveBeenCalledWith({ id: "123456", stdId: "99000000001", term: "42", val: undefined });
+    expect(pointSpy).toHaveBeenCalledWith({ id: "123456", stdId: "00000000001", term: "42", val: undefined });
+    pointSpy.mockRestore();
+  });
+
+  it("sanitizes the browser grades response while retaining the cached selector for point detail", async () => {
+    const imported = await importVnu(app);
+    const selector = "00000000001";
+    gradesSpy = vi.spyOn(DaotaoClient.prototype, "getGradesHtml").mockResolvedValue(`<table>
+      <tr><td>HỌC KỲ 1. MÃ HỌC KỲ 251</td></tr>
+      <tr><td>1</td><td>INT1001</td><td>Synthetic Course</td><td>3</td><td>8</td><td>B</td><td>3</td><td><img onclick="detailPoint('123456','8','${selector}','42')"></td></tr>
+    </table>`);
+    const pointSpy = vi.spyOn(DaotaoClient.prototype, "getPointDetailHtml").mockResolvedValue("<table></table>");
+
+    const gradesResponse = await getVnuRawPage(app, imported.token);
+    const gradesBody = await gradesResponse.json() as { data: { html: string } };
+    const detailResponse = await app.handle(new Request("http://localhost/api/vnu/raw/point-detail?id=123456&Term=42", {
+      headers: { Authorization: `Bearer ${imported.token}` },
+    }));
+
+    expect(gradesResponse.status).toBe(200);
+    expect(gradesBody.data.html).toContain("detailPoint('123456','8','','42')");
+    expect(gradesBody.data.html).not.toContain(selector);
+    expect(detailResponse.status).toBe(200);
+    expect(gradesSpy).toHaveBeenCalledTimes(1);
+    expect(pointSpy).toHaveBeenCalledWith({ id: "123456", stdId: selector, term: "42", val: undefined });
+    pointSpy.mockRestore();
+  });
+
+  it.each([
+    ["canonical", `detailPoint('123456','8','00000000001','42')`, `detailPoint('123456','8','','42')`, true],
+    ["extra argument", `detailPoint('123456','8','00000000001','42','extra')`, `detailPoint('123456','8','','42','extra')`, false],
+    ["malformed tail", `detailPoint('123456','8','00000000001','42', malformed)`, `detailPoint('123456','8','','42', malformed)`, false],
+    ["unquoted selector position", `detailPoint('123456','8', malformed, '00000000001','42')`, "void 0", false],
+  ])("redacts the selector from a %s grades handler", async (_case, handler, expectedBrowserHandler, isCanonical) => {
+    const imported = await importVnu(app);
+    const selector = "00000000001";
+    gradesSpy = vi.spyOn(DaotaoClient.prototype, "getGradesHtml").mockResolvedValue(`<table>
+      <tr><td>HỌC KỲ 1. MÃ HỌC KỲ 251</td></tr>
+      <tr><td>1</td><td>INT1001</td><td>Synthetic Course</td><td>3</td><td>8</td><td>B</td><td>3</td><td><img onclick="${handler}"></td></tr>
+    </table>`);
+
+    const response = await getVnuRawPage(app, imported.token);
+    const body = await response.json() as { data: { html: string } };
+
+    expect(response.status).toBe(200);
+    expect(body.data.html).not.toContain(selector);
+    expect(body.data.html).toContain(expectedBrowserHandler);
+    if (isCanonical) expect(parseGradesHtml(body.data.html).rows[0]).toMatchObject({ classId: "123456", termOrdinal: "42" });
+  });
+
+  it.each([
+    ["missing", `<table></table>`],
+    ["malformed", `<table><tr><td>HỌC KỲ 1. MÃ HỌC KỲ 251</td></tr><tr><td>1</td><td>INT1001</td><td>Synthetic Course</td><td>3</td><td>8</td><td>B</td><td>3</td><td><img onclick="detailPoint('123456','8','not-numeric','42')"></td></tr></table>`],
+    ["ambiguous", `<table><tr><td>HỌC KỲ 1. MÃ HỌC KỲ 251</td></tr><tr><td>1</td><td>INT1001</td><td>Synthetic Course</td><td>3</td><td>8</td><td>B</td><td>3</td><td><img onclick="detailPoint('123456','8','00000000001','42')"></td></tr><tr><td>2</td><td>INT1002</td><td>Synthetic Course</td><td>3</td><td>8</td><td>B</td><td>3</td><td><img onclick="detailPoint('123456','8','00000000002','42')"></td></tr></table>`],
+  ])("rejects %s point-detail selector without upstream access", async (_case, gradesHtml) => {
+    const imported = await importVnu(app);
+    gradesSpy = vi.spyOn(DaotaoClient.prototype, "getGradesHtml").mockResolvedValue(gradesHtml);
+    const pointSpy = vi.spyOn(DaotaoClient.prototype, "getPointDetailHtml");
+
+    const response = await app.handle(new Request("http://localhost/api/vnu/raw/point-detail?id=123456&Term=42", {
+      headers: { Authorization: `Bearer ${imported.token}` },
+    }));
+
+    expect(response.status).toBe(404);
+    await expect(response.json()).resolves.toEqual({
+      data: null,
+      error: { code: "VNU_POINT_DETAIL_NOT_AVAILABLE", message: "Point detail is not available for this course." },
+    });
+    expect(pointSpy).not.toHaveBeenCalled();
+    pointSpy.mockRestore();
+  });
+
+  it("reuses cached own grades across point-detail lookups", async () => {
+    const imported = await importVnu(app);
+    gradesSpy = vi.spyOn(DaotaoClient.prototype, "getGradesHtml").mockResolvedValue(`<table>
+      <tr><td>HỌC KỲ 1. MÃ HỌC KỲ 251</td></tr>
+      <tr><td>1</td><td>INT1001</td><td>Synthetic Course</td><td>3</td><td>8</td><td>B</td><td>3</td><td><img onclick="detailPoint('123456','8','00000000001','42')"></td></tr>
+      <tr><td>2</td><td>INT1002</td><td>Synthetic Course</td><td>3</td><td>8</td><td>B</td><td>3</td><td><img onclick="detailPoint('654321','8','00000000001','42')"></td></tr>
+    </table>`);
+    const pointSpy = vi.spyOn(DaotaoClient.prototype, "getPointDetailHtml").mockResolvedValue("<table></table>");
+
+    const first = await app.handle(new Request("http://localhost/api/vnu/raw/point-detail?id=123456&Term=42", { headers: { Authorization: `Bearer ${imported.token}` } }));
+    const second = await app.handle(new Request("http://localhost/api/vnu/raw/point-detail?id=654321&Term=42", { headers: { Authorization: `Bearer ${imported.token}` } }));
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(gradesSpy).toHaveBeenCalledTimes(1);
+    expect(pointSpy).toHaveBeenCalledTimes(2);
     pointSpy.mockRestore();
   });
 
@@ -2685,15 +2892,10 @@ describe("VNU import session cache", () => {
     expect(responseText).not.toContain(expiryNotice);
   });
 
-  it("does not cache or expose a runtime VNU_SESSION_EXPIRED response", async () => {
-    const expiryNoticeSentinel = "SYNTHETIC_EXPIRY_NOTICE_SENTINEL";
+  it("returns VNU_SESSION_EXPIRED instead of caching or exposing a raw grades paragraph HTTP expiry response", async () => {
     const expiryNotice = "Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.";
-    const expiryNoticeHtml = `<html><body><table data-synthetic-marker="${expiryNoticeSentinel}"><tr><td>${expiryNotice}</td></tr></table></body></html>`;
-    let upstreamHtmlAtFetchBoundary: string | undefined;
-    const upstreamFetch = vi.fn(async () => {
-      upstreamHtmlAtFetchBoundary = expiryNoticeHtml;
-      return new Response(upstreamHtmlAtFetchBoundary, { status: 200, headers: { "Content-Type": "text/html" } });
-    });
+    const expiryNoticeHtml = `<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Phiên làm việc đã kết thúc.<br />Vui lòng đăng nhập lại hệ thống.<br /><a href="http://daotao.vnu.edu.vn/dkmh/login.asp">Sign in</a><br /></p></body></html>`;
+    const upstreamFetch = vi.fn(async () => new Response(expiryNoticeHtml, { status: 200, headers: { "Content-Type": "text/html" } }));
     const outward = await importVnu(app);
     gradesSpy = vi.spyOn(DaotaoClient.prototype, "getGradesHtml");
     vi.stubGlobal("fetch", upstreamFetch);
@@ -2702,17 +2904,84 @@ describe("VNU import session cache", () => {
     const responseText = await response.text();
 
     expect(response.status).toBe(401);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
     expect(JSON.parse(responseText)).toMatchObject({
       data: null,
       error: { code: "VNU_SESSION_EXPIRED" },
     });
-    expect(upstreamHtmlAtFetchBoundary).toContain(expiryNoticeSentinel);
-    expect(upstreamHtmlAtFetchBoundary).toContain(expiryNotice);
-    expect(responseText).not.toContain(expiryNoticeSentinel);
     expect(responseText).not.toContain(expiryNotice);
     expect(cache.rawUrls()).toEqual([]);
     expect(gradesSpy).toHaveBeenCalledTimes(1);
     expect(upstreamFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["profile", "/StdInfo/TabStdSelf.asp"],
+    ["grades", "/ListPoint/listpoint_Brc1.asp"],
+    ["progress", "/StdInfo/TabStdStudy.asp"],
+  ])("returns VNU_SESSION_EXPIRED for the exact XHTML notification variant on raw %s", async (page, upstreamPath) => {
+    const imported = await importVnu(app);
+    profileSpy.mockRestore();
+    const upstreamFetch = vi.fn(async () => new Response(XHTML_VNU_NOTIFICATION_EXPIRY_HTML, {
+      status: 200,
+      headers: { "Content-Type": "text/html" },
+    }));
+    vi.stubGlobal("fetch", upstreamFetch);
+
+    const response = await getVnuRawPage(app, imported.token, page);
+    const responseText = await response.text();
+
+    expect(upstreamFetch).toHaveBeenCalledTimes(1);
+    expect(response.status).toBe(401);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(JSON.parse(responseText)).toMatchObject({
+      data: null,
+      error: { code: "VNU_SESSION_EXPIRED" },
+    });
+    expect(responseText).not.toContain(XHTML_VNU_NOTIFICATION_EXPIRY_HTML);
+    expect(cache.rawUrls()).toEqual([]);
+    expect(upstreamFetch).toHaveBeenCalledWith(`https://daotao.vnu.edu.vn${upstreamPath}`, expect.anything());
+  });
+
+  it.each([
+    ["HTTPS default port", "https://daotao.vnu.edu.vn:443/dkmh/login.asp"],
+    ["HTTP default port", "http://daotao.vnu.edu.vn:80/dkmh/login.asp"],
+    ["HTTPS non-default port", "https://daotao.vnu.edu.vn:8443/dkmh/login.asp"],
+    ["HTTP non-default port", "http://daotao.vnu.edu.vn:8080/dkmh/login.asp"],
+  ])("returns raw grades HTML instead of an expiry error for a strict paragraph notice with an explicit %s", async (_port, href) => {
+    const html = `<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Phiên làm việc đã kết thúc.<br />Vui lòng đăng nhập lại hệ thống.<br /><a href="${href}">Sign in</a><br /></p></body></html>`;
+    const upstreamFetch = vi.fn(async () => new Response(html, { status: 200, headers: { "Content-Type": "text/html" } }));
+    const imported = await importVnu(app);
+    profileSpy.mockRestore();
+    vi.stubGlobal("fetch", upstreamFetch);
+
+    const response = await getVnuRawPage(app, imported.token);
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ data: { html }, error: null });
+    expect(upstreamFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["profile", "/StdInfo/TabStdSelf.asp"],
+    ["grades", "/ListPoint/listpoint_Brc1.asp"],
+    ["progress", "/StdInfo/TabStdStudy.asp"],
+  ])("normalizes a strict legacy HTTP 200 expiry page for raw %s without caching it", async (page, upstreamPath) => {
+    const legacyExpiryHtml = `<html><body><table><tr><td>Phi&#xEA;n l&#224;m vi&#7879;c &#273;&#227; k&#7871;t th&#250;c. Vui&nbsp;l&#242;ng &#273;&#259;ng nh&#7853;p l&#7841;i h&#7879; th&#7889;ng.</td></tr></table></body></html>`;
+    const imported = await importVnu(app);
+    profileSpy.mockRestore();
+    const upstreamFetch = vi.fn(async () => new Response(legacyExpiryHtml, { status: 200, headers: { "Content-Type": "text/html" } }));
+    vi.stubGlobal("fetch", upstreamFetch);
+
+    const response = await getVnuRawPage(app, imported.token, page);
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({
+      data: null,
+      error: { code: "VNU_SESSION_EXPIRED", message: "The university portal session has expired. Sign in again." },
+    });
+    expect(upstreamFetch).toHaveBeenCalledWith(`https://daotao.vnu.edu.vn${upstreamPath}`, expect.anything());
+    expect(cache.rawUrls()).toEqual([]);
   });
 
   it("rejects a legacy expiry page from the raw cache without an upstream call or notice leak", async () => {
@@ -2737,6 +3006,7 @@ describe("VNU import session cache", () => {
     const responseText = await response.text();
 
     expect(response.status).toBe(401);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
     expect(JSON.parse(responseText)).toMatchObject({ data: null, error: { code: "VNU_SESSION_EXPIRED" } });
     expect(responseText).not.toContain(expiryNoticeSentinel);
     expect(responseText).not.toContain(expiryNotice);
@@ -2974,16 +3244,17 @@ describe("VNU cross-transcript route", () => {
     }));
   }
 
-  async function bulkRequest(body: unknown, session: EncryptedSessionPayload = { ...vnuSession(), vnu: { ...vnuSession().vnu!, value: "SYNTHETIC_TRANSCRIPT_COOKIE" } }): Promise<Response> {
-    return bulkRawRequest(JSON.stringify(body), session);
+  async function bulkRequest(body: unknown, session: EncryptedSessionPayload = { ...vnuSession(), vnu: { ...vnuSession().vnu!, value: "SYNTHETIC_TRANSCRIPT_COOKIE" } }, signal?: AbortSignal): Promise<Response> {
+    return bulkRawRequest(JSON.stringify(body), session, signal);
   }
 
-  async function bulkRawRequest(body: string, session?: EncryptedSessionPayload): Promise<Response> {
+  async function bulkRawRequest(body: string, session?: EncryptedSessionPayload, signal?: AbortSignal): Promise<Response> {
     const token = session ? await encryptSession(session, SESSION_SECRET) : undefined;
     return app.handle(new Request("http://localhost/api/vnu/cross-lookup/bulk", {
       method: "POST",
       headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), "Content-Type": "application/json" },
       body,
+      signal,
     }));
   }
 
@@ -3023,7 +3294,7 @@ describe("VNU cross-transcript route", () => {
     const response = await authorizedRequest(query);
 
     expect(response.status).toBe(400);
-    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Cache-Control")).toBe("no-store, private");
     await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_CROSS_LOOKUP_QUERY_INCOMPLETE" } });
     expect(profileSpy).not.toHaveBeenCalled();
     expect(transcriptSpy).not.toHaveBeenCalled();
@@ -3036,7 +3307,7 @@ describe("VNU cross-transcript route", () => {
     const response = await authorizedRequest(query);
 
     expect(response.status).toBe(400);
-    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Cache-Control")).toBe("no-store, private");
     await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_CROSS_LOOKUP_NOT_EXPLICITLY_ALLOWED" } });
     expect(profileSpy).not.toHaveBeenCalled();
     expect(transcriptSpy).not.toHaveBeenCalled();
@@ -3049,7 +3320,7 @@ describe("VNU cross-transcript route", () => {
     }));
 
     expect(response.status).toBe(403);
-    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Cache-Control")).toBe("no-store, private");
     await expect(response.json()).resolves.toMatchObject({ error: { code: "SESSION_UNIVERSITY_MISMATCH" } });
     expect(profileSpy).not.toHaveBeenCalled();
     expect(transcriptSpy).not.toHaveBeenCalled();
@@ -3062,7 +3333,7 @@ describe("VNU cross-transcript route", () => {
     const response = await authorizedRequest(query);
 
     expect(response.status).toBe(400);
-    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Cache-Control")).toBe("no-store, private");
     await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_CROSS_LOOKUP_SELF_TARGET" } });
     expect(profileSpy).toHaveBeenCalledTimes(1);
     expect(transcriptSpy).not.toHaveBeenCalled();
@@ -3093,7 +3364,7 @@ describe("VNU cross-transcript route", () => {
     const responseText = await response.text();
 
     expect(response.status).toBe(500);
-    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Cache-Control")).toBe(route === "transcript" ? "no-store, private" : "no-store");
     expect(JSON.parse(responseText)).toEqual({ data: null, error: { code: "VNU_PROFILE_INCOMPLETE", message: "The university portal profile is incomplete." } });
     for (const privateValue of ["not-a-number", "20000000"]) expect(responseText).not.toContain(privateValue);
     expect(probeBudget.count).toBe(0);
@@ -3144,7 +3415,7 @@ describe("VNU cross-transcript route", () => {
     const body = await response.json() as { data: Record<string, unknown> };
 
     expect(response.status).toBe(200);
-    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Cache-Control")).toBe("no-store, private");
     expect(body.data).toMatchObject({
       header: { studentCode: "20000001", studentName: "SYNTHETIC TARGET" },
       terms: [{ maHK: "251", rows: [{ courseCode: "INT1001", grade10: 8 }] }],
@@ -3155,6 +3426,8 @@ describe("VNU cross-transcript route", () => {
     expect(probeBudget.count).toBe(1);
     expect(probeBudget.reservedAmounts).toEqual([1]);
     expect(probeBudget.consumedAmounts).toEqual([]);
+    expect(probeBudget.activeLeaseCount).toBe(0);
+    expect(probeBudget.releasedLeases).toHaveLength(1);
   });
 
   it("removes upstream notice prose from transcript responses", async () => {
@@ -3174,7 +3447,7 @@ describe("VNU cross-transcript route", () => {
     const body = await response.json() as { data: Record<string, unknown> };
 
     expect(response.status).toBe(200);
-    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Cache-Control")).toBe("no-store, private");
     expect(body.data).toMatchObject({ header: { studentCode: "20000001" }, terms: [{ maHK: "251" }] });
     expect(JSON.stringify(body)).not.toContain("<table>");
     expect(transcriptSpy).toHaveBeenCalledTimes(2);
@@ -3189,7 +3462,7 @@ describe("VNU cross-transcript route", () => {
     const response = await authorizedRequest("stdCode=20000001&allowCrossLookup=true");
 
     expect(response.status).toBe(429);
-    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Cache-Control")).toBe("no-store, private");
     await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_RATE_LIMITED" } });
     expect(transcriptSpy).not.toHaveBeenCalled();
     expect(probeBudget.reservedAmounts).toEqual([34]);
@@ -3220,7 +3493,7 @@ describe("VNU cross-transcript route", () => {
     const body = await response.json() as { data: unknown; error: { code: string } };
 
     expect(response.status).toBe(404);
-    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Cache-Control")).toBe("no-store, private");
     expect(body).toMatchObject({ data: null, error: { code: "VNU_CROSS_LOOKUP_NOT_FOUND" } });
     expect(JSON.stringify(body)).not.toContain("Foreign grade");
   });
@@ -3315,6 +3588,7 @@ describe("VNU cross-transcript route", () => {
     expect(response.headers.get("Cache-Control")).toBe("no-store");
     expect(observedReasons).toEqual([reason]);
     expect(settled).toBe(true);
+    expect(probeBudget.activeLeaseCount).toBe(0);
   });
 
   it("resolver route cancelled at configured concurrency 4 aborts and settles every started candidate", async () => {
@@ -3365,9 +3639,10 @@ describe("VNU cross-transcript route", () => {
     expect(response.status).toBe(429);
     expect(response.headers.get("Cache-Control")).toBe("no-store");
     await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_RATE_LIMITED" } });
-    expect(siblingSignals).toHaveLength(3);
+    expect(siblingSignals.length).toBeLessThanOrEqual(3);
     expect(siblingSignals.every((signal) => signal.aborted && signal.reason === fatal)).toBe(true);
-    expect(settledSiblings).toBe(3);
+    expect(settledSiblings).toBe(siblingSignals.length);
+    expect(probeBudget.activeLeaseCount).toBe(0);
   });
 
   it("candidate session expiry aborts siblings and propagates 401 instead of not-converged", async () => {
@@ -3386,7 +3661,7 @@ describe("VNU cross-transcript route", () => {
     expect(response.status).toBe(401);
     expect(response.headers.get("Cache-Control")).toBe("no-store");
     await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_SESSION_EXPIRED" } });
-    expect(siblingSignals).toHaveLength(3);
+    expect(siblingSignals.length).toBeLessThanOrEqual(3);
     expect(siblingSignals.every((signal) => signal.aborted && signal.reason === fatal)).toBe(true);
   });
 
@@ -3399,6 +3674,182 @@ describe("VNU cross-transcript route", () => {
     expect(response.status).toBe(503);
     expect(body.error).toMatchObject({ code: "VNU_PROBE_BUDGET_UNAVAILABLE", details: { retryAfterSeconds: 5 } });
     expect(transcriptSpy).not.toHaveBeenCalled();
+  });
+
+  it("does not lease cross-student permits for the session owner's grades", async () => {
+    const gradesSpy = vi.spyOn(DaotaoClient.prototype, "getGradesHtml").mockResolvedValue(targetTranscriptHtml);
+    const token = await encryptSession(vnuSession(), SESSION_SECRET);
+
+    const response = await app.handle(new Request("http://localhost/api/vnu/raw/grades", {
+      headers: { Authorization: `Bearer ${token}` },
+    }));
+
+    expect(response.status).toBe(200);
+    expect(gradesSpy).toHaveBeenCalledOnce();
+    expect(probeBudget.activeLeaseCount).toBe(0);
+    expect(probeBudget.releasedLeases).toEqual([]);
+    gradesSpy.mockRestore();
+  });
+
+  it("splits three bulk resolver workers into two candidate permits each", async () => {
+    setRuntimeConfig({
+      HYEB_SESSION_SECRET: SESSION_SECRET,
+      VNU_CODE_LOOKUP_BULK_TARGET_CONCURRENCY: "3",
+      VNU_CODE_LOOKUP_CONCURRENCY: "6",
+    });
+    const controller = new AbortController();
+    transcriptSpy.mockImplementation(async (stdId: string, signal?: AbortSignal) => {
+      if (["1050", "1100", "1150"].includes(stdId)) return "<html>headerless</html>";
+      return new Promise<string>((_resolve, reject) => signal?.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    });
+
+    const request = bulkRequest({
+      mode: "code-to-stdid",
+      targets: ["20000050", "20000100", "20000150"],
+      allowCrossLookup: true,
+    }, undefined, controller.signal);
+    await vi.waitFor(() => expect(transcriptSpy).toHaveBeenCalledTimes(9));
+
+    expect(probeBudget.activeLeaseCount).toBe(6);
+    expect(probeBudget.pendingPermitCount).toBe(0);
+    controller.abort(new DOMException("bulk resolver cancelled", "AbortError"));
+    await request;
+    expect(probeBudget.activeLeaseCount).toBe(0);
+  });
+
+  it("caps concurrent same-session code bulk Brc1 work at exactly six and releases every aborted lease", async () => {
+    setRuntimeConfig({
+      HYEB_SESSION_SECRET: SESSION_SECRET,
+      VNU_CODE_LOOKUP_BULK_TARGET_CONCURRENCY: "3",
+      VNU_CODE_LOOKUP_CONCURRENCY: "6",
+    });
+    const firstAbort = new AbortController();
+    const secondAbort = new AbortController();
+    let resolveSixActive!: () => void;
+    const sixActive = new Promise<void>((resolve) => { resolveSixActive = resolve; });
+    transcriptSpy.mockImplementation(async (_stdId: string, signal?: AbortSignal) => {
+      if (transcriptSpy.mock.calls.length === 6) resolveSixActive();
+      return new Promise<string>((_resolve, reject) => signal!.addEventListener("abort", () => reject(signal!.reason), { once: true }));
+    });
+
+    const first = bulkRequest({ mode: "code-to-stdid", targets: ["20000001", "20000002", "20000003"], allowCrossLookup: true }, undefined, firstAbort.signal);
+    const second = bulkRequest({ mode: "code-to-stdid", targets: ["20000004", "20000005", "20000006"], allowCrossLookup: true }, undefined, secondAbort.signal);
+    await sixActive;
+
+    expect(transcriptSpy).toHaveBeenCalledTimes(6);
+    expect(probeBudget.activeLeaseCount).toBe(6);
+    expect(probeBudget.peakActiveLeases).toBe(6);
+    firstAbort.abort(new DOMException("first bulk cancelled", "AbortError"));
+    secondAbort.abort(new DOMException("second bulk cancelled", "AbortError"));
+    await Promise.all([first, second]);
+
+    expect(probeBudget.activeLeaseCount).toBe(0);
+    expect(probeBudget.pendingPermitCount).toBe(0);
+    expect(probeBudget.releasedLeases).toHaveLength(6);
+  });
+
+  it("shares exactly six same-session Brc1 permits between direct and bulk code lookups", async () => {
+    setRuntimeConfig({
+      HYEB_SESSION_SECRET: SESSION_SECRET,
+      VNU_CODE_LOOKUP_BULK_TARGET_CONCURRENCY: "3",
+      VNU_CODE_LOOKUP_CONCURRENCY: "6",
+    });
+    const directAbort = new AbortController();
+    const bulkAbort = new AbortController();
+    let resolveSixActive!: () => void;
+    const sixActive = new Promise<void>((resolve) => { resolveSixActive = resolve; });
+    transcriptSpy.mockImplementation(async (_stdId: string, signal?: AbortSignal) => {
+      const call = transcriptSpy.mock.calls.length;
+      if (call === 1) return "<html>headerless</html>";
+      if (call === 7) resolveSixActive();
+      return new Promise<string>((_resolve, reject) => signal!.addEventListener("abort", () => reject(signal!.reason), { once: true }));
+    });
+
+    const direct = authorizedRequest("stdCode=20000001&allowCrossLookup=true", "student-id", undefined, directAbort.signal);
+    await sixActive;
+    const bulk = bulkRequest({ mode: "code-to-stdid", targets: ["20000002", "20000003", "20000004"], allowCrossLookup: true }, undefined, bulkAbort.signal);
+    await Promise.resolve();
+
+    expect(transcriptSpy).toHaveBeenCalledTimes(7);
+    expect(probeBudget.activeLeaseCount).toBe(6);
+    expect(probeBudget.peakActiveLeases).toBe(6);
+    directAbort.abort(new DOMException("direct cancelled", "AbortError"));
+    bulkAbort.abort(new DOMException("bulk cancelled", "AbortError"));
+    await Promise.all([direct, bulk]);
+
+    expect(probeBudget.activeLeaseCount).toBe(0);
+    expect(probeBudget.pendingPermitCount).toBe(0);
+  });
+
+  it("removes an aborted cap-one queued direct lookup before it reaches Brc1", async () => {
+    probeBudget = new TestVnuProbeBudget(1);
+    setVnuProbeBudgetCoordinator(probeBudget);
+    const firstAbort = new AbortController();
+    const secondAbort = new AbortController();
+    let resolveFirstFetch!: () => void;
+    const firstFetchStarted = new Promise<void>((resolve) => { resolveFirstFetch = resolve; });
+    let resolveQueued!: () => void;
+    const secondQueued = new Promise<void>((resolve) => { resolveQueued = resolve; });
+    probeBudget.onPermitQueued = resolveQueued;
+    transcriptSpy.mockImplementation(async (_stdId: string, signal?: AbortSignal) => {
+      resolveFirstFetch();
+      return new Promise<string>((_resolve, reject) => signal!.addEventListener("abort", () => reject(signal!.reason), { once: true }));
+    });
+
+    const first = authorizedRequest("stdId=1001&allowCrossLookup=true", "student-code", undefined, firstAbort.signal);
+    await firstFetchStarted;
+    const second = authorizedRequest("stdId=1002&allowCrossLookup=true", "student-code", undefined, secondAbort.signal);
+    await secondQueued;
+    secondAbort.abort(new DOMException("queued direct cancelled", "AbortError"));
+    await second;
+
+    expect(transcriptSpy).toHaveBeenCalledTimes(1);
+    expect(probeBudget.pendingPermitCount).toBe(0);
+    firstAbort.abort(new DOMException("first direct cancelled", "AbortError"));
+    await first;
+    expect(probeBudget.activeLeaseCount).toBe(0);
+  });
+
+  it("releases all permits after a resolver winner cancels sibling probes", async () => {
+    setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET, VNU_CODE_LOOKUP_CONCURRENCY: "4" });
+    transcriptSpy.mockImplementation(async (stdId: string, signal?: AbortSignal) => {
+      const call = transcriptSpy.mock.calls.length;
+      if (call === 1) return "<html>headerless</html>";
+      if (stdId === "1000") {
+        await Promise.resolve();
+        return targetTranscriptHtml;
+      }
+      return new Promise<string>((_resolve, reject) => signal!.addEventListener("abort", () => reject(signal!.reason), { once: true }));
+    });
+
+    const response = await authorizedRequest("stdCode=20000001&allowCrossLookup=true", "student-id");
+
+    expect(response.status).toBe(200);
+    expect(probeBudget.activeLeaseCount).toBe(0);
+    expect(probeBudget.releasedLeases).toHaveLength(transcriptSpy.mock.calls.length);
+  });
+
+  it("passes the direct-route default 60-second TimeoutError to Brc1 and releases its permit", async () => {
+    vi.useFakeTimers();
+    const observedSignals: AbortSignal[] = [];
+    let resolveFetchStarted!: () => void;
+    const fetchStarted = new Promise<void>((resolve) => { resolveFetchStarted = resolve; });
+    transcriptSpy.mockImplementation(async (_stdId: string, signal?: AbortSignal) => {
+      observedSignals.push(signal!);
+      resolveFetchStarted();
+      return new Promise<string>((_resolve, reject) => signal!.addEventListener("abort", () => reject(signal!.reason), { once: true }));
+    });
+    const responsePromise = authorizedRequest("stdId=1001&allowCrossLookup=true", "student-code");
+    await fetchStarted;
+    await vi.advanceTimersByTimeAsync(60_000);
+    const response = await responsePromise;
+
+    expect(response.status).toBe(500);
+    expect(observedSignals[0].aborted).toBe(true);
+    expect(observedSignals[0].reason).toBeInstanceOf(DOMException);
+    expect((observedSignals[0].reason as DOMException).name).toBe("TimeoutError");
+    expect(probeBudget.activeLeaseCount).toBe(0);
+    vi.useRealTimers();
   });
 
   describe("bulk lookup", () => {
@@ -3438,9 +3889,9 @@ describe("VNU cross-transcript route", () => {
     });
 
     it.each([
-      ["stdid-to-code", 6],
-      ["stdid-to-transcript", 6],
-      ["code-to-stdid", 4],
+      ["stdid-to-code", 33],
+      ["stdid-to-transcript", 33],
+      ["code-to-stdid", 10],
     ] as const)("rejects an oversized %s chunk at the chunk boundary", async (mode, size) => {
       const target = mode === "code-to-stdid" ? "20000001" : "1001";
       const response = await bulkRequest({ mode, targets: Array.from({ length: size }, () => target), allowCrossLookup: true });
@@ -3525,12 +3976,26 @@ describe("VNU cross-transcript route", () => {
       expect(transcriptSpy).not.toHaveBeenCalled();
     });
 
-    it("five direct targets reserve 5 atomically", async () => {
-      const response = await bulkRequest({ mode: "stdid-to-code", targets: ["1001", "1002", "1003", "1004", "1005"], allowCrossLookup: true });
+    it("32 direct targets are accepted and reserve 32 atomically", async () => {
+      const response = await bulkRequest({ mode: "stdid-to-code", targets: Array.from({ length: 32 }, (_, index) => String(1001 + index)), allowCrossLookup: true });
 
       expect(response.status).toBe(200);
-      expect(probeBudget.reservedAmounts).toEqual([5]);
+      expect(probeBudget.reservedAmounts).toEqual([32]);
       expect(probeBudget.consumedAmounts).toEqual([]);
+    });
+
+    it("accepts nine code targets and rejects ten before reading the profile", async () => {
+      const nine = Array.from({ length: 9 }, (_, index) => String(20_000_001 + index));
+      const accepted = await bulkRequest({ mode: "code-to-stdid", targets: nine, allowCrossLookup: true });
+      expect(accepted.status).toBe(200);
+
+      profileSpy.mockClear();
+      transcriptSpy.mockClear();
+      const rejected = await bulkRequest({ mode: "code-to-stdid", targets: [...nine, "20000010"], allowCrossLookup: true });
+      expect(rejected.status).toBe(400);
+      await expect(rejected.json()).resolves.toMatchObject({ error: { code: "VNU_CROSS_LOOKUP_CHUNK_TOO_LARGE" } });
+      expect(profileSpy).not.toHaveBeenCalled();
+      expect(transcriptSpy).not.toHaveBeenCalled();
     });
 
     it("ordinary bulk systemic failure aborts chunk and starts no later item", async () => {
@@ -3547,43 +4012,63 @@ describe("VNU cross-transcript route", () => {
       expect(transcriptSpy.mock.calls.map((call: unknown[]) => call[0])).toEqual(["1001", "1002"]);
     });
 
-    it("bulk targets stay sequential while each resolver overlaps configured candidate probes", async () => {
-      setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET, VNU_CODE_LOOKUP_CONCURRENCY: "4" });
+    it("bulk code targets overlap while their aggregate candidate probes stay capped", async () => {
+      probeBudget = new TestVnuProbeBudget(2);
+      setVnuProbeBudgetCoordinator(probeBudget);
+      setRuntimeConfig({
+        HYEB_SESSION_SECRET: SESSION_SECRET,
+        VNU_CODE_LOOKUP_BULK_TARGET_CONCURRENCY: "2",
+        VNU_CODE_LOOKUP_CONCURRENCY: "2",
+      });
       profileSpy.mockResolvedValue(`<input name="hidStdID" value="${SYNTHETIC_VNU_STD_ID}"><input name="StdCode" value="${SYNTHETIC_VNU_CODE}">`);
       const targetCodes = [SYNTHETIC_VNU_CODE + 100, SYNTHETIC_VNU_CODE + 200];
       const projectedIds = targetCodes.map((code) => SYNTHETIC_VNU_STD_ID + code - SYNTHETIC_VNU_CODE);
-      let activeCandidates = 0;
-      const activeCandidatesByTarget = [0, 0];
-      let maxActiveCandidates = 0;
-      let secondStartedBeforeFirstSettled = false;
+      const pendingWork = new Map<number, { resolve: (html: string) => void; reject: (reason: unknown) => void }>();
+      const startedWork = new Map(projectedIds.flatMap((stdId) => [
+        [stdId - 1, enteredOperation<void>()],
+        [stdId + 1, enteredOperation<void>()],
+      ]));
+      const waitForWork = (stdId: number): Promise<void> => {
+        const work = startedWork.get(stdId);
+        if (!work) throw new Error(`No controlled Brc1 start exists for ${stdId}`);
+        return work.entered;
+      };
+      const completeWork = (stdId: number, html: string): void => {
+        const work = pendingWork.get(stdId);
+        if (!work) throw new Error(`No controlled Brc1 work exists for ${stdId}`);
+        pendingWork.delete(stdId);
+        work.resolve(html);
+      };
       transcriptSpy.mockImplementation(async (stdIdText: string, signal?: AbortSignal) => {
         const stdId = Number(stdIdText);
-        const targetIndex = Math.abs(stdId - projectedIds[0]) <= 16 ? 0 : 1;
-        if (targetIndex === 1 && activeCandidatesByTarget[0] > 0) secondStartedBeforeFirstSettled = true;
-        if (stdId === projectedIds[targetIndex]) return "<html>headerless</html>";
-        activeCandidates += 1;
-        activeCandidatesByTarget[targetIndex] += 1;
-        maxActiveCandidates = Math.max(maxActiveCandidates, activeCandidates);
-        try {
-          if (stdId === projectedIds[targetIndex] - 1) {
-            await Promise.resolve();
-            return `<table><tr><td>Mã số: ${targetCodes[targetIndex]}</td></tr></table>`;
-          }
-          return await new Promise<string>((_resolve, reject) => signal!.addEventListener("abort", () => reject(signal!.reason), { once: true }));
-        } finally {
-          activeCandidates -= 1;
-          activeCandidatesByTarget[targetIndex] -= 1;
-        }
+        if (projectedIds.includes(stdId)) return "<html>headerless</html>";
+        return new Promise<string>((resolve, reject) => {
+          pendingWork.set(stdId, { resolve, reject });
+          startedWork.get(stdId)?.markEntered();
+          signal?.addEventListener("abort", () => {
+            pendingWork.delete(stdId);
+            reject(signal.reason);
+          }, { once: true });
+        });
       });
 
-      const response = await bulkRequest({ mode: "code-to-stdid", targets: targetCodes.map(String), allowCrossLookup: true });
+      const responsePromise = bulkRequest({ mode: "code-to-stdid", targets: targetCodes.map(String), allowCrossLookup: true });
+      await waitForWork(projectedIds[0] - 1);
+      await waitForWork(projectedIds[0] + 1);
+      expect(probeBudget.activeLeaseCount).toBe(2);
+      completeWork(projectedIds[0] - 1, `<table><tr><td>Mã số: ${targetCodes[0]}</td></tr></table>`);
+      await waitForWork(projectedIds[1] - 1);
+      expect(probeBudget.activeLeaseCount).toBeLessThanOrEqual(2);
+      completeWork(projectedIds[1] - 1, `<table><tr><td>Mã số: ${targetCodes[1]}</td></tr></table>`);
+
+      const response = await responsePromise;
       const payload = await response.json() as { data: { items: Array<{ target: string; status: string }> } };
 
       expect(response.status).toBe(200);
       expect(payload.data.items.map(({ target, status }) => ({ target, status }))).toEqual(targetCodes.map((target) => ({ target: String(target), status: "ok" })));
       expect(probeBudget.reservedAmounts).toEqual([66]);
-      expect(maxActiveCandidates).toBe(4);
-      expect(secondStartedBeforeFirstSettled).toBe(false);
+      expect(probeBudget.peakActiveLeases).toBeLessThanOrEqual(2);
+      expect(probeBudget.activeLeaseCount).toBe(0);
     });
 
     it("per-item nonconverged remains isolated and ordered", async () => {
@@ -3684,4 +4169,138 @@ describe("VNU cross-transcript route", () => {
     });
   });
 
+});
+
+describe("VNU cross-detail HTTP routes", () => {
+  let app: ReturnType<typeof createApp>;
+  let probeBudget: TestVnuProbeBudget;
+  let detailSpy: ReturnType<typeof vi.spyOn>;
+  let profileSpy: ReturnType<typeof vi.spyOn>;
+  let transcriptSpy: ReturnType<typeof vi.spyOn>;
+
+  async function bearerToken(cookie: string): Promise<string> {
+    return encryptSession({ ...vnuSession(), vnu: { ...vnuSession().vnu!, value: cookie } }, SESSION_SECRET);
+  }
+
+  async function issuePermit(token: string): Promise<string> {
+    const minter = createVnuCrossDetailMinter({
+      secret: SESSION_SECRET,
+      requesterToken: token,
+      maxTargets: 1,
+      maxRows: 2,
+      permitTtlSeconds: 60,
+    });
+    const permit = await minter.mint({
+      targetStdId: "99000000001",
+      transcriptHtml: "<table>synthetic transcript</table>",
+      row: { courseCode: "SYN9901", classId: "990099", termOrdinal: "2" },
+    });
+    if (!permit) throw new Error("Synthetic cross-detail permit was not minted");
+    await probeBudget.issueCrossDetailPermits("synthetic-session", minter.issued);
+    return permit;
+  }
+
+  async function requestRoute(path: string, token: string, body: unknown, signal?: AbortSignal): Promise<Response> {
+    return app.handle(new Request(`http://localhost${path}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    }));
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setRuntimeConfig({
+      HYEB_SESSION_SECRET: SESSION_SECRET,
+      VNU_CROSS_DETAIL_MAX_TARGETS: "1",
+      VNU_CROSS_DETAIL_MAX_ROWS: "2",
+      VNU_CROSS_DETAIL_CONCURRENCY: "1",
+      VNU_CROSS_DETAIL_BUDGET: "2",
+      VNU_CROSS_DETAIL_WINDOW_SECONDS: "60",
+      VNU_CROSS_DETAIL_PERMIT_TTL_SECONDS: "60",
+      VNU_CROSS_DETAIL_EXPORT_MODE: "selected",
+    });
+    probeBudget = new TestVnuProbeBudget();
+    setVnuProbeBudgetCoordinator(probeBudget);
+    profileSpy = vi.spyOn(DaotaoClient.prototype, "getProfileHtml").mockResolvedValue('<input name="hidStdID" value="1000"><input name="StdCode" value="20000000">');
+    transcriptSpy = vi.spyOn(DaotaoClient.prototype, "getTranscriptByStdIdHtml").mockResolvedValue("<table><tr><td>Sinh viên: SYNTHETIC</td><td>Mã số: 20000001</td></tr></table>");
+    detailSpy = vi.spyOn(DaotaoClient.prototype, "getPointDetailHtml").mockResolvedValue("<table><tr><td>1</td><td>Synthetic component</td><td>0.5</td><td>1</td><td>9</td></tr></table>");
+    app = createApp(undefined);
+  });
+
+  afterEach(() => {
+    detailSpy.mockRestore();
+    profileSpy.mockRestore();
+    transcriptSpy.mockRestore();
+  });
+
+  it("keeps transcript permit issuance and its errors private", async () => {
+    const token = await bearerToken("SYNTHETIC_ISSUANCE_COOKIE");
+    const success = await app.handle(new Request("http://localhost/api/vnu/cross-lookup/transcript?stdId=1001&allowCrossLookup=true", { headers: { Authorization: `Bearer ${token}` } }));
+    const failure = await app.handle(new Request("http://localhost/api/vnu/cross-lookup/transcript?allowCrossLookup=true", { headers: { Authorization: `Bearer ${token}` } }));
+
+    expect(success.status).toBe(200);
+    expect(success.headers.get("Cache-Control")).toBe("no-store, private");
+    expect(failure.headers.get("Cache-Control")).toBe("no-store, private");
+  });
+
+  it("rejects a wrong-bearer permit with the generic invalid response", async () => {
+    const permitOwner = await bearerToken("SYNTHETIC_OWNER_COOKIE");
+    const otherBearer = await bearerToken("SYNTHETIC_OTHER_COOKIE");
+    const permit = await issuePermit(permitOwner);
+
+    const response = await requestRoute("/api/vnu/cross-lookup/detail", otherBearer, { allowCrossLookup: true, permit });
+
+    expect(response.status).toBe(403);
+    expect(response.headers.get("Cache-Control")).toBe("no-store, private");
+    await expect(response.json()).resolves.toEqual({ data: null, error: { code: "VNU_CROSS_DETAIL_PERMIT_INVALID", message: "The cross-detail permit is invalid or expired." } });
+  });
+
+  it("rejects selector smuggling and selected-export omissions through HTTP handlers", async () => {
+    const token = await bearerToken("SYNTHETIC_BODY_COOKIE");
+    const permit = await issuePermit(token);
+    const smuggled = await requestRoute("/api/vnu/cross-lookup/detail", token, { allowCrossLookup: true, permit, stdId: "99000000002" });
+    const unselectedExport = await requestRoute("/api/vnu/cross-lookup/detail/export", token, { allowCrossLookup: true });
+
+    expect(smuggled.status).toBe(400);
+    expect(smuggled.headers.get("Cache-Control")).toBe("no-store, private");
+    await expect(smuggled.json()).resolves.toMatchObject({ error: { code: "VNU_CROSS_DETAIL_BODY_INVALID" } });
+    expect(unselectedExport.status).toBe(400);
+    expect(unselectedExport.headers.get("Cache-Control")).toBe("no-store, private");
+    await expect(unselectedExport.json()).resolves.toMatchObject({ error: { code: "VNU_CROSS_DETAIL_EXPORT_NOT_SELECTED" } });
+  });
+
+  it("handles success, replay, and selected export with private no-store responses", async () => {
+    const token = await bearerToken("SYNTHETIC_SUCCESS_COOKIE");
+    const permit = await issuePermit(token);
+    const detail = await requestRoute("/api/vnu/cross-lookup/detail", token, { allowCrossLookup: true, permit });
+    const replay = await requestRoute("/api/vnu/cross-lookup/detail", token, { allowCrossLookup: true, permit });
+    const exportPermit = await issuePermit(token);
+    const selectedExport = await requestRoute("/api/vnu/cross-lookup/detail/export", token, { allowCrossLookup: true, permits: [exportPermit] });
+
+    expect(detail.status).toBe(200);
+    expect(detail.headers.get("Cache-Control")).toBe("no-store, private");
+    expect(replay.status).toBe(403);
+    expect(replay.headers.get("Cache-Control")).toBe("no-store, private");
+    await expect(replay.json()).resolves.toMatchObject({ error: { code: "VNU_CROSS_DETAIL_PERMIT_INVALID" } });
+    expect(selectedExport.status).toBe(200);
+    expect(selectedExport.headers.get("Cache-Control")).toBe("no-store, private");
+  });
+
+  it("releases consumed detail leases after upstream rejection and request abort", async () => {
+    const token = await bearerToken("SYNTHETIC_RELEASE_COOKIE");
+    detailSpy.mockRejectedValueOnce(new Error("Synthetic upstream failure"));
+    const rejected = await requestRoute("/api/vnu/cross-lookup/detail", token, { allowCrossLookup: true, permit: await issuePermit(token) });
+    expect(rejected.status).toBe(500);
+    expect(probeBudget.releasedCrossDetailLeases).toHaveLength(1);
+
+    const controller = new AbortController();
+    detailSpy.mockImplementationOnce(async (_selector: unknown, signal?: AbortSignal) => new Promise<string>((_resolve, reject) => signal?.addEventListener("abort", () => reject(signal.reason), { once: true })));
+    const abortedRequest = requestRoute("/api/vnu/cross-lookup/detail", token, { allowCrossLookup: true, permit: await issuePermit(token) }, controller.signal);
+    await vi.waitFor(() => expect(detailSpy).toHaveBeenCalledTimes(2));
+    controller.abort(new DOMException("Synthetic abort", "AbortError"));
+    await abortedRequest;
+    expect(probeBudget.releasedCrossDetailLeases).toHaveLength(2);
+  });
 });

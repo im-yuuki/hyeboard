@@ -23,7 +23,10 @@ Local dev env, `apps/worker/.dev.vars` (gitignored): `HYEB_SESSION_SECRET` is re
 HYEB_SESSION_SECRET=replace-with-at-least-32-random-bytes
 HYEB_ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
 VNU_CODE_LOOKUP_CONCURRENCY=16
-VNU_CROSS_LOOKUP_BULK_MAX_TARGETS=50
+VNU_CROSS_LOOKUP_BULK_MAX_TARGETS=500
+VNU_CROSS_LOOKUP_DIRECT_CHUNK_MAX_TARGETS=32
+VNU_CODE_LOOKUP_BULK_TARGET_CONCURRENCY=3
+VNU_CROSS_LOOKUP_REQUEST_TIMEOUT_MS=60000
 ```
 
 Optional, `apps/web/.env.local`:
@@ -63,9 +66,9 @@ cp .env.example .env   # fill in HYEB_SESSION_SECRET
 node dist/index.js      # or: bun run dist/index.js
 ```
 
-Non-secret runtime configuration lives in `dist/config.json`; environment variables override matching file values. VNU resolver settings use `vnu.code_lookup_concurrency` and `vnu.cross_lookup_bulk_max_targets` in JSON, or `VNU_CODE_LOOKUP_CONCURRENCY` and `VNU_CROSS_LOOKUP_BULK_MAX_TARGETS` in the environment. Canonical non-negative base-10 safe integers are accepted; concurrency must be positive. Missing values default to 16 and 50. Malformed concurrency falls back to 1, while malformed bulk configuration disables bulk with 0. There is no product ceiling below JavaScript's safe-integer bound.
+Non-secret runtime configuration lives in `dist/config.json`; environment variables override matching file values. VNU resolver settings use `vnu.code_lookup_concurrency`, `vnu.cross_lookup_bulk_max_targets`, `vnu.cross_lookup_direct_chunk_max_targets`, `vnu.code_lookup_bulk_target_concurrency`, and `vnu.cross_lookup_request_timeout_ms` in JSON, or matching `VNU_*` environment variables. Direct chunks default to 32 and accept 1–300; bulk code target concurrency defaults to 3 and falls back to 1 when malformed; bulk requests default to 60 seconds. The whole-run bulk maximum remains independent.
 
-VNU cross lookup requires the Cloudflare `VNU_PROBE_BUDGET` Durable Object. Self-hosted Node/Bun deployments fail cross lookup closed and omit its runtime limit metadata. The browser hides bulk when metadata is missing or zero, enforces the published whole-run maximum, and still sends sequential chunks of three code targets or five direct-ID/transcript targets. The Worker atomically reserves 1 unit for direct lookups, 33 for code-to-ID, and 34 for code-to-transcript before Brc1 work. Reservations are per session, authoritative, and non-refundable.
+VNU cross lookup requires the Cloudflare `VNU_PROBE_BUDGET` Durable Object. Self-hosted Node/Bun deployments fail cross lookup closed and omit runtime limit metadata. The browser hides bulk when metadata is missing or zero, enforces the published whole-run maximum, and sends sequential chunks of three code targets or the server-published direct-ID maximum (legacy metadata falls back to five). The Worker atomically reserves 1 unit for direct lookups and 33 per code target before Brc1 work. Code targets may run concurrently, but their combined Brc1 fetches never exceed six; a 60-second request deadline cancels pending work.
 
 Exports are explicit browser-only JSON or CSV downloads built from sanitized result models. They do not refetch, persist, or send result content to the server. Derived term GPA/CPA values exclude missing grades and remain labeled separately from portal-reported cumulative values.
 

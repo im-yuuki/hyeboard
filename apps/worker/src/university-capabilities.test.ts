@@ -22,7 +22,7 @@ type UniversitiesPayload = {
   data: Array<{
     id: string;
     capabilities: Record<string, boolean>;
-    limits?: { crossLookup?: { bulkMaxTargets: number } };
+    limits?: { crossLookup?: { bulkMaxTargets: number; crossDetail?: { maxTargets: number; maxRows: number; concurrency: number } } };
   }>;
 };
 
@@ -88,11 +88,16 @@ describe("university capability serialization", () => {
     expect(vnu?.limits).toBeUndefined();
   });
 
-  it("publishes effective optional VNU limits without mutating other universities once the coordinator is installed", async () => {
-    setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET, VNU_CROSS_LOOKUP_BULK_MAX_TARGETS: "9007199254740991" });
+  it("publishes a supplied VNU bulk limit as effective metadata without mutating other universities", async () => {
+    setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET, VNU_CROSS_LOOKUP_BULK_MAX_TARGETS: "500" });
     const coordinator: VnuProbeBudgetCoordinator = {
       async consume() { /* not exercised — capability wiring only */ },
       async reserve() { /* not exercised — capability wiring only */ },
+      async acquireBrc1Permit() { return { leaseId: "a".repeat(32), expiresAt: Date.now() + 1_000 }; },
+      async releaseBrc1Permit() { /* not exercised — capability wiring only */ },
+      async issueCrossDetailPermits() { /* not exercised — capability wiring only */ },
+      async consumeCrossDetailPermit() { throw new Error("not exercised"); },
+      async releaseCrossDetailLease() { /* not exercised — capability wiring only */ },
     };
     setVnuProbeBudgetCoordinator(coordinator);
 
@@ -100,7 +105,17 @@ describe("university capability serialization", () => {
 
     expect(universities.find((university) => university.id === "vnu")).toMatchObject({
       capabilities: { crossLookup: true },
-      limits: { crossLookup: { bulkMaxTargets: Number.MAX_SAFE_INTEGER } },
+      limits: {
+        crossLookup: {
+          bulkMaxTargets: 500,
+          bulkDirectChunkMaxTargets: 32,
+          bulkModeMaxTargets: {
+            "stdid-to-code": 500,
+            "stdid-to-transcript": 500,
+            "code-to-stdid": 9,
+          },
+        },
+      },
     });
     expect(universities.find((university) => university.id === "mock")?.limits).toBeUndefined();
     expect(universities.find((university) => university.id === "uet")?.limits).toBeUndefined();
@@ -108,5 +123,45 @@ describe("university capability serialization", () => {
     setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET, VNU_CROSS_LOOKUP_BULK_MAX_TARGETS: "0" });
     const disabledBulkUniversities = await listUniversities(createApp(undefined));
     expect(disabledBulkUniversities.find((university) => university.id === "vnu")?.limits?.crossLookup?.bulkMaxTargets).toBe(0);
+  });
+
+  // These cross-detail tests rely on the coordinator installed by the test
+  // above (module-level, cannot be uninstalled) — they must run after it.
+  it("publishes cross-detail limits with documented defaults alongside bulk limits", async () => {
+    setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET });
+
+    const vnu = (await listUniversities(createApp(undefined))).find((university) => university.id === "vnu");
+
+    expect(vnu?.limits?.crossLookup).toMatchObject({
+      bulkMaxTargets: 500,
+      crossDetail: { maxTargets: 50, maxRows: 200, concurrency: 6 },
+    });
+    expect((await listUniversities(createApp(undefined))).find((university) => university.id === "mock")?.limits).toBeUndefined();
+  });
+
+  it("publishes configured cross-detail limits", async () => {
+    setRuntimeConfig({
+      HYEB_SESSION_SECRET: SESSION_SECRET,
+      VNU_CROSS_DETAIL_MAX_TARGETS: "12",
+      VNU_CROSS_DETAIL_MAX_ROWS: "34",
+      VNU_CROSS_DETAIL_CONCURRENCY: "2",
+    });
+
+    const vnu = (await listUniversities(createApp(undefined))).find((university) => university.id === "vnu");
+
+    expect(vnu?.limits?.crossLookup?.crossDetail).toEqual({ maxTargets: 12, maxRows: 34, concurrency: 2 });
+  });
+
+  it.each([
+    ["malformed bound", { VNU_CROSS_DETAIL_MAX_ROWS: "raw" }],
+    ["zero bound", { VNU_CROSS_DETAIL_BUDGET: "0" }],
+    ["non-selected export mode", { VNU_CROSS_DETAIL_EXPORT_MODE: "all" }],
+  ] as const)("omits cross-detail limits but keeps bulk limits when disabled by %s", async (_label, overrides) => {
+    setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET, ...overrides });
+
+    const vnu = (await listUniversities(createApp(undefined))).find((university) => university.id === "vnu");
+
+    expect(vnu?.limits?.crossLookup?.bulkMaxTargets).toBe(500);
+    expect(vnu?.limits?.crossLookup?.crossDetail).toBeUndefined();
   });
 });

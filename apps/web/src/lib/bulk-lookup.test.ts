@@ -12,6 +12,13 @@ describe("bulk lookup input", () => {
     expect(parseBulkTargets(" 12\n34\n12 ", 1)).toEqual({ targets: ["12", "34"], error: "tooMany" });
   });
 
+  it("accepts nine code targets from mode metadata and rejects ten", () => {
+    const nineTargets = Array.from({ length: 9 }, (_, index) => String(index + 1)).join("\n");
+    const tenTargets = `${nineTargets}\n10`;
+    expect(parseBulkTargets(nineTargets, 9).error).toBeUndefined();
+    expect(parseBulkTargets(tenTargets, 9)).toMatchObject({ error: "tooMany" });
+  });
+
   it.each([undefined, 0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])("disables bulk input for invalid maximum %s", (maximum) => {
     expect(parseBulkTargets(" 12\n12\n34 ", maximum)).toEqual({ targets: ["12", "34"], error: "disabled" });
   });
@@ -25,11 +32,13 @@ describe("bulk lookup input", () => {
     expect(parseBulkTargets("1001\nmalformed\n1002", 3)).toEqual({ targets: ["1001", "malformed", "1002"] });
   });
 
-  it("chunks code mode by three and other modes by five", () => {
+  it("keeps mode input limits separate from request chunks", () => {
     const targets = ["1", "2", "3", "4", "5", "6", "7"];
     expect(chunkBulkTargets("code-to-stdid", targets)).toEqual([["1", "2", "3"], ["4", "5", "6"], ["7"]]);
     expect(chunkBulkTargets("stdid-to-code", targets)).toEqual([["1", "2", "3", "4", "5"], ["6", "7"]]);
     expect(chunkBulkTargets("stdid-to-transcript", targets)).toEqual([["1", "2", "3", "4", "5"], ["6", "7"]]);
+    expect(chunkBulkTargets("code-to-stdid", Array.from({ length: 9 }, (_, index) => String(index))).map((chunk) => chunk.length)).toEqual([3, 3, 3]);
+    expect(chunkBulkTargets("stdid-to-code", Array.from({ length: 33 }, (_, index) => String(index)), 32).map((chunk) => chunk.length)).toEqual([32, 1]);
   });
 
   it("parses only supported modes", () => {

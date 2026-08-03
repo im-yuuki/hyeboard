@@ -2,7 +2,12 @@ import { HyeboardError } from "@hyeboard/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DaotaoClient } from "./daotao-client";
 import { createVnuAdapter } from "./adapter";
-import { standaloneSessionEndedNoticeHtml } from "./session-expiry-fixtures";
+import {
+  paragraphSessionEndedNoticeHttpHtml,
+  paragraphSessionEndedNoticeHtml,
+  standaloneSessionEndedNoticeHtml,
+  xhtmlParagraphSessionEndedNoticeHttpHtml,
+} from "./session-expiry-fixtures";
 
 const AUTHENTICATED_URL = "https://daotao.vnu.edu.vn/StdInfo/TabStdSelf.asp";
 const AUTHENTICATED_HTML = "<html><body><main>Authenticated portal page</main></body></html>";
@@ -39,7 +44,7 @@ afterEach(() => {
 
 describe("DaotaoClient session expiry", () => {
   it("rejects a followed redirect that finishes at the trusted login URL", async () => {
-    const finalUrl = "https://daotao.vnu.edu.vn/dkmh/login.asp?return=profile";
+    const finalUrl = "https://daotao.vnu.edu.vn/dkmh/login.asp";
     mockFetchResponse(AUTHENTICATED_HTML, 200, finalUrl);
 
     const error = await expectHyeboardError(
@@ -50,6 +55,13 @@ describe("DaotaoClient session expiry", () => {
     expect(error.message).toBe("The university portal session has expired. Sign in again.");
     expect(error.message).not.toContain(AUTHENTICATED_HTML);
     expect(error.details).toBeUndefined();
+  });
+
+  it("does not classify a followed redirect with a login URL query as expired", async () => {
+    const finalUrl = "https://daotao.vnu.edu.vn/dkmh/login.asp?return=profile";
+    mockFetchResponse(AUTHENTICATED_HTML, 200, finalUrl);
+
+    await expect(new DaotaoClient().getProfileHtml()).resolves.toBe(AUTHENTICATED_HTML);
   });
 
   it("rejects an HTTP 200 standalone expiry notice without exposing its HTML", async () => {
@@ -63,6 +75,57 @@ describe("DaotaoClient session expiry", () => {
     expect(error.message).toBe("The university portal session has expired. Sign in again.");
     expect(error.message).not.toContain(standaloneSessionEndedNoticeHtml);
     expect(error.details).toBeUndefined();
+  });
+
+  it("normalizes an HTTP 200 paragraph expiry notice for grades without exposing HTML", async () => {
+    mockFetchResponse(paragraphSessionEndedNoticeHtml);
+
+    const error = await expectHyeboardError(
+      new DaotaoClient().getGradesHtml(),
+      { code: "VNU_SESSION_EXPIRED", status: 401 },
+    );
+
+    expect(error.message).not.toContain(paragraphSessionEndedNoticeHtml);
+    expect(error.details).toBeUndefined();
+  });
+
+  it("normalizes an HTTP 200 paragraph expiry notice with an HTTP login anchor without exposing HTML", async () => {
+    mockFetchResponse(paragraphSessionEndedNoticeHttpHtml);
+
+    const error = await expectHyeboardError(
+      new DaotaoClient().getGradesHtml(),
+      { code: "VNU_SESSION_EXPIRED", status: 401 },
+    );
+
+    expect(error.message).not.toContain(paragraphSessionEndedNoticeHttpHtml);
+    expect(error.details).toBeUndefined();
+  });
+
+  it("maps the exact XHTML notification variant from HTTP 200 to VNU_SESSION_EXPIRED 401", async () => {
+    mockFetchResponse(xhtmlParagraphSessionEndedNoticeHttpHtml);
+
+    const error = await expectHyeboardError(
+      new DaotaoClient().getGradesHtml(),
+      { code: "VNU_SESSION_EXPIRED", status: 401 },
+    );
+
+    expect(error.message).not.toContain(xhtmlParagraphSessionEndedNoticeHttpHtml);
+    expect(error.details).toBeUndefined();
+  });
+
+  it.each([
+    ["HTTPS default port", "https://daotao.vnu.edu.vn:443/dkmh/login.asp"],
+    ["HTTP default port", "http://daotao.vnu.edu.vn:80/dkmh/login.asp"],
+    ["HTTPS non-default port", "https://daotao.vnu.edu.vn:8443/dkmh/login.asp"],
+    ["HTTP non-default port", "http://daotao.vnu.edu.vn:8080/dkmh/login.asp"],
+  ])("returns the strict paragraph notice unchanged for an explicit %s", async (_port, href) => {
+    const html = paragraphSessionEndedNoticeHtml.replace(
+      "https://daotao.vnu.edu.vn/dkmh/login.asp",
+      href,
+    );
+    mockFetchResponse(html);
+
+    await expect(new DaotaoClient().getGradesHtml()).resolves.toBe(html);
   });
 
   it("returns authenticated HTML unchanged", async () => {

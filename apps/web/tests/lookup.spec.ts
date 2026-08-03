@@ -139,6 +139,37 @@ test("bulk keeps complete exports ordered for all modes and fixed chunks", async
   for (const testCase of cases) expect(chunks[testCase.mode].map((chunk) => chunk.length)).toEqual(testCase.sizes);
 });
 
+test("bulk metadata separates input maximums from HTTP chunk sizes", async ({ page }) => {
+  const chunks: Record<SyntheticBulkMode, string[][]> = { "stdid-to-code": [], "code-to-stdid": [], "stdid-to-transcript": [] };
+  await page.route("**/api/vnu/cross-lookup/bulk", async (route) => {
+    const mode = (route.request().postDataJSON() as { mode: SyntheticBulkMode }).mode;
+    await fulfillBulkSuccess(route, chunks[mode]);
+  });
+  await openMockedLookup(page, 500, 32, {
+    "stdid-to-code": 500,
+    "stdid-to-transcript": 500,
+    "code-to-stdid": 9,
+  });
+  const bulk = page.getByTestId("bulk-lookup");
+  const directTargets = Array.from({ length: 33 }, (_, index) => `990000003${String(index + 1).padStart(2, "0")}`);
+
+  await bulk.getByLabel("Targets, one per line").fill(directTargets.join("\n"));
+  await expect(bulk.getByRole("button", { name: "Run bulk lookup" })).toBeEnabled();
+  await bulk.getByRole("button", { name: "Run bulk lookup" }).click();
+  await expect(bulk.getByText("33 completed")).toBeVisible();
+
+  await bulk.getByLabel("Lookup mode").click();
+  await page.getByRole("option", { name: "Student codes to internal IDs" }).click();
+  const codeTargets = Array.from({ length: 9 }, (_, index) => `990001${String(index + 1).padStart(2, "0")}`);
+  await bulk.getByLabel("Targets, one per line").fill(codeTargets.join("\n"));
+  await expect(bulk.getByRole("button", { name: "Run bulk lookup" })).toBeEnabled();
+  await bulk.getByRole("button", { name: "Run bulk lookup" }).click();
+  await expect(bulk.getByText("9 completed")).toBeVisible();
+
+  expect(chunks["stdid-to-code"].map((chunk) => chunk.length)).toEqual([32, 1]);
+  expect(chunks["code-to-stdid"].map((chunk) => chunk.length)).toEqual([3, 3, 3]);
+});
+
 test("bulk exports prior five results after later 429 and while retrying", async ({ page }) => {
   const apiRequestCount = trackApiRequestCounts(page);
   let call = 0;
@@ -778,4 +809,55 @@ test("VNU spaced course codes match compact document searches without refetch", 
   await search.fill("Synthetic Syllabus");
   await expect(document).toBeVisible();
   expect(syllabusRequests()).toBe(requestsAfterCompactSearch);
+});
+
+test("cross-detail sends only an opaque permit and never persists detail state", async ({ page }) => {
+  await openMockedLookup(page, 50, 5, undefined, 2, true);
+  const submittedBodies: unknown[] = [];
+  await page.route("**/api/vnu/cross-lookup/detail", async (route) => {
+    submittedBodies.push(route.request().postDataJSON());
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { components: [{ index: 1, nature: "Synthetic component", score: 9 }] }, error: null }) });
+  });
+
+  await page.getByRole("button", { name: "Transcript", exact: true }).click();
+  const section = page.getByTestId("cross-transcript");
+  await section.getByLabel("Target internal student ID").fill(SYNTHETIC_TARGET_INTERNAL_ID);
+  await section.getByRole("button", { name: "View transcript" }).click();
+  await section.getByRole("button", { name: "Details" }).click();
+  await expect(section.getByText("Synthetic component")).toBeVisible();
+
+  expect(submittedBodies).toEqual([{ allowCrossLookup: true, permit: "synthetic-detail-permit" }]);
+  const stored = await page.evaluate(() => ({ local: Object.values(localStorage), session: Object.values(sessionStorage) }));
+  expect(JSON.stringify(stored)).not.toContain("synthetic-detail-permit");
+  expect(JSON.stringify(stored)).not.toContain("Synthetic component");
+});
+
+test("cross-detail UI stays unavailable without its published capability", async ({ page }) => {
+  await openMockedLookup(page, 50, 5, undefined, undefined, true);
+  await page.getByRole("button", { name: "Transcript", exact: true }).click();
+  const section = page.getByTestId("cross-transcript");
+  await section.getByLabel("Target internal student ID").fill(SYNTHETIC_TARGET_INTERNAL_ID);
+  await section.getByRole("button", { name: "View transcript" }).click();
+
+  await expect(section.getByRole("button", { name: "Details" })).toHaveCount(0);
+});
+
+test("cross-detail local state clears on account changes and route unmount", async ({ page }) => {
+  await openMockedLookup(page, 50, 5, undefined, 2, true);
+  await page.route("**/api/vnu/cross-lookup/detail", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { components: [{ index: 1, nature: "Synthetic transient detail", score: 9 }] }, error: null }) });
+  });
+  await page.getByRole("button", { name: "Transcript", exact: true }).click();
+  const section = page.getByTestId("cross-transcript");
+  await section.getByLabel("Target internal student ID").fill(SYNTHETIC_TARGET_INTERNAL_ID);
+  await section.getByRole("button", { name: "View transcript" }).click();
+  await section.getByRole("button", { name: "Details" }).click();
+  await expect(section.getByText("Synthetic transient detail")).toBeVisible();
+
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:account-switched")));
+  await expect(section.getByText("Synthetic transient detail")).toHaveCount(0);
+  await page.goto("/dashboard");
+  const stored = await page.evaluate(() => ({ local: Object.values(localStorage), session: Object.values(sessionStorage) }));
+  expect(JSON.stringify(stored)).not.toContain("synthetic-detail-permit");
+  expect(JSON.stringify(stored)).not.toContain("Synthetic transient detail");
 });

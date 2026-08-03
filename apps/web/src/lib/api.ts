@@ -573,14 +573,18 @@ async function vnuPointDetail(params: { id: string; Term: string }): Promise<Vnu
 
 export type VnuCrossStudentCode = { studentCode?: string; studentName?: string; className?: string };
 
-export type VnuCrossTranscript = Omit<VnuTranscript, "notice">;
+export type VnuCrossDetailComponent = { index: number; nature: string; weight?: number; attempt?: number; score?: number };
+export type VnuCrossDetailPermit = { termIndex: number; rowIndex: number; permit: string };
+export type VnuCrossDetailItem = { permit: string; status: "ok"; components: VnuCrossDetailComponent[] } | { permit: string; status: "error"; errorCode: string };
+export type VnuCrossTranscript = Omit<VnuTranscript, "notice"> & { detailPermits?: VnuCrossDetailPermit[] };
 
 function sanitizeCrossStudentCode(result: VnuCrossStudentCode): VnuCrossStudentCode {
   return { studentCode: result.studentCode, studentName: result.studentName, className: result.className };
 }
 
 function sanitizeCrossTranscript(result: VnuTranscript): VnuCrossTranscript {
-  return { header: result.header, terms: result.terms, totals: result.totals };
+  const permits = (result as VnuCrossTranscript).detailPermits;
+  return { header: result.header, terms: result.terms, totals: result.totals, ...(Array.isArray(permits) ? { detailPermits: permits } : {}) };
 }
 
 // Cross-student StdID -> student-code resolver (crossLookup capability, vnu
@@ -616,6 +620,14 @@ export type VnuCrossTranscriptInput =
 async function vnuCrossTranscript(input: VnuCrossTranscriptInput): Promise<VnuCrossTranscript> {
   const target = input.mode === "stdId" ? { stdId: input.stdId } : { stdCode: input.stdCode };
   return sanitizeCrossTranscript(await request<VnuTranscript>(`/api/vnu/cross-lookup/transcript${queryString({ ...target, allowCrossLookup: "true" })}`));
+}
+
+async function vnuCrossDetail(permit: string, signal?: AbortSignal): Promise<VnuCrossDetailComponent[]> {
+  return (await request<{ components: VnuCrossDetailComponent[] }>("/api/vnu/cross-lookup/detail", { method: "POST", body: JSON.stringify({ allowCrossLookup: true, permit }), signal })).components;
+}
+
+async function vnuCrossDetailBulk(permits: string[], signal?: AbortSignal): Promise<VnuCrossDetailItem[]> {
+  return (await request<{ items: VnuCrossDetailItem[] }>("/api/vnu/cross-lookup/detail/bulk", { method: "POST", body: JSON.stringify({ allowCrossLookup: true, permits }), signal })).items;
 }
 
 export type VnuBulkLookupMode = "stdid-to-code" | "code-to-stdid" | "stdid-to-transcript";
@@ -669,6 +681,8 @@ export const api = {
   vnuCrossStudentCode: (params: { stdId: string }) => vnuCrossStudentCode(params),
   vnuCrossStudentId: (params: { stdCode: string }) => vnuCrossStudentId(params),
   vnuCrossTranscript: (input: VnuCrossTranscriptInput) => vnuCrossTranscript(input),
+  vnuCrossDetail: (permit: string, signal?: AbortSignal) => vnuCrossDetail(permit, signal),
+  vnuCrossDetailBulk: (permits: string[], signal?: AbortSignal) => vnuCrossDetailBulk(permits, signal),
   vnuCrossLookupBulk: (mode: VnuBulkLookupMode, targets: string[], signal?: AbortSignal) => vnuCrossLookupBulk(mode, targets, signal),
   importSession: async (universityId: string, body: ImportSessionInput): Promise<ImportedAccountResult> => {
     const auth = await request<AuthResult>(`/api/${universityId}/auth/import-session`, { method: "POST", body: JSON.stringify(body) });

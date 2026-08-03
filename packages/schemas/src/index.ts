@@ -36,6 +36,16 @@ export const universityCapabilitiesSchema = z.object({
 export const universityLimitsSchema = z.object({
   crossLookup: z.object({
     bulkMaxTargets: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    bulkDirectChunkMaxTargets: z.number().int().positive().max(300).optional(),
+    bulkModeMaxTargets: z.record(z.string(), z.number().int().positive()).optional(),
+    // Cross-student grade-breakdown (detail permit) limits. Absent when the
+    // deployment disables the feature (misconfigured values fail closed) or
+    // no authoritative coordinator backs it — clients must gate on presence.
+    crossDetail: z.object({
+      maxTargets: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      maxRows: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      concurrency: z.number().int().positive().max(16),
+    }).optional(),
   }).optional(),
 });
 

@@ -17,19 +17,57 @@ export const SYNTHETIC_CLASS_ID = "990099";
 
 export type LookupRequestCounts = { exams: number; studentCode: number; studentId: number; transcript: number };
 
-export async function openMockedLookup(page: import("@playwright/test").Page, bulkMaximum: number | null = 50): Promise<LookupRequestCounts> {
+const mockUniversity = {
+  id: "mock",
+  name: "Hyeboard Demo University",
+  shortName: "Demo",
+  theme: { primary: "#0A0A0A", accent: "#525252", soft: "#F5F5F5" },
+  capabilities: {
+    profile: true, terms: true, timetable: true, courses: true, assignments: true,
+    grades: true, exams: true, attendance: true, notifications: true, documents: true,
+    tuition: true, news: true, trainingPoints: true, requests: true, classLookup: true,
+    crossLookup: true,
+  },
+} as const;
+
+const vnuUniversity = {
+  id: "vnu",
+  name: "Vietnam National University, Hanoi (daotao portal)",
+  shortName: "VNU (daotao)",
+  theme: { primary: "#7A1E28", accent: "#B23A47", soft: "#FBEEEE" },
+  capabilities: {
+    profile: true, terms: true, timetable: false, courses: false, assignments: false,
+    grades: true, exams: true, attendance: false, notifications: false, documents: true,
+    tuition: false, news: false, trainingPoints: true, requests: false, classLookup: true,
+    crossLookup: true,
+  },
+} as const;
+
+function lookupUniversitiesResponse(universities: readonly Record<string, unknown>[]) {
+  return { data: universities, error: null };
+}
+
+export async function openMockedLookup(
+  page: import("@playwright/test").Page,
+  bulkMaximum: number | null = 50,
+  directChunkMaximum: number | undefined = 5,
+  modeMaximums?: Record<string, number>,
+  crossDetailMaximum?: number,
+  includeDetailPermits = false,
+): Promise<LookupRequestCounts> {
   const requestCounts: LookupRequestCounts = { exams: 0, studentCode: 0, studentId: 0, transcript: 0 };
   await page.route("**/api/universities", async (route) => {
-    const response = await route.fetch();
-    const payload = await response.json() as { data: Array<{ id: string; capabilities: Record<string, boolean>; limits?: { crossLookup?: { bulkMaxTargets: number } } }> };
-    const mock = payload.data.find((university) => university.id === "mock");
-    if (mock) {
-      mock.capabilities.classLookup = true;
-      mock.capabilities.crossLookup = true;
-      if (bulkMaximum === null) delete mock.limits;
-      else mock.limits = { crossLookup: { bulkMaxTargets: bulkMaximum } };
-    }
-    await route.fulfill({ response, json: payload });
+    const limits = bulkMaximum === null ? {} : {
+      limits: {
+        crossLookup: {
+          bulkMaxTargets: bulkMaximum,
+          ...(directChunkMaximum === undefined ? {} : { bulkDirectChunkMaxTargets: directChunkMaximum }),
+          ...(modeMaximums === undefined ? {} : { bulkModeMaxTargets: modeMaximums }),
+          ...(crossDetailMaximum === undefined ? {} : { crossDetail: { maxTargets: 1, maxRows: crossDetailMaximum, concurrency: 1 } }),
+        },
+      },
+    };
+    await route.fulfill({ status: 200, contentType: "application/json", json: lookupUniversitiesResponse([{ ...mockUniversity, ...limits }]) });
   });
   await page.route("**/api/vnu/raw/profile", async (route) => {
     const html = `<input name="StdCode" value="${SYNTHETIC_OWN_STUDENT_CODE}"><input name="StdName" value="Synthetic Demo"><input name="hidStdID" value="${SYNTHETIC_OWN_INTERNAL_ID}">`;
@@ -67,12 +105,13 @@ export async function openMockedLookup(page: import("@playwright/test").Page, bu
         header: { studentCode: SYNTHETIC_TARGET_STUDENT_CODE, studentName: "Synthetic Target", className: "SYNTHETIC-99" },
         totals: { totalCredits: 8, accumulatedCredits: 6, gpa4: 3.91 },
         terms: [
-          { maHK: "251", rows: [{ courseCode: "SYN9901", courseName: "Synthetic Foundations", credits: 3, grade10: 8, letterGrade: "B", grade4: 3 }] },
+          { maHK: "251", rows: [{ courseCode: "SYN9901", courseName: "Synthetic Foundations", classId: "SYNTHETIC-DETAIL-CLASS", termOrdinal: "251", credits: 3, grade10: 8, letterGrade: "B", grade4: 3 }] },
           { maHK: "252", rows: [
             { courseCode: "SYN9902", courseName: "Synthetic Resolution", credits: 3, grade10: 9, letterGrade: "A", grade4: 4 },
             { courseCode: "SYN9903", courseName: "Synthetic Pending", credits: 2 },
           ] },
         ],
+        ...(includeDetailPermits ? { detailPermits: [{ termIndex: 0, rowIndex: 0, permit: "synthetic-detail-permit" }] } : {}),
       }, error: null }),
     });
   });
@@ -96,6 +135,16 @@ export async function switchDemoShellToVnu(page: import("@playwright/test").Page
 
 export async function openMockedVnuLookup(page: import("@playwright/test").Page): Promise<() => number> {
   let examRequests = 0;
+  await page.route("**/api/universities", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      json: lookupUniversitiesResponse([{
+        ...vnuUniversity,
+        limits: { crossLookup: { bulkMaxTargets: 50, bulkDirectChunkMaxTargets: 5 } },
+      }]),
+    });
+  });
   await page.route("**/api/vnu/raw/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
     if (path === "/api/vnu/raw/exams") examRequests += 1;

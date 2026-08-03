@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   isDaotaoSessionExpired,
+  findPointDetailSelector,
   parseExamCatalogHtml,
   parseExamsHtml,
   parseGradesHtml,
@@ -12,7 +13,11 @@ import {
 import {
   loginFormHtml,
   mixedAttributeLoginFormHtml,
+  paragraphSessionEndedNoticeHttpHtml,
+  paragraphSessionEndedNoticeHtml,
   standaloneSessionEndedNoticeHtml,
+  xhtmlParagraphSessionEndedNoticeHttpHtml,
+  xhtmlParagraphSessionEndedNoticeHttpsHtml,
 } from "./session-expiry-fixtures";
 
 const transcriptHtml = `
@@ -56,6 +61,9 @@ describe("VNU course-code cells", () => {
     ["repeated spaces", "INT   3103", "INT 3103"],
     ["tabs and newlines", "INT\t\n3103Z", "INT 3103Z"],
     ["intervening tags", "INT<span></span>3103", "INT 3103"],
+    ["single namespace", "UET.COM1050", "UET.COM1050"],
+    ["repeated namespaces", "VNU.UET.COM1050", "VNU.UET.COM1050"],
+    ["numeric namespace segments", "ABC2.DEF3.COM1050", "ABC2.DEF3.COM1050"],
   ])("preserves normalized display for %s in grades, term groups, transcript, and syllabus", (_case, source, display) => {
     const gradesHtml = `<table><tr><td>HỌC KỲ. MÃ HỌC KỲ 252</td></tr>${gradeRow(source)}</table>`;
     const grades = parseGradesHtml(gradesHtml);
@@ -78,6 +86,8 @@ describe("VNU course-code cells", () => {
     ["punctuation", "INT-3103"],
     ["bare hyphen suffix", "INE2102-"],
     ["multiple hyphen suffixes", "INE2102-E-F"],
+    ["namespace without a terminal course code", "VNU.UET."],
+    ["malformed namespace delimiter", "VNU..UET.COM1050"],
   ])("skips malformed %s grade and syllabus rows", (_case, source) => {
     expect(parseGradesHtml(`<table>${gradeRow(source)}</table>`).rows).toEqual([]);
     expect(parseSyllabusHtml(`<table>${syllabusRow(source)}</table>`)).toEqual([]);
@@ -98,6 +108,7 @@ describe("VNU exam composite codes", () => {
     ["252-INT 3103--71", { termCode: "252", courseCode: "INT 3103", classNo: "71" }],
     ["252-đt&nbsp;3103Z-CN07", { termCode: "252", courseCode: "đt 3103Z", classNo: "CN07" }],
     ["252-INT<span></span>3103A\tCN7", { termCode: "252", courseCode: "INT 3103A", classNo: "CN7" }],
+    ["252-VNU.UET.COM1050 6", { termCode: "252", courseCode: "VNU.UET.COM1050", classNo: "6" }],
   ])("parses %s identically for schedules and catalogs", (source, expected) => {
     expect(parseExamsHtml(`<table>${examRow(source)}</table>`)[0]).toMatchObject(expected);
     expect(parseExamCatalogHtml(`<table>${examRow(source, "CLASS-SYNTHETIC")}</table>`)[0]).toMatchObject({
@@ -164,6 +175,8 @@ describe("parseTranscriptHtml", () => {
 
     expect(grades.rows).toHaveLength(2);
     expect(grades.rows[0]).toMatchObject({ classId: "123456", termOrdinal: "42" });
+    expect(grades.rows[0]).not.toHaveProperty("detailStudentId");
+    expect(findPointDetailSelector(transcriptHtml, "123456", "42")).toBe("00000000001");
     expect(transcript).toEqual({
       header: { studentName: "SYNTHETIC STUDENT", studentCode: "20000001", className: "QH-SYNTHETIC" },
       terms: [
@@ -190,6 +203,7 @@ describe("parseTranscriptHtml", () => {
       totals: { totalCredits: 5, accumulatedCredits: 4, gpa4: 3.25 },
       notice: undefined,
     });
+    expect(transcript.terms[0]?.rows[0]).not.toHaveProperty("detailStudentId");
   });
 
   it("fails closed on malformed identity, scores, and detail arguments", () => {
@@ -204,6 +218,53 @@ describe("parseTranscriptHtml", () => {
       totals: {},
       notice: undefined,
     });
+  });
+
+  it("omits malformed detail selectors while retaining the public row shape", () => {
+    const html = `<table>
+      <tr><td>HỌC KỲ 1 - 2025-2026. MÃ HỌC KỲ 251</td></tr>
+      <tr><td>1</td><td>INT1001</td><td>Reliable Systems</td><td>3</td><td>8</td><td>B</td><td>3</td><td><img onclick="detailPoint('123456','8','not-numeric','42')"></td></tr>
+    </table>`;
+
+    const grades = parseGradesHtml(html);
+    expect(grades.rows[0]).toMatchObject({ classId: "123456", termOrdinal: "42" });
+    expect(grades.rows[0]).not.toHaveProperty("detailStudentId");
+    expect(parseTranscriptHtml(html).terms[0]?.rows[0]).not.toHaveProperty("detailStudentId");
+  });
+
+  it.each([
+    ["too short", "0000000001"],
+    ["too long", "000000000001"],
+    ["non-ASCII", "００００００００００１"],
+    ["non-numeric", "0000000000a"],
+  ])("omits a %s point-detail selector", (_case, selector) => {
+    const html = `<table><tr><td>HỌC KỲ 1. MÃ HỌC KỲ 251</td></tr><tr><td>1</td><td>INT1001</td><td>Synthetic Course</td><td>3</td><td>8</td><td>B</td><td>3</td><td><img onclick="detailPoint('123456','8','${selector}','42')"></td></tr></table>`;
+
+    const row = parseGradesHtml(html).rows[0];
+    expect(row).toMatchObject({ classId: "123456", termOrdinal: "42" });
+    expect(row).not.toHaveProperty("detailStudentId");
+    expect(findPointDetailSelector(html, "123456", "42")).toBeUndefined();
+  });
+
+  it("omits the selector when one transcript row has multiple detailPoint invocations", () => {
+    const html = `<table><tr><td>HỌC KỲ 1. MÃ HỌC KỲ 251</td></tr><tr><td>1</td><td>INT1001</td><td>Synthetic Course</td><td>3</td><td>8</td><td>B</td><td>3</td><td><img onclick="detailPoint('123456','8','00000000001','42')"><img onclick="detailPoint('123456','8','00000000002','42')"></td></tr></table>`;
+
+    const row = parseGradesHtml(html).rows[0];
+    expect(row).toMatchObject({ classId: undefined, termOrdinal: undefined });
+    expect(row).not.toHaveProperty("detailStudentId");
+    expect(findPointDetailSelector(html, "123456", "42")).toBeUndefined();
+  });
+
+  it.each([
+    ["an extra argument", `detailPoint('654321','8','00000000002','42','extra')`],
+    ["malformed arguments", `detailPoint('654321', malformed)`],
+  ])("fails closed when a canonical invocation is accompanied by %s", (_case, secondInvocation) => {
+    const html = `<table><tr><td>HỌC KỲ 1. MÃ HỌC KỲ 251</td></tr><tr><td>1</td><td>INT1001</td><td>Synthetic Course</td><td>3</td><td>8</td><td>B</td><td>3</td><td><img onclick="detailPoint('123456','8','00000000001','42')"><img onclick="${secondInvocation}"></td></tr></table>`;
+
+    const row = parseGradesHtml(html).rows[0];
+    expect(row).toMatchObject({ classId: undefined, termOrdinal: undefined });
+    expect(row).not.toHaveProperty("detailStudentId");
+    expect(findPointDetailSelector(html, "123456", "42")).toBeUndefined();
   });
 
   it("decodes table-cell entities exactly once", () => {
@@ -248,8 +309,25 @@ describe("parsePortalNotice entity decoding", () => {
 describe("isDaotaoSessionExpired", () => {
   const authenticatedUrl = "https://daotao.vnu.edu.vn/StdInfo/StudentProfile.asp";
 
-  it("matches the trusted login URL case-insensitively and permits a query", () => {
-    expect(isDaotaoSessionExpired("https://daotao.vnu.edu.vn/DKMH/LOGIN.ASP?return=profile", "")).toBe(true);
+  it.each([
+    "https://daotao.vnu.edu.vn/dkmh/login.asp",
+    "http://daotao.vnu.edu.vn/dkmh/login.asp",
+  ])("matches the trusted %s login URL", (finalUrl) => {
+    expect(isDaotaoSessionExpired(finalUrl, "")).toBe(true);
+  });
+
+  it.each([
+    ["query", "https://daotao.vnu.edu.vn/dkmh/login.asp?return=profile"],
+    ["fragment", "https://daotao.vnu.edu.vn/dkmh/login.asp#login"],
+    ["path case variant", "https://daotao.vnu.edu.vn/DKMH/login.asp"],
+    ["trailing slash", "https://daotao.vnu.edu.vn/dkmh/login.asp/"],
+    ["encoded path", "https://daotao.vnu.edu.vn/dkmh/%6coin.asp"],
+    ["HTTPS default port", "https://daotao.vnu.edu.vn:443/dkmh/login.asp"],
+    ["HTTP default port", "http://daotao.vnu.edu.vn:80/dkmh/login.asp"],
+    ["HTTPS non-default port", "https://daotao.vnu.edu.vn:8443/dkmh/login.asp"],
+    ["HTTP non-default port", "http://daotao.vnu.edu.vn:8080/dkmh/login.asp"],
+  ])("rejects a trusted login URL with a %s", (_case, finalUrl) => {
+    expect(isDaotaoSessionExpired(finalUrl, "")).toBe(false);
   });
 
   it("rejects a login-looking URL on a foreign origin", () => {
@@ -313,6 +391,103 @@ describe("isDaotaoSessionExpired", () => {
     expect(isDaotaoSessionExpired(authenticatedUrl, standaloneSessionEndedNoticeHtml)).toBe(true);
   });
 
+  it("matches the known XHTML paragraph session-ended notice", () => {
+    expect(isDaotaoSessionExpired(authenticatedUrl, paragraphSessionEndedNoticeHtml)).toBe(true);
+  });
+
+  it("matches the known XHTML paragraph session-ended notice with an HTTP login anchor", () => {
+    expect(isDaotaoSessionExpired(authenticatedUrl, paragraphSessionEndedNoticeHttpHtml)).toBe(true);
+  });
+
+  it.each([
+    ["HTTP", xhtmlParagraphSessionEndedNoticeHttpHtml],
+    ["HTTPS", xhtmlParagraphSessionEndedNoticeHttpsHtml],
+  ])("matches the exact XHTML notification variant with a %s login anchor", (_scheme, html) => {
+    expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(true);
+  });
+
+  it("matches the live XHTML notification shape with CRLF line endings", () => {
+    const crlfHtml = xhtmlParagraphSessionEndedNoticeHttpHtml.replace(/\n/g, "\r\n");
+    expect(isDaotaoSessionExpired(authenticatedUrl, crlfHtml)).toBe(true);
+  });
+
+  it.each([
+    ["wrong", "/dkmh/not-login.asp"],
+    ["foreign", "https://example.invalid/dkmh/login.asp"],
+    ["relative", "dkmh/login.asp"],
+    ["userinfo", "https://user@daotao.vnu.edu.vn/dkmh/login.asp"],
+    ["subdomain", "https://login.daotao.vnu.edu.vn/dkmh/login.asp"],
+    ["suffix", "https://daotao.vnu.edu.vn.example.invalid/dkmh/login.asp"],
+    ["query", "https://daotao.vnu.edu.vn/dkmh/login.asp?return=profile"],
+    ["fragment", "https://daotao.vnu.edu.vn/dkmh/login.asp#login"],
+    ["HTTPS default port", "https://daotao.vnu.edu.vn:443/dkmh/login.asp"],
+    ["HTTP default port", "http://daotao.vnu.edu.vn:80/dkmh/login.asp"],
+    ["HTTPS non-default port", "https://daotao.vnu.edu.vn:8443/dkmh/login.asp"],
+    ["HTTP non-default port", "http://daotao.vnu.edu.vn:8080/dkmh/login.asp"],
+    ["other path", "https://daotao.vnu.edu.vn/dkmh/login.asp/extra"],
+    ["other scheme", "ftp://daotao.vnu.edu.vn/dkmh/login.asp"],
+  ])("rejects a paragraph notice with a %s login destination", (_case, href) => {
+    const html = paragraphSessionEndedNoticeHtml.replace("https://daotao.vnu.edu.vn/dkmh/login.asp", href);
+
+    expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(false);
+  });
+
+  it.each([
+    ["changed title text", xhtmlParagraphSessionEndedNoticeHttpHtml.replace("Thông báo", "Thông báo lỗi")],
+    ["changed first-line text", xhtmlParagraphSessionEndedNoticeHttpHtml.replace("Bạn chưa đăng nhập hoặc phiên làm việc của bạn đã hết", "Bạn chưa đăng nhập.")],
+    ["changed login label", xhtmlParagraphSessionEndedNoticeHttpHtml.replace("vào đây", "đăng nhập")],
+    // Mutations below anchor on unique surrounding text, not first occurrence
+    // of `<br>`/`</p>`, so a future fixture edit can't silently retarget them.
+    ["missing break", xhtmlParagraphSessionEndedNoticeHttpHtml.replace("hết<br><br>", "hết<br>")],
+    ["extra double break", xhtmlParagraphSessionEndedNoticeHttpHtml.replace("lại\n    </p>", "lại\n    <br><br></p>")],
+    ["double meta tag", xhtmlParagraphSessionEndedNoticeHttpHtml.replace("<title>", "<meta name=\"synthetic\"><title>")],
+    ["head extra content", xhtmlParagraphSessionEndedNoticeHttpHtml.replace("</title>", "</title><meta name=\"synthetic\">")],
+    ["body extra content", xhtmlParagraphSessionEndedNoticeHttpHtml.replace("</p>", "<p>Authenticated content</p></p>")],
+    ["hidden markup", xhtmlParagraphSessionEndedNoticeHttpHtml.replace("<p>", "<p hidden>")],
+    ["interactive markup", xhtmlParagraphSessionEndedNoticeHttpHtml.replace("</p>", "<button>Continue</button></p>")],
+    ["script markup", xhtmlParagraphSessionEndedNoticeHttpHtml.replace("</head>", "<script>void 0</script></head>")],
+    ["style markup", xhtmlParagraphSessionEndedNoticeHttpHtml.replace("</head>", "<style>p{}</style></head>")],
+    ["template markup", xhtmlParagraphSessionEndedNoticeHttpHtml.replace("</body>", "<template>notice</template></body>")],
+    ["table markup", xhtmlParagraphSessionEndedNoticeHttpHtml.replace("<p>", "<table><tr><td><p>").replace("</p>", "</p></td></tr></table>")],
+  ])("rejects the XHTML notification variant with %s", (_case, html) => {
+    expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(false);
+  });
+
+  it.each([
+    ["foreign host", "http://example.invalid/dkmh/login.asp"],
+    ["userinfo", "http://user@daotao.vnu.edu.vn/dkmh/login.asp"],
+    ["query", "http://daotao.vnu.edu.vn/dkmh/login.asp?return=profile"],
+    ["fragment", "http://daotao.vnu.edu.vn/dkmh/login.asp#login"],
+    ["HTTP explicit port", "http://daotao.vnu.edu.vn:80/dkmh/login.asp"],
+    ["HTTPS explicit port", "https://daotao.vnu.edu.vn:443/dkmh/login.asp"],
+    ["other scheme", "ftp://daotao.vnu.edu.vn/dkmh/login.asp"],
+  ])("rejects the XHTML notification variant with an unsafe %s anchor", (_case, href) => {
+    const html = xhtmlParagraphSessionEndedNoticeHttpHtml.replace(
+      "http://daotao.vnu.edu.vn/dkmh/login.asp",
+      href,
+    );
+    expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(false);
+  });
+
+  it.each([
+    ["extra prose", paragraphSessionEndedNoticeHtml.replace("</p>", "Authenticated portal content</p>")],
+    ["an additional anchor", paragraphSessionEndedNoticeHtml.replace("</p>", '<a href="https://daotao.vnu.edu.vn/dkmh/login.asp">Another link</a></p>')],
+    ["an interactive control", paragraphSessionEndedNoticeHtml.replace("</p>", '<input name="state"></p>')],
+    ["a hidden paragraph", paragraphSessionEndedNoticeHtml.replace("<p>", '<p hidden>')],
+    ["an altered login label", paragraphSessionEndedNoticeHtml.replace("Sign in", "Continue")],
+    ["a missing presentation break", paragraphSessionEndedNoticeHtml.replace("<br />", "")],
+    ["an additional presentation break", paragraphSessionEndedNoticeHtml.replace("</p>", "<br /></p>")],
+    ["a non-XHTML document", paragraphSessionEndedNoticeHtml.replace(' xmlns="http://www.w3.org/1999/xhtml"', "")],
+  ])("rejects a paragraph notice with %s", (_case, html) => {
+    expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(false);
+  });
+
+  it.each(["script", "style", "template"])("rejects a notice that exists only inside %s", (container) => {
+    const html = `<html><body><div><table><tbody><tr><td><${container}>Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.</${container}></td></tr></tbody></table></div></body></html>`;
+
+    expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(false);
+  });
+
   it("uses body evidence when the final URL is malformed", () => {
     expect(isDaotaoSessionExpired("not a URL", standaloneSessionEndedNoticeHtml)).toBe(true);
   });
@@ -321,6 +496,9 @@ describe("isDaotaoSessionExpired", () => {
     ["an extra row", `<html><body><table><tr><td>Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.</td></tr><tr><td></td></tr></table></body></html>`],
     ["an extra cell", `<html><body><table><tr><td>Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.</td><td></td></tr></table></body></html>`],
     ["an empty button", `<html><body><table><tr><td>Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.<button></button></td></tr></table></body></html>`],
+    ["a presentation wrapper with extra prose", `<html><body><div><table><tbody><tr><td>Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.</td></tr></tbody></table></div><p>Authenticated profile</p></body></html>`],
+    ["an extra anchor", `<html><body><table><tr><td>Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.<a href="/dkmh/login.asp">Sign in</a></td></tr></table></body></html>`],
+    ["a hidden ancestor", `<html hidden><body><table><tr><td>Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.</td></tr></table></body></html>`],
   ])("rejects a standalone notice with %s", (_case, html) => {
     expect(isDaotaoSessionExpired(authenticatedUrl, html)).toBe(false);
   });

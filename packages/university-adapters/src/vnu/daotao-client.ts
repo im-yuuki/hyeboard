@@ -103,11 +103,11 @@ export class DaotaoClient {
   }
 
   // ListPoint/detailPoint.asp — per-component grade breakdown popup. The
-  // stdId here must come from the session owner's own profile (server-side),
+  // stdId here must come from the authenticated grades row (server-side),
   // never from a client query param; val is a cosmetic echo the portal
   // renders into the footer without validating it (see har-notes.md).
-  getPointDetailHtml(params: { id: string; stdId: string; term: string; val?: string }): Promise<string> {
+  getPointDetailHtml(params: { id: string; stdId: string; term: string; val?: string }, signal?: AbortSignal): Promise<string> {
     const query = new URLSearchParams({ id: params.id, val: params.val ?? "", StdID: params.stdId, Term: params.term });
-    return this.fetchPage(`/ListPoint/detailPoint.asp?${query.toString()}`);
+    return this.fetchPage(`/ListPoint/detailPoint.asp?${query.toString()}`, signal);
   }
 }

@@ -26,10 +26,10 @@ export type VnuGradeRow = {
   point10?: number;
   letter?: string;
   point4?: number;
-  // Both lifted from the row's "Chi tiết" cell <img onClick="detailPoint(
-  // '{classId}','{grade10}','{stdId}','{termOrdinal}')"> — absent when the
-   // row renders no detail link. Own grades preserve these only to request
-   // the authenticated student's component breakdown.
+  // Lifted from the row's "Chi tiết" cell <img onClick="detailPoint(
+  // '{classId}','{grade10}','{internalSelector}','{termOrdinal}')"> — absent
+  // when the row renders no detail link. The internal selector remains
+  // server-only; public rows preserve only these safe lookup fields.
   classId?: string;
   termOrdinal?: string;
 };
@@ -57,6 +57,10 @@ export type VnuTranscriptRow = {
   grade4?: number;
   classId?: string;
   termOrdinal?: string;
+  // Opaque single-use cross-detail permit minted by the worker after a
+  // validated cross-transcript fetch (never set by the parser; absent when
+  // the feature is disabled, the row is ineligible, or mint caps are hit).
+  detailPermit?: string;
 };
 
 export type VnuTranscriptTerm = {

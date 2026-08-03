@@ -9,7 +9,17 @@
   },
   "vnu": {
     "code_lookup_concurrency": 64,
-    "cross_lookup_bulk_max_targets": 500
+    "cross_lookup_bulk_max_targets": 500,
+    "cross_lookup_direct_chunk_max_targets": 32,
+    "code_lookup_bulk_target_concurrency": 3,
+    "cross_lookup_request_timeout_ms": 60000,
+    "cross_detail_max_targets": 50,
+    "cross_detail_max_rows": 200,
+    "cross_detail_concurrency": 6,
+    "cross_detail_budget": 300,
+    "cross_detail_window_seconds": 600,
+    "cross_detail_permit_ttl_seconds": 60,
+    "cross_detail_export_mode": "selected"
   },
   "log_level": "info",
   "host": "127.0.0.1",

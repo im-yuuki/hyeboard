@@ -20,14 +20,32 @@ import type {
 } from "./types";
 import { collapseVnuCourseCodeDisplay } from "./course-code";
 
-const DAOTAO_ORIGIN = "https://daotao.vnu.edu.vn";
+const DAOTAO_HOST = "daotao.vnu.edu.vn";
+const DAOTAO_ORIGINS = new Set(["http://daotao.vnu.edu.vn", "https://daotao.vnu.edu.vn"]);
 const DAOTAO_LOGIN_PATH = "/dkmh/login.asp";
 const DAOTAO_SESSION_ENDED_SENTENCE = "Phiên làm việc đã kết thúc. Vui lòng đăng nhập lại hệ thống.";
+const DAOTAO_SESSION_ENDED_FIRST_LINE = "Phiên làm việc đã kết thúc.";
+const DAOTAO_SESSION_ENDED_SECOND_LINE = "Vui lòng đăng nhập lại hệ thống.";
+const DAOTAO_PARAGRAPH_LOGIN_LABELS = new Set(["Sign in"]);
+const DAOTAO_NOTIFICATION_DOCTYPE = '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">';
+const DAOTAO_NOTIFICATION_DOCTYPE_ESCAPED = DAOTAO_NOTIFICATION_DOCTYPE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const DAOTAO_NOTIFICATION_TITLE = "Thông báo";
+const DAOTAO_NOTIFICATION_SESSION_ENDED_FIRST_LINE = "Bạn chưa đăng nhập hoặc phiên làm việc của bạn đã hết";
+const DAOTAO_NOTIFICATION_LOGIN_PREFIX = "Xin vui lòng bấm";
+const DAOTAO_NOTIFICATION_LOGIN_LABEL = "vào đây";
+const DAOTAO_NOTIFICATION_LOGIN_SUFFIX = "để đăng nhập lại";
 const HTML_ENTITY_RE = /&(?:nbsp|amp|lt|gt|quot|#[^;&\s]*);/gi;
-const VNU_COURSE_CODE_SOURCE = "[A-Za-zĐđ]{2,6} ?\\d{3,4}[A-Za-zĐđ]*(?:-[A-Za-zĐđ]+)?";
+const VNU_COURSE_CODE_TERMINAL_SOURCE = "[A-Za-zĐđ]{2,6} ?\\d{3,4}[A-Za-zĐđ]*(?:-[A-Za-zĐđ]+)?";
+const VNU_COURSE_CODE_SOURCE = `(?:[A-Za-z0-9]+\\.)*${VNU_COURSE_CODE_TERMINAL_SOURCE}`;
 const VNU_COURSE_CODE_RE = new RegExp(`^${VNU_COURSE_CODE_SOURCE}$`);
 const VNU_EXAM_COMPOSITE_RE = new RegExp(
   `^(\\d{3})-(${VNU_COURSE_CODE_SOURCE})(?:[ -]+(\\d+|[A-Za-zĐđ]+\\d+))?$`,
+);
+const VNU_MALFORMED_COMPOSITE_SUFFIX_RE = new RegExp(
+  `^\\d{3}-${VNU_COURSE_CODE_SOURCE}-(?:$|[^\\sA-Za-zĐđ]|[A-Za-zĐđ]+-)`,
+);
+const DAOTAO_NOTIFICATION_RE = new RegExp(
+  `^\\s*${DAOTAO_NOTIFICATION_DOCTYPE_ESCAPED}\\s*<html xmlns="http://www\\.w3\\.org/1999/xhtml">\\s*<head>\\s*(?:<meta[^>]*>\\s*)?<title>\\s*([^<>]*?)\\s*</title>\\s*</head>\\s*<body>\\s*<p>\\s*<br>\\s*([^<>]*?)\\s*<br>\\s*<br>\\s*([^<>]*?)\\s*<a href="([^"]*)">([^<>]*)</a>\\s*([^<>]*?)\\s*(?:<br>\\s*)?</p>\\s*</body>\\s*</html>\\s*$`,
 );
 
 function decodeEntities(text: string): string {
@@ -127,6 +145,27 @@ function tdCells(rowHtml: string): string[] {
   return [...rowHtml.matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/gi)].map((m) => stripTags(m[1]));
 }
 
+type DetailPointInvocation = {
+  classId: string;
+  termOrdinal: string;
+  detailStudentId?: string;
+};
+
+function parseUniqueDetailPointInvocation(rowHtml: string): DetailPointInvocation | undefined {
+  const lexicalInvocations = [...rowHtml.matchAll(/\bdetailPoint\s*\(/gi)];
+  if (lexicalInvocations.length !== 1) return undefined;
+
+  const invocations = [...rowHtml.matchAll(/detailPoint\s*\(\s*['"]([^'"]+)['"]\s*,\s*['"][^'"]*['"]\s*,\s*['"]([^'"]*)['"]\s*,\s*['"]([^'"]+)['"]\s*\)/gi)];
+  if (invocations.length !== 1) return undefined;
+
+  const [, classId, detailStudentId, termOrdinal] = invocations[0];
+  return {
+    classId,
+    termOrdinal,
+    ...(/^[0-9]{11}$/.test(detailStudentId) ? { detailStudentId } : {}),
+  };
+}
+
 // ListPoint/listpoint_Brc1.asp — term-grouped transcript table plus
 // plain-text cumulative summary lines after the table.
 export function parseGradesHtml(html: string): VnuGradesResult {
@@ -153,9 +192,9 @@ export function parseGradesHtml(html: string): VnuGradesResult {
       const credits = parseOptionalNumber(cells[3]);
       const point10 = parseOptionalNumber(cells[4]);
       const point4 = parseOptionalNumber(cells[6]);
-      const detailMatch = match[1].match(/detailPoint\s*\(\s*['"]([^'"]+)['"]\s*,\s*['"][^'"]*['"]\s*,\s*['"][^'"]*['"]\s*,\s*['"]([^'"]+)['"]\s*\)/i);
-      const classId = detailMatch?.[1]?.trim();
-      const termOrdinal = detailMatch?.[2]?.trim();
+      const detailPoint = parseUniqueDetailPointInvocation(match[1]);
+      const classId = detailPoint?.classId.trim();
+      const termOrdinal = detailPoint?.termOrdinal.trim();
       const row: VnuGradeRow = {
         termCode: currentTermCode ?? "",
         termLabel: currentTermLabel ?? "",
@@ -183,6 +222,19 @@ export function parseGradesHtml(html: string): VnuGradesResult {
     totalAccumulatedCredits: accumulatedMatch ? Number.parseFloat(accumulatedMatch[1]) : undefined,
     cumulativeGpa4: cumulativeGpaMatch ? Number.parseFloat(cumulativeGpaMatch[1]) : undefined,
   };
+}
+
+export function findPointDetailSelector(html: string, classId: string, termOrdinal: string): string | undefined {
+  const selectors: string[] = [];
+  for (const match of html.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)) {
+    const cells = tdCells(match[1]);
+    if (cells.length < 7 || !VNU_COURSE_CODE_RE.test(cells[1] ?? "")) continue;
+
+    const detailPoint = parseUniqueDetailPointInvocation(match[1]);
+    if (detailPoint?.classId.trim() !== classId || detailPoint.termOrdinal.trim() !== termOrdinal || !detailPoint.detailStudentId) continue;
+    selectors.push(detailPoint.detailStudentId);
+  }
+  return selectors.length === 1 ? selectors[0] : undefined;
 }
 
 // Full server-side model for ListPoint/listpoint_Brc1.asp. Grade-table parsing
@@ -297,7 +349,7 @@ function parseCatalogCode(raw: string): { termCode?: string; courseCode: string;
   if (strict) {
     return strict;
   }
-  if (/^\d{3}-[A-Za-zĐđ]{2,6} ?\d{3,4}[A-Za-zĐđ]*-(?:$|[^\sA-Za-zĐđ]|[A-Za-zĐđ]+-)/.test(raw)) {
+  if (VNU_MALFORMED_COMPOSITE_SUFFIX_RE.test(raw)) {
     return { courseCode: raw };
   }
   // Fallback for shapes that don't fit the common pattern: still split off a
@@ -579,15 +631,27 @@ function hasCompleteLoginForm(html: string): boolean {
 }
 
 function isTrustedLoginUrl(finalUrl: string): boolean {
+  if (hasExplicitPortInAbsoluteHref(finalUrl)) return false;
+
   try {
     const url = new URL(finalUrl);
-    return url.origin === DAOTAO_ORIGIN && url.pathname.toLowerCase() === DAOTAO_LOGIN_PATH;
+    return DAOTAO_ORIGINS.has(url.origin)
+      && url.hostname === DAOTAO_HOST
+      && url.port === ""
+      && url.username === ""
+      && url.password === ""
+      && url.pathname === DAOTAO_LOGIN_PATH
+      && url.search === ""
+      && url.hash === "";
   } catch {
     return false;
   }
 }
 
 function hasStandaloneSessionEndedNotice(html: string): boolean {
+  if ((html.match(/<body\b[^>]*>/gi) ?? []).length !== 1) return false;
+  if ((html.match(/<\/body\s*>/gi) ?? []).length !== 1) return false;
+
   const bodyMatch = html.match(/<body\b[^>]*>([\s\S]*?)<\/body\s*>/i);
   if (!bodyMatch) return false;
 
@@ -595,14 +659,70 @@ function hasStandaloneSessionEndedNotice(html: string): boolean {
   if ((body.match(/<table\b/gi) ?? []).length !== 1) return false;
   if ((body.match(/<tr\b/gi) ?? []).length !== 1) return false;
   if ((body.match(/<td\b/gi) ?? []).length !== 1) return false;
-  if (/<(?:form|input|select|textarea|button)\b/i.test(body)) return false;
+  if (/<(?:a|form|input|select|textarea|button|script|style|template)\b/i.test(body)) return false;
   if (!/^\s*<table\b[^>]*>\s*<tr\b[^>]*>\s*<td\b[^>]*>[\s\S]*<\/td\s*>\s*<\/tr\s*>\s*<\/table\s*>\s*$/i.test(body)) return false;
 
+  const documentTags = html.match(/<\/?[a-z][^>]*>/gi) ?? [];
+  if (documentTags.some((tag) => hasHiddenOrInertAttribute(tag))) return false;
+
+  const bodyTags = body.match(/<\/?[a-z][^>]*>/gi) ?? [];
+  if (bodyTags.some((tag) => !isLegacyPresentationTag(tag) && !/^<\/?(?:table|tr|td)\b/i.test(tag))) return false;
+
   return stripTags(body) === DAOTAO_SESSION_ENDED_SENTENCE;
+}
+
+function hasHiddenOrInertAttribute(tag: string): boolean {
+  return /(?:^|\s)(?:hidden|inert)(?=\s|=|\/|>|$)|(?:^|\s)aria-hidden\s*=\s*(?:"true"|'true'|true)(?=\s|\/|>|$)|\bstyle\s*=\s*(?:"[^"]*(?:display\s*:\s*none|visibility\s*:\s*hidden)[^"]*"|'[^']*(?:display\s*:\s*none|visibility\s*:\s*hidden)[^']*')/i.test(tag);
+}
+
+function isLegacyPresentationTag(tag: string): boolean {
+  return /^<\/?(?:b|br|em|font|i|p|span|strong|u)\b[^>]*>$/i.test(tag);
+}
+
+function hasExplicitPortInAbsoluteHref(href: string): boolean {
+  const authorityMatch = /^[a-z][a-z\d+.-]*:\/\/([^/?#]*)/i.exec(href);
+  if (!authorityMatch) return false;
+
+  const authority = authorityMatch[1];
+  const hostAndPort = authority.slice(authority.lastIndexOf("@") + 1);
+  return hostAndPort.includes(":");
+}
+
+function isTrustedParagraphLoginHref(href: string): boolean {
+  return isTrustedLoginUrl(href);
+}
+
+function hasStandaloneParagraphSessionEndedNotice(html: string): boolean {
+  const match = /^\s*<html xmlns="http:\/\/www\.w3\.org\/1999\/xhtml">\s*<body>\s*<p>\s*([\s\S]*?)<br \/>\s*([\s\S]*?)<br \/>\s*<a href="([^"]*)">([^<]*)<\/a>\s*<br \/>\s*<\/p>\s*<\/body>\s*<\/html>\s*$/.exec(html);
+  if (!match) return false;
+
+  const [, firstLine, secondLine, href, loginLabel] = match;
+  if (decodeEntities(firstLine) !== DAOTAO_SESSION_ENDED_FIRST_LINE) return false;
+  if (decodeEntities(secondLine) !== DAOTAO_SESSION_ENDED_SECOND_LINE) return false;
+  return isTrustedParagraphLoginHref(href) && DAOTAO_PARAGRAPH_LOGIN_LABELS.has(loginLabel);
+}
+
+function normalizeNotificationText(text: string): string {
+  return decodeEntities(text).replace(/[\t\n\r\f ]+/g, " ").trim();
+}
+
+function hasXhtmlNotificationSessionEndedNotice(html: string): boolean {
+  const match = DAOTAO_NOTIFICATION_RE.exec(html);
+  if (!match) return false;
+
+  const [, title, firstLine, prefix, href, loginLabel, suffix] = match;
+  if (normalizeNotificationText(title) !== DAOTAO_NOTIFICATION_TITLE) return false;
+  if (normalizeNotificationText(firstLine) !== DAOTAO_NOTIFICATION_SESSION_ENDED_FIRST_LINE) return false;
+  if (normalizeNotificationText(prefix) !== DAOTAO_NOTIFICATION_LOGIN_PREFIX) return false;
+  if (normalizeNotificationText(loginLabel) !== DAOTAO_NOTIFICATION_LOGIN_LABEL) return false;
+  if (normalizeNotificationText(suffix) !== DAOTAO_NOTIFICATION_LOGIN_SUFFIX) return false;
+  return isTrustedParagraphLoginHref(href);
 }
 
 export function isDaotaoSessionExpired(finalUrl: string, html: string): boolean {
   if (isTrustedLoginUrl(finalUrl)) return true;
   if (hasCompleteLoginForm(html)) return true;
-  return hasStandaloneSessionEndedNotice(html);
+  if (hasStandaloneSessionEndedNotice(html)) return true;
+  if (hasStandaloneParagraphSessionEndedNotice(html)) return true;
+  return hasXhtmlNotificationSessionEndedNotice(html);
 }

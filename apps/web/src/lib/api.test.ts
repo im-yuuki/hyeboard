@@ -395,6 +395,32 @@ describe("frontend session-death policy", () => {
     expect(committedEvents).toEqual([{ type: VNU_REFRESH_COMMITTED_EVENT, detail: { accountId: ACCOUNT.id } }]);
   });
 
+  it.each([
+    ["profile", () => api.vnuOwnProfile(), `<input name="StdCode" value="SYNTHETIC-STUDENT">`, { studentCode: "SYNTHETIC-STUDENT" }],
+    ["grades", () => api.grades("vnu"), "<table></table>", []],
+    ["progress", () => api.trainingPoints("vnu"), "<table></table>", []],
+  ])("refreshes and replays the VNU raw %s GET once after normalized expiry", async (page, request, replayHtml, expected) => {
+    storeVnuRefreshGrant(ACCOUNT.id, "opaque-grant-alpha");
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonError("VNU_SESSION_EXPIRED", 401))
+      .mockResolvedValueOnce(jsonOk({
+        token: "rotated-token-alpha",
+        refreshGrant: "rotated-grant-alpha",
+        session: { universityId: "vnu", studentCode: ACCOUNT.studentCode, expiresAt: "2036-01-01T08:00:00.000Z", authenticated: true },
+      }))
+      .mockResolvedValueOnce(jsonOk({ html: replayHtml }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(request()).resolves.toEqual(expected);
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls[0]?.[0]).toContain(`/api/vnu/raw/${page}`);
+    expect(fetchMock.mock.calls[1]?.[0]).toContain("/api/vnu/auth/refresh");
+    expect(fetchMock.mock.calls[2]?.[0]).toBe(fetchMock.mock.calls[0]?.[0]);
+    expect((fetchMock.mock.calls[0]?.[1] as RequestInit).headers).toMatchObject({ Authorization: `Bearer ${ACCOUNT.token}` });
+    expect((fetchMock.mock.calls[2]?.[1] as RequestInit).headers).toMatchObject({ Authorization: "Bearer rotated-token-alpha" });
+  });
+
   it("replays a safe GET at most once when the rotated token also expires", async () => {
     storeVnuRefreshGrant(ACCOUNT.id, "opaque-grant-alpha");
     const fetchMock = vi.fn()

@@ -38,6 +38,26 @@ export type VnuRefreshGrantPayload = {
 
 export const VNU_REFRESH_GRANT_MAX_LENGTH = 8_192;
 
+// Opaque server-encrypted envelope carried inside a VNU cross-detail permit.
+// The upstream selector values (target stdId/classId/termOrdinal) live ONLY
+// inside this AES-GCM blob — Durable Object storage and the wire see just the
+// ciphertext plus keyed HMAC bindings, never the plaintext target identity.
+export type VnuCrossDetailPermitEnvelope = {
+  version: 1;
+  purpose: "vnu-cross-detail";
+  nonce: string;
+  targetHmac: string;
+  revisionHmac: string;
+  rowHmac: string;
+  selector: {
+    stdId: string;
+    classId: string;
+    termOrdinal: string;
+  };
+};
+
+export const VNU_CROSS_DETAIL_PERMIT_ENVELOPE_MAX_LENGTH = 1_024;
+
 export type VnuRefreshAccessDescriptor = {
   version: 1;
   purpose: "vnu-refresh-access";
@@ -153,6 +173,9 @@ const VNU_REFRESH_LIFETIME_MS = 8 * 60 * 60 * 1000;
 const VNU_REFRESH_SALT = textEncoder.encode("hyeboard:vnu-refresh:v1:salt");
 const VNU_REFRESH_INFO = textEncoder.encode("hyeboard:vnu-refresh:v1:aes-gcm");
 const VNU_REFRESH_AAD = textEncoder.encode("hyeboard:vnu-refresh:v1");
+const VNU_CROSS_DETAIL_SALT = textEncoder.encode("hyeboard:vnu-cross-detail:v1:salt");
+const VNU_CROSS_DETAIL_INFO = textEncoder.encode("hyeboard:vnu-cross-detail:v1:aes-gcm");
+const VNU_CROSS_DETAIL_AAD = textEncoder.encode("hyeboard:vnu-cross-detail:v1");
 const VNU_PRINCIPAL_SALT = textEncoder.encode("hyeboard:vnu-refresh-principal:v1:salt");
 const VNU_PRINCIPAL_INFO = textEncoder.encode("hyeboard:vnu-refresh-principal:v1:hmac-sha256");
 const VNU_PRINCIPAL_MESSAGE_PREFIX = "hyeboard:vnu-refresh-principal:v1:";
@@ -176,6 +199,8 @@ const GOOGLE_COOKIE_KEYS = ["domain", "expires", "httpOnly", "name", "path", "sa
 const PARENT_CREDENTIAL_KEYS = ["password", "username"] as const;
 const GRANT_KEYS = ["expectedStudentCode", "expiresAt", "grantId", "issuedAt", "password", "purpose", "universityId", "username", "version"] as const;
 const DESCRIPTOR_KEYS = ["accessExpiresAt", "accessTokenId", "grantExpiresAt", "grantId", "principalKey", "purpose", "version"] as const;
+const CROSS_DETAIL_ENVELOPE_KEYS = ["nonce", "purpose", "revisionHmac", "rowHmac", "selector", "targetHmac", "version"] as const;
+const CROSS_DETAIL_SELECTOR_KEYS = ["classId", "stdId", "termOrdinal"] as const;
 
 type RandomBytes = (length: number) => Uint8Array;
 type JsonObject = Record<string, unknown>;
@@ -194,6 +219,13 @@ function invalidSession(): HyeboardError {
 
 function invalidVnuRefreshGrant(): HyeboardError {
   return new HyeboardError("VNU_REFRESH_GRANT_INVALID", "The VNU reconnect grant is invalid or expired.", 401);
+}
+
+// The single generic external error for every cross-detail permit failure
+// (malformed, forged, tampered, wrong-key). Rejection internals never leak
+// which check failed — one stable code, one stable status.
+function invalidVnuCrossDetailPermit(): HyeboardError {
+  return new HyeboardError("VNU_CROSS_DETAIL_PERMIT_INVALID", "The cross-detail permit is invalid or expired.", 403);
 }
 
 function oversizedVnuRefreshGrant(): HyeboardError {
@@ -257,6 +289,10 @@ async function deriveVnuRefreshGrantKey(secret: string): Promise<CryptoKey> {
   return deriveHkdfKey(secret, VNU_REFRESH_SALT, VNU_REFRESH_INFO, { name: "AES-GCM", length: 256 }, ["encrypt", "decrypt"]);
 }
 
+async function deriveVnuCrossDetailKey(secret: string): Promise<CryptoKey> {
+  return deriveHkdfKey(secret, VNU_CROSS_DETAIL_SALT, VNU_CROSS_DETAIL_INFO, { name: "AES-GCM", length: 256 }, ["encrypt", "decrypt"]);
+}
+
 async function deriveKey(secret: string): Promise<CryptoKey> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret));
   return crypto.subtle.importKey("raw", digest, "AES-GCM", false, ["encrypt", "decrypt"]);
@@ -280,6 +316,65 @@ export function assertVnuRefreshAccessDescriptor(value: unknown): asserts value 
   if (!isNonemptyString(value.principalKey) || !VNU_PRINCIPAL_PATTERN.test(value.principalKey)) throw invalidSession();
   if (!isBase64Url128(value.accessTokenId) || !isBase64Url128(value.grantId)) throw invalidSession();
   if (parseCanonicalIso(value.accessExpiresAt) === null || parseCanonicalIso(value.grantExpiresAt) === null) throw invalidSession();
+}
+
+const VNU_CROSS_DETAIL_NONCE_PATTERN = /^[0-9a-f]{32}$/;
+const VNU_CROSS_DETAIL_HMAC_PATTERN = /^[0-9a-f]{64}$/;
+const VNU_CROSS_DETAIL_STD_ID_PATTERN = /^\d{1,11}$/;
+const VNU_CROSS_DETAIL_CLASS_ID_PATTERN = /^\S{1,32}$/;
+const VNU_CROSS_DETAIL_TERM_ORDINAL_PATTERN = /^\S{1,16}$/;
+
+export function assertVnuCrossDetailPermitEnvelope(value: unknown): asserts value is VnuCrossDetailPermitEnvelope {
+  if (!isJsonObject(value) || !hasExactKeys(value, CROSS_DETAIL_ENVELOPE_KEYS, CROSS_DETAIL_ENVELOPE_KEYS)) throw invalidVnuCrossDetailPermit();
+  if (value.version !== 1 || value.purpose !== "vnu-cross-detail") throw invalidVnuCrossDetailPermit();
+  if (typeof value.nonce !== "string" || !VNU_CROSS_DETAIL_NONCE_PATTERN.test(value.nonce)) throw invalidVnuCrossDetailPermit();
+  for (const key of ["targetHmac", "revisionHmac", "rowHmac"] as const) {
+    if (typeof value[key] !== "string" || !VNU_CROSS_DETAIL_HMAC_PATTERN.test(value[key])) throw invalidVnuCrossDetailPermit();
+  }
+  if (!isJsonObject(value.selector) || !hasExactKeys(value.selector, CROSS_DETAIL_SELECTOR_KEYS, CROSS_DETAIL_SELECTOR_KEYS)) throw invalidVnuCrossDetailPermit();
+  if (typeof value.selector.stdId !== "string" || !VNU_CROSS_DETAIL_STD_ID_PATTERN.test(value.selector.stdId)) throw invalidVnuCrossDetailPermit();
+  if (typeof value.selector.classId !== "string" || !VNU_CROSS_DETAIL_CLASS_ID_PATTERN.test(value.selector.classId)) throw invalidVnuCrossDetailPermit();
+  if (typeof value.selector.termOrdinal !== "string" || !VNU_CROSS_DETAIL_TERM_ORDINAL_PATTERN.test(value.selector.termOrdinal)) throw invalidVnuCrossDetailPermit();
+}
+
+export async function encryptVnuCrossDetailPermitEnvelope(payload: VnuCrossDetailPermitEnvelope, secret: string): Promise<string> {
+  assertStrongSecret(secret);
+  assertVnuCrossDetailPermitEnvelope(payload);
+  const iv = defaultRandomBytes(12);
+  const key = await deriveVnuCrossDetailKey(secret);
+  const encoded = textEncoder.encode(JSON.stringify(payload));
+  const encrypted = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: toArrayBuffer(iv), additionalData: toArrayBuffer(VNU_CROSS_DETAIL_AAD) },
+    key,
+    toArrayBuffer(encoded),
+  );
+  const token = `${toBase64Url(iv)}.${toBase64Url(new Uint8Array(encrypted))}`;
+  if (token.length > VNU_CROSS_DETAIL_PERMIT_ENVELOPE_MAX_LENGTH) throw invalidVnuCrossDetailPermit();
+  return token;
+}
+
+export async function decryptVnuCrossDetailPermitEnvelope(token: string, secret: string): Promise<VnuCrossDetailPermitEnvelope> {
+  try {
+    if (token.length > VNU_CROSS_DETAIL_PERMIT_ENVELOPE_MAX_LENGTH) throw invalidVnuCrossDetailPermit();
+    const parts = token.split(".");
+    if (parts.length !== 2 || !parts[0] || !parts[1]) throw invalidVnuCrossDetailPermit();
+    const iv = fromBase64Url(parts[0]);
+    if (iv.byteLength !== 12 || toBase64Url(iv) !== parts[0]) throw invalidVnuCrossDetailPermit();
+    const encrypted = fromBase64Url(parts[1]);
+    if (encrypted.byteLength < 17 || toBase64Url(encrypted) !== parts[1]) throw invalidVnuCrossDetailPermit();
+    const key = await deriveVnuCrossDetailKey(secret);
+    const decrypted = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: toArrayBuffer(iv), additionalData: toArrayBuffer(VNU_CROSS_DETAIL_AAD) },
+      key,
+      toArrayBuffer(encrypted),
+    );
+    const payload: unknown = JSON.parse(new TextDecoder().decode(decrypted));
+    assertVnuCrossDetailPermitEnvelope(payload);
+    return payload;
+  } catch (error) {
+    if (error instanceof HyeboardError && error.code === "WEAK_SESSION_SECRET") throw error;
+    throw invalidVnuCrossDetailPermit();
+  }
 }
 
 function assertUpstreamCredential(value: unknown): void {
