@@ -57,7 +57,7 @@ function VnuGradeDetail({ classId, termOrdinal }: { classId: string; termOrdinal
   if (detailQuery.error) return <div className="px-4 py-3" role="alert"><p className="text-sm text-muted-foreground">{t.grades.componentDetailError}</p></div>;
   if (!detailQuery.data?.components.length) return <div className="px-4 py-3"><Empty text={t.grades.componentDetailEmpty} /></div>;
   return (
-    <div className="divide-y divide-[hsl(var(--border)/0.2)] bg-muted/30 px-4">
+    <div className="divide-y divide-border bg-muted/30 px-4">
       {detailQuery.data.components.map((component) => (
         <div key={component.index} className="list-row">
           <div className="min-w-0">

@@ -112,7 +112,7 @@ function PointDetailPanel({ classId, termOrdinal }: { classId: string; termOrdin
         <span>{t.lookup.pointDetailComponentColumn}</span>
         <span>{t.lookup.pointDetailScoreColumn}</span>
       </div>
-      <div className="divide-y divide-[hsl(var(--border)/0.2)]">
+      <div className="divide-y divide-border">
         {detail.components.map((component) => (
           <div key={component.index} className="list-row">
             <div className="min-w-0">
