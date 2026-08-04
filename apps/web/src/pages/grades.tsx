@@ -57,7 +57,7 @@ function VnuGradeDetail({ classId, termOrdinal }: { classId: string; termOrdinal
   if (detailQuery.error) return <div className="px-4 py-3" role="alert"><p className="text-sm text-muted-foreground">{t.grades.componentDetailError}</p></div>;
   if (!detailQuery.data?.components.length) return <div className="px-4 py-3"><Empty text={t.grades.componentDetailEmpty} /></div>;
   return (
-    <div className="divide-y divide-border bg-muted/30 px-4">
+    <div className="divide-y divide-border/30 bg-muted/30 px-4">
       {detailQuery.data.components.map((component) => (
         <div key={component.index} className="list-row">
           <div className="min-w-0">
@@ -111,7 +111,7 @@ function GradeDetail({ grade, universityId }: { grade: Grade; universityId: stri
 
 function GradeTable({ grades, sort, onSortChange, universityId }: { grades: Grade[]; sort: GradeSortState; onSortChange: (sort: GradeSortState) => void; universityId: string }) {
   const { t } = useLocale();
-  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
   const sortableHeaders: Array<{ key: GradeSortKey; label: string; align?: "right"; className?: string }> = [
     { key: "name", label: t.grades.course },
     { key: "credits", label: t.grades.credits, align: "right" },
@@ -123,7 +123,13 @@ function GradeTable({ grades, sort, onSortChange, universityId }: { grades: Grad
     const direction = sort.key === key && sort.direction === "asc" ? "desc" : "asc";
     onSortChange({ key, direction });
   };
-  const toggleExpanded = (id: string) => setExpandedId((current) => (current === id ? null : id));
+  const toggleExpanded = (id: string) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
   if (!grades.length) return <Empty text={t.grades.noGrades} />;
   const renderSortableHeader = (header: (typeof sortableHeaders)[number]) => (
     <th
@@ -149,7 +155,7 @@ function GradeTable({ grades, sort, onSortChange, universityId }: { grades: Grad
         </thead>
         <tbody>
           {grades.map((grade) => {
-            const expanded = expandedId === grade.id;
+            const expanded = expandedIds.has(grade.id);
             return (
               <Fragment key={grade.id}>
                 <tr

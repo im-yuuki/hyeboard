@@ -1,5 +1,6 @@
 import type { VnuExamCatalogRow, VnuExamTermInfo, VnuProfile, VnuTranscriptRow } from "@hyeboard/university-adapters/src/vnu/types";
 import { VNU_EXAM_TERMS } from "@hyeboard/university-adapters/src/vnu/exam-terms";
+import { ChevronDown } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ExportMenu } from "@/components/export-menu";
@@ -19,6 +20,7 @@ import { createBulkExport, createClassLookupExport, createResolverLookupExport, 
 import { useLocale } from "@/lib/i18n";
 import { formatTermLabel } from "@/lib/presentation";
 import { calculateTermAcademicSummaries, newestAcademicTermsFirst, type AcademicTermSummary } from "@/lib/term-academic-summary";
+import { cn } from "@/lib/utils";
 import { filterCatalogRowsByUniversity } from "@/lib/university-course-search";
 import { useHyeboard } from "@/state";
 
@@ -52,15 +54,33 @@ function classExportResult(row: VnuExamCatalogRow) {
 function ClassResultRow({ row, expanded, onToggleDetail, exportModel }: { row: VnuExamCatalogRow; expanded: boolean; onToggleDetail: () => void; exportModel: ExportDocument }) {
   const { t } = useLocale();
   return (
-    <div className="list-row flex-col items-stretch gap-3 sm:flex-row sm:items-center">
-      <div className="min-w-0">
-        <p className="break-words text-sm font-medium">{row.courseCode}{row.classNo ? ` · ${row.classNo}` : ""} — {row.courseName}</p>
-        <p className="break-words text-xs text-muted-foreground">{row.examDate || "-"}{row.room ? ` · ${row.room}` : ""}</p>
+    <div
+      className="list-row flex-col items-stretch gap-3 sm:flex-row sm:items-center cursor-pointer"
+      onClick={(event) => {
+        if ((event.target as HTMLElement).closest("button")) return;
+        onToggleDetail();
+      }}
+      role="button"
+      aria-expanded={expanded}
+    >
+      <div className="min-w-0 flex items-center gap-2">
+        <button
+          type="button"
+          onClick={onToggleDetail}
+          aria-expanded={expanded}
+          aria-label={t.lookup.pointDetailAction}
+          className="shrink-0 rounded-md p-0.5 text-muted-foreground hover:text-foreground max-lg:-mx-1.5 max-lg:-my-2 max-lg:p-2"
+        >
+          <ChevronDown className={cn("h-4 w-4 transition-transform", expanded && "rotate-180")} />
+        </button>
+        <div className="min-w-0">
+          <p className="break-words text-sm font-medium">{row.courseCode}{row.classNo ? ` · ${row.classNo}` : ""} — {row.courseName}</p>
+          <p className="break-words text-xs text-muted-foreground">{row.examDate || "-"}{row.room ? ` · ${row.room}` : ""}</p>
+        </div>
       </div>
       <div className="flex flex-wrap items-center gap-2 sm:shrink-0 sm:justify-end">
         <Badge className="max-w-full break-all border border-border bg-background font-mono font-normal tabular-nums text-foreground">{row.classId}</Badge>
         <ExportMenu model={exportModel} />
-        <Button type="button" variant="outline" size="sm" className="min-h-11" aria-expanded={expanded} onClick={onToggleDetail}>{t.lookup.pointDetailAction}</Button>
       </div>
     </div>
   );
@@ -92,7 +112,7 @@ function PointDetailPanel({ classId, termOrdinal }: { classId: string; termOrdin
         <span>{t.lookup.pointDetailComponentColumn}</span>
         <span>{t.lookup.pointDetailScoreColumn}</span>
       </div>
-      <div className="divide-y divide-border">
+      <div className="divide-y divide-border/30">
         {detail.components.map((component) => (
           <div key={component.index} className="list-row">
             <div className="min-w-0">
@@ -119,7 +139,7 @@ function ClassResolver() {
   const [courseCode, setCourseCode] = useState("");
   const [classNo, setClassNo] = useState("");
   const [termOrdinal, setTermOrdinal] = useState<string | undefined>(undefined);
-  const [expandedClassId, setExpandedClassId] = useState<string | null>(null);
+  const [expandedClassIds, setExpandedClassIds] = useState<Set<string>>(new Set());
 
   // The catalog call needs no ids from the client: the worker derives
   // selStd/selUniv from the session's own profile (same hardening as
@@ -141,7 +161,7 @@ function ClassResolver() {
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
         <div className="space-y-1.5"><label htmlFor="lookup-course-code" className="text-sm font-medium">{t.lookup.courseCodeLabel}</label><Input id="lookup-course-code" className="min-h-11 font-mono tabular-nums" value={courseCode} onChange={(event) => setCourseCode(event.target.value)} placeholder={t.lookup.courseCodePlaceholder} /></div>
         <div className="space-y-1.5"><label htmlFor="lookup-class-number" className="text-sm font-medium">{t.lookup.classNoLabel}</label><Input id="lookup-class-number" className="min-h-11 font-mono tabular-nums" value={classNo} onChange={(event) => setClassNo(event.target.value)} placeholder={t.lookup.classNoPlaceholder} /></div>
-        <div className="space-y-1.5 sm:col-span-2 lg:col-span-1"><label htmlFor="lookup-forward-term" className="text-sm font-medium">{t.lookup.termFieldLabel}</label><Select value={termOrdinal ?? ""} onValueChange={(value) => { setTermOrdinal(value); setExpandedClassId(null); }}>
+        <div className="space-y-1.5 sm:col-span-2 lg:col-span-1"><label htmlFor="lookup-forward-term" className="text-sm font-medium">{t.lookup.termFieldLabel}</label><Select value={termOrdinal ?? ""} onValueChange={(value) => { setTermOrdinal(value);           setExpandedClassIds(new Set()); }}>
           <SelectTrigger id="lookup-forward-term" className="min-h-11"><SelectValue placeholder={t.lookup.termPlaceholder} /></SelectTrigger>
           <SelectContent>
             {TERMS_NEWEST_FIRST.map((term) => <SelectItem key={term.ordinal} value={term.ordinal}>{t.lookup.termLabel(term)}</SelectItem>)}
@@ -170,8 +190,8 @@ function ClassResolver() {
                       <div key={row.classId}>
                         <ClassResultRow
                           row={row}
-                          expanded={expandedClassId === row.classId}
-                          onToggleDetail={() => setExpandedClassId((current) => (current === row.classId ? null : row.classId))}
+                          expanded={expandedClassIds.has(row.classId)}
+                          onToggleDetail={() => setExpandedClassIds((prev) => { const next = new Set(prev); if (next.has(row.classId)) next.delete(row.classId); else next.add(row.classId); return next; })}
                           exportModel={createClassLookupExport({
                             surface: "class-forward",
                             universityId: state.universityId,
@@ -179,7 +199,7 @@ function ClassResolver() {
                             result: classExportResult(row),
                           })}
                         />
-                        {expandedClassId === row.classId && termOrdinal ? <PointDetailPanel classId={row.classId} termOrdinal={termOrdinal} /> : null}
+                        {expandedClassIds.has(row.classId) && termOrdinal ? <PointDetailPanel classId={row.classId} termOrdinal={termOrdinal} /> : null}
                       </div>
                     ))}
                   </div>

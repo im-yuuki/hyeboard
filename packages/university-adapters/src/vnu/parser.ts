@@ -444,7 +444,7 @@ export function parsePointDetailHtml(html: string): VnuPointDetail {
   const components: VnuPointDetailComponent[] = [];
   let displayTotalEcho: string | undefined;
   let componentColumns: { index: number; nature: number; weight: number; attempt: number; score: number; notes?: number } | undefined;
-  const trRe = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
+  const trRe = /<tr\b[^>]*>([\s\S]*?)(?=<\/tr>|<tr\b|<\/t(?:able|body)>)/gi;
   let match: RegExpExecArray | null;
   while ((match = trRe.exec(html))) {
     const cells = tdCells(match[1]);

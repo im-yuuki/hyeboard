@@ -291,6 +291,27 @@ describe("parsePointDetailHtml", () => {
     ]);
     expect(detail.displayTotalEcho).toBe("8.8");
   });
+
+  it("parses component rows when the ListHeader <tr> has no closing </tr> tag", () => {
+    const detail = parsePointDetailHtml(`
+      <table id="ListHeader">
+        <tr height="22">
+          <td>STT</td><td>Bản chất kỳ thi</td><td>TS</td><td>Lần thi</td><td>Điểm</td><td>Ghi chú</td>
+        </table>   <!--  </tr> MISSING here! -->
+      <div id="divList1">
+        <table>
+          <tr height="20"><td>1</td><td>Thi cuối kỳ</td><td>0.6</td><td>1</td><td>9.5</td><td></td></tr>
+          <tr height="20"><td>2</td><td>Giữa kỳ</td><td>0.4</td><td>1</td><td>9.3</td><td></td></tr>
+        </table>
+      </div>
+    `);
+
+    expect(detail.components).toEqual([
+      { index: 1, nature: "Thi cuối kỳ", weight: 0.6, attempt: 1, score: 9.5, notes: undefined },
+      { index: 2, nature: "Giữa kỳ", weight: 0.4, attempt: 1, score: 9.3, notes: undefined },
+    ]);
+    expect(detail.displayTotalEcho).toBeUndefined();
+  });
 });
 
 describe("parsePortalNotice entity decoding", () => {
