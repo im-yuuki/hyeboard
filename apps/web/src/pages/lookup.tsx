@@ -2,8 +2,11 @@ import type { VnuExamCatalogRow, VnuExamTermInfo, VnuProfile, VnuTranscriptRow }
 import { VNU_EXAM_TERMS } from "@hyeboard/university-adapters/src/vnu/exam-terms";
 import { ChevronDown } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ExportMenu } from "@/components/export-menu";
+import { GradeTable } from "@/components/grades/grade-table";
+import { AcademicTermSection } from "@/components/grades/academic-term-section";
+import type { GradeTableRow } from "@/lib/grade-view-model";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -13,7 +16,8 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { Progress } from "@/components/ui/progress";
 import { Empty, FeatureFrame, SummaryStat, SummaryStrip } from "@/components/shared";
-import { ACCOUNT_SWITCHED_EVENT, api, ApiError, type VnuBulkLookupItem, type VnuBulkLookupMode, type VnuCrossDetailComponent, type VnuCrossTranscript, type VnuCrossTranscriptInput } from "@/lib/api";
+import { CompactAcademicMetric } from "@/pages/grades";
+import { ACCOUNT_SWITCHED_EVENT, api, ApiError, type VnuBulkLookupItem, type VnuBulkLookupMode, type VnuCrossTranscript, type VnuCrossTranscriptInput } from "@/lib/api";
 import { deriveBulkLookupViewState, executeBulkLookup, parseBulkLookupItems, parseBulkLookupMode, parseBulkTargets, type BulkLookupProgress } from "@/lib/bulk-lookup";
 import { deriveCrossTranscriptInput, deriveCrossTranscriptView } from "@/lib/cross-transcript-view";
 import { createBulkExport, createClassLookupExport, createResolverLookupExport, createTranscriptExport, type ExportBulkItem, type ExportDerivedTerm, type ExportDocument, type ExportSurface } from "@/lib/data-export";
@@ -491,10 +495,6 @@ function CrossStudentIdSection({ profile }: { profile: VnuProfile }) {
   );
 }
 
-function CompactAcademicMetric({ label, value }: { label: string; value: string }) {
-  return <span className="inline-flex items-baseline gap-1.5 whitespace-nowrap"><span className="text-xs text-muted-foreground">{label}</span><span className="font-semibold tabular-nums">{value}</span></span>;
-}
-
 function crossTranscriptExportTerm(summary: AcademicTermSummary<VnuTranscriptRow>, label: string): ExportDerivedTerm {
   return {
     termCode: summary.termKey,
@@ -528,80 +528,80 @@ function transcriptAcademicSummaries(transcript?: VnuCrossTranscript): AcademicT
   ));
 }
 
-function CrossTranscriptTerm({ summary, permits, expandedPermit, details, onToggle }: { summary: AcademicTermSummary<VnuTranscriptRow>; permits: Map<string, string>; expandedPermit?: string; details: Map<string, VnuCrossDetailComponent[]>; onToggle: (permit: string) => void }) {
+function CrossTranscriptDetail({ permit }: { permit: string }) {
+  const { t } = useLocale();
+  const state = useHyeboard();
+  const detailQuery = useQuery({
+    queryKey: ["vnu-cross-detail", state.universityId, state.sessionNonce, permit],
+    queryFn: async () => {
+      await state.ensureSession();
+      return api.vnuCrossDetail(permit);
+    },
+    staleTime: Infinity,
+  });
+
+  if (detailQuery.isLoading) return <div className="px-4 py-3"><Skeleton className="h-12" /></div>;
+  if (detailQuery.error || !detailQuery.data?.length) return <div className="px-4 py-3"><Empty text={t.lookup.pointDetailEmpty} /></div>;
+  return (
+    <div className="divide-y divide-border bg-muted/30 px-4">
+      {detailQuery.data.map((component) => (
+        <div key={component.index} className="list-row">
+          <div className="min-w-0">
+            <p className="break-words text-sm font-medium">{component.nature || "-"}</p>
+            <p className="text-xs text-muted-foreground">
+              {[
+                component.weight != null ? t.lookup.pointDetailWeight(component.weight) : undefined,
+                component.attempt != null ? t.lookup.pointDetailAttempt(component.attempt) : undefined,
+              ].filter(Boolean).join(" · ") || "-"}
+            </p>
+          </div>
+          <Badge className="shrink-0 border border-border bg-background font-normal tabular-nums text-foreground">{component.score ?? "-"}</Badge>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function CrossTranscriptTerm({ summary, permits }: {
+  summary: AcademicTermSummary<VnuTranscriptRow>;
+  permits: Map<string, string>;
+}) {
   const { t } = useLocale();
   const label = formatTermLabel(summary.termKey, "vnu", t.terms);
+  const headingId = `cross-transcript-term-${summary.termKey}`;
+
+  const rows: GradeTableRow[] = summary.courses.map((row, index) => {
+    const permitKey = `${summary.termKey}:${row.courseCode}:${row.classId ?? index}`;
+    const permit = permits.get(permitKey);
+    const id = `${summary.termKey}:${index}`;
+    return {
+      id,
+      courseName: row.courseName,
+      credits: row.credits ?? null,
+      point10: row.grade10 ?? null,
+      letter: row.letterGrade ?? undefined,
+      point4: row.grade4 ?? null,
+      detail: permit
+        ? { kind: "available" as const, render: () => <CrossTranscriptDetail permit={permit} /> }
+        : { kind: "unavailable" as const, render: () => <div className="px-4 py-3"><Empty text={t.grades.componentDetailUnavailable} /></div> },
+    };
+  });
+
   return (
-    <section className="space-y-2" aria-labelledby={`cross-transcript-term-${summary.termKey}`}>
-      <header data-testid="academic-term-header" className="flex flex-wrap items-center gap-x-4 gap-y-2 border-y border-border py-3">
-        <h4 id={`cross-transcript-term-${summary.termKey}`} className="text-sm font-semibold">{label}</h4>
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-          <Badge className="border border-border bg-muted text-foreground" title={t.grades.derivedDetail}>{t.grades.derived}</Badge>
-          <CompactAcademicMetric label={t.grades.termGpa} value={summary.termGpa4?.toFixed(2) ?? "-"} />
-          <CompactAcademicMetric label={t.grades.cpa} value={summary.cpa4?.toFixed(2) ?? "-"} />
-          <CompactAcademicMetric label={t.grades.includedCredits} value={t.grades.creditRatio(summary.includedCredits, summary.listedCredits)} />
-        </div>
-      </header>
-      <div data-testid="cross-transcript-table" className="max-h-[32rem] overflow-auto rounded-xl border border-border">
-        <table className="w-full min-w-[36rem] table-fixed text-sm">
-          <colgroup><col /><col className="w-20" /><col className="w-20" /><col className="w-20" /><col className="w-20" /></colgroup>
-          <thead className="bg-muted text-xs font-medium text-muted-foreground">
-            <tr>
-              <th scope="col" className="px-3 py-2 text-left font-medium">{t.grades.course}</th>
-              <th scope="col" className="px-3 py-2 text-right font-medium">{t.grades.credits}</th>
-              <th scope="col" className="px-3 py-2 text-right font-medium">{t.grades.point10}</th>
-              <th scope="col" className="px-3 py-2 text-right font-medium">{t.grades.letter}</th>
-              <th scope="col" className="px-3 py-2 text-right font-medium">{t.grades.point4}</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-border">
-            {summary.courses.map((row, index) => {
-              const permit = permits.get(`${summary.termKey}:${row.courseCode}:${row.classId ?? index}`);
-              const components = permit ? details.get(permit) : undefined;
-              const rowKey = `${row.courseCode}-${row.classId ?? index}`;
-              return <Fragment key={rowKey}>
-              <tr>
-                <td className="min-w-0 px-3 py-2">
-                  <p className="break-words font-medium">{row.courseName}</p>
-                  <p className="break-all font-mono text-xs text-muted-foreground">{row.courseCode}</p>
-                </td>
-                <td className="px-3 py-2 text-right tabular-nums">{row.credits ?? "-"}</td>
-                <td className="px-3 py-2 text-right tabular-nums">{row.grade10 ?? "-"}</td>
-                <td className="px-3 py-2 text-right"><Badge data-tone={row.letterGrade ? "neutral" : undefined} className="min-w-9 justify-center tabular-nums">{row.letterGrade ?? "-"}</Badge></td>
-                <td className="px-3 py-2 text-right tabular-nums">{row.grade4 ?? "-"}{permit ? <Button type="button" variant="ghost" size="sm" className="ml-1 min-h-8" aria-expanded={expandedPermit === permit} onClick={() => onToggle(permit)}>{t.lookup.crossDetailAction}</Button> : null}</td>
-              </tr>
-              {permit && expandedPermit === permit ? (
-                <tr key={`${permit}-detail`}>
-                  <td colSpan={5} className="p-0">
-                    <div className="divide-y divide-border bg-muted/30 px-4">
-                      {components
-                        ? components.length
-                          ? components.map((component) => (
-                              <div key={component.index} className="list-row">
-                                <div className="min-w-0">
-                                  <p className="break-words text-sm font-medium">{component.nature || "-"}</p>
-                                  <p className="text-xs text-muted-foreground">
-                                    {[
-                                      component.weight != null ? t.lookup.pointDetailWeight(component.weight) : undefined,
-                                      component.attempt != null ? t.lookup.pointDetailAttempt(component.attempt) : undefined,
-                                    ].filter(Boolean).join(" · ") || "-"}
-                                  </p>
-                                </div>
-                                <Badge className="shrink-0 border border-border bg-background font-normal tabular-nums text-foreground">{component.score ?? "-"}</Badge>
-                              </div>
-                            ))
-                          : <div className="px-4 py-3"><Empty text={t.lookup.pointDetailEmpty} /></div>
-                        : <div className="px-4 py-3"><Skeleton className="h-12" /></div>}
-                    </div>
-                  </td>
-                </tr>
-              ) : null}
-              </Fragment>;
-            })}
-          </tbody>
-        </table>
-      </div>
-    </section>
+    <AcademicTermSection
+      id={headingId}
+      label={label}
+      headingLevel="h4"
+      includesSummer={false}
+      derivedLabel={t.grades.derived}
+      metrics={<>
+        <CompactAcademicMetric label={t.grades.termGpa} value={summary.termGpa4?.toFixed(2) ?? "-"} />
+        <CompactAcademicMetric label={t.grades.cpa} value={summary.cpa4?.toFixed(2) ?? "-"} />
+        <CompactAcademicMetric label={t.grades.includedCredits} value={t.grades.creditRatio(summary.includedCredits, summary.listedCredits)} />
+      </>}
+    >
+      <GradeTable rows={rows} sort={{ key: "name", direction: "asc" }} onSortChange={() => {}} emptyText={t.grades.noGrades} />
+    </AcademicTermSection>
   );
 }
 
@@ -612,9 +612,6 @@ function CrossTranscriptSection({ profile, crossDetailEnabled }: { profile: VnuP
   const [stdId, setStdId] = useState("");
   const [stdCode, setStdCode] = useState("");
   const [submitted, setSubmitted] = useState<VnuCrossTranscriptInput | null>(null);
-  const [expandedPermit, setExpandedPermit] = useState<string>();
-  const [details, setDetails] = useState<Map<string, VnuCrossDetailComponent[]>>(new Map());
-  const detailRequest = useRef<AbortController | undefined>(undefined);
   const inputState = deriveCrossTranscriptInput(mode, mode === "stdId" ? stdId : stdCode, profile);
 
   const transcriptQuery = useQuery({
@@ -637,40 +634,18 @@ function CrossTranscriptSection({ profile, crossDetailEnabled }: { profile: VnuP
     return mapped;
   }, [crossDetailEnabled, transcriptQuery.data]);
 
-  const clearDetailState = useCallback(() => {
-    detailRequest.current?.abort();
-    detailRequest.current = undefined;
-    setExpandedPermit(undefined);
-    setDetails(new Map());
-  }, []);
   useEffect(() => {
-    clearDetailState();
-    const clearForAccount = () => clearDetailState();
+    setSubmitted(null);
+    const clearForAccount = () => setSubmitted(null);
     window.addEventListener(ACCOUNT_SWITCHED_EVENT, clearForAccount);
     return () => {
       window.removeEventListener(ACCOUNT_SWITCHED_EVENT, clearForAccount);
-      clearDetailState();
+      setSubmitted(null);
     };
-  }, [clearDetailState, state.sessionNonce, state.universityId]);
-  const toggleDetail = (permit: string) => {
-    if (expandedPermit === permit) { clearDetailState(); return; }
-    detailRequest.current?.abort();
-    const controller = new AbortController();
-    detailRequest.current = controller;
-    setExpandedPermit(permit);
-    if (details.has(permit)) return;
-    void api.vnuCrossDetail(permit, controller.signal)
-      .then((components) => {
-        if (!controller.signal.aborted) setDetails((current) => new Map(current).set(permit, components));
-      })
-      .catch(() => {
-        if (!controller.signal.aborted) clearDetailState();
-      });
-  };
+  }, [state.sessionNonce, state.universityId]);
 
   const submit = () => {
     if (!inputState.target) return;
-    clearDetailState();
     setSubmitted(inputState.target);
   };
   const transcriptView = deriveCrossTranscriptView({
@@ -713,8 +688,8 @@ function CrossTranscriptSection({ profile, crossDetailEnabled }: { profile: VnuP
         {transcriptExportModel ? <ExportMenu model={transcriptExportModel} /> : null}
       </div>
         <div className="grid min-h-11 grid-cols-2 rounded-lg border border-border p-1 sm:inline-grid" role="group" aria-label={t.lookup.crossTranscriptModeLabel}>
-          <Button type="button" size="sm" variant={mode === "stdId" ? "default" : "ghost"} className="min-h-11" aria-pressed={mode === "stdId"} onClick={() => { clearDetailState(); setMode("stdId"); setSubmitted(null); }}>{t.lookup.crossTranscriptStdIdMode}</Button>
-          <Button type="button" size="sm" variant={mode === "stdCode" ? "default" : "ghost"} className="min-h-11" aria-pressed={mode === "stdCode"} onClick={() => { clearDetailState(); setMode("stdCode"); setSubmitted(null); }}>{t.lookup.crossTranscriptStdCodeMode}</Button>
+          <Button type="button" size="sm" variant={mode === "stdId" ? "default" : "ghost"} className="min-h-11" aria-pressed={mode === "stdId"} onClick={() => { setMode("stdId"); setSubmitted(null); }}>{t.lookup.crossTranscriptStdIdMode}</Button>
+          <Button type="button" size="sm" variant={mode === "stdCode" ? "default" : "ghost"} className="min-h-11" aria-pressed={mode === "stdCode"} onClick={() => { setMode("stdCode"); setSubmitted(null); }}>{t.lookup.crossTranscriptStdCodeMode}</Button>
         </div>
         <form className="grid gap-3 sm:grid-cols-[1fr_auto]" onSubmit={(event) => { event.preventDefault(); submit(); }}>
           <div className="space-y-1.5">
@@ -752,7 +727,7 @@ function CrossTranscriptSection({ profile, crossDetailEnabled }: { profile: VnuP
                 <SummaryStat label={t.lookup.crossTranscriptAccumulatedCredits} value={transcriptView.transcript.totals.accumulatedCredits ?? "-"} />
                 <SummaryStat label={t.lookup.crossTranscriptGpa4} value={transcriptView.transcript.totals.gpa4 ?? "-"} />
               </SummaryStrip>
-              {transcriptView.derivedTerms.map((summary) => <CrossTranscriptTerm key={summary.termKey} summary={summary} permits={permits} expandedPermit={expandedPermit} details={details} onToggle={toggleDetail} />)}
+              {transcriptView.derivedTerms.map((summary) => <CrossTranscriptTerm key={summary.termKey} summary={summary} permits={permits} />)}
             </div>
           ) : null}</div>
     </section>

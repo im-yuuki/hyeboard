@@ -1,7 +1,10 @@
 import type { Grade } from "@hyeboard/schemas";
-import { ChevronDown } from "lucide-react";
-import { Fragment, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
+import type { GradeTableRow } from "@/lib/grade-view-model";
+import { GradeTable } from "@/components/grades/grade-table";
+import { SummerBadge } from "@/components/grades/summer-badge";
 import { useQuery } from "@tanstack/react-query";
+import { AcademicTermSection } from "@/components/grades/academic-term-section";
 import { ExportMenu } from "@/components/export-menu";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -9,25 +12,20 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Empty, FeatureFrame, SummaryStat, SummaryStrip } from "@/components/shared";
 import { api } from "@/lib/api";
 import { createGradesExport } from "@/lib/data-export";
-import { ALL_GRADE_TERMS, createGradeExportTerm, decodeGradeTermKey, encodeGradeTermKey, isSummerGrade, selectVisibleGradeSummaries, sortGrades, type GradeSortKey, type GradeSortState } from "@/lib/grade-view-model";
+import { ALL_GRADE_TERMS, createGradeExportTerm, decodeGradeTermKey, encodeGradeTermKey, isSummerGrade, selectVisibleGradeSummaries, sortGrades, type GradeSortState } from "@/lib/grade-view-model";
 import { useLocale } from "@/lib/i18n";
 import { formatTermLabel, letterForGrade, letterTone } from "@/lib/presentation";
 import { calculateTermAcademicSummaries, newestAcademicTermsFirst } from "@/lib/term-academic-summary";
 import { cn } from "@/lib/utils";
 import { useFeatureQuery, useHyeboard } from "@/state";
 
-function CompactAcademicMetric({ label, value }: { label: string; value: string }) {
+export function CompactAcademicMetric({ label, value }: { label: string; value: string }) {
   return (
     <span className="inline-flex items-baseline gap-1.5 whitespace-nowrap">
       <span className="text-xs text-muted-foreground">{label}</span>
       <span className="font-semibold tabular-nums">{value}</span>
     </span>
   );
-}
-
-function SummerBadge() {
-  const { t } = useLocale();
-  return <Badge className="shrink-0 border border-border bg-background text-foreground">{t.grades.summerTerm}</Badge>;
 }
 
 function LetterBadge({ letter, large }: { letter: string | undefined; large?: boolean }) {
@@ -109,98 +107,18 @@ function GradeDetail({ grade, universityId }: { grade: Grade; universityId: stri
   );
 }
 
-function GradeTable({ grades, sort, onSortChange, universityId }: { grades: Grade[]; sort: GradeSortState; onSortChange: (sort: GradeSortState) => void; universityId: string }) {
-  const { t } = useLocale();
-  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
-  const sortableHeaders: Array<{ key: GradeSortKey; label: string; align?: "right"; className?: string }> = [
-    { key: "name", label: t.grades.course },
-    { key: "credits", label: t.grades.credits, align: "right" },
-    { key: "point10", label: t.grades.point10, align: "right" },
-    { key: "point4", label: t.grades.point4, align: "right", className: "max-sm:hidden" },
-  ];
-  const [courseHeader, ...numericHeaders] = sortableHeaders;
-  const changeSort = (key: GradeSortKey) => {
-    const direction = sort.key === key && sort.direction === "asc" ? "desc" : "asc";
-    onSortChange({ key, direction });
-  };
-  const toggleExpanded = (id: string) => {
-    setExpandedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id); else next.add(id);
-      return next;
-    });
-  };
-  if (!grades.length) return <Empty text={t.grades.noGrades} />;
-  const renderSortableHeader = (header: (typeof sortableHeaders)[number]) => (
-    <th
-      key={header.key}
-      className={cn("px-3 py-2 font-medium", header.align === "right" ? "text-right" : "text-left", header.className)}
-      aria-sort={sort.key === header.key ? (sort.direction === "asc" ? "ascending" : "descending") : "none"}
-    >
-      <button type="button" onClick={() => changeSort(header.key)} className={cn("inline-flex items-center gap-1 hover:text-foreground", header.align === "right" && "justify-end")}>
-        {header.label}
-        <span className="text-[10px]">{sort.key === header.key ? (sort.direction === "asc" ? "▲" : "▼") : ""}</span>
-      </button>
-    </th>
-  );
-  return (
-    <div className="overflow-x-auto rounded-xl border border-border">
-      <table className="w-full border-collapse text-sm">
-        <thead className="bg-muted text-muted-foreground">
-          <tr>
-            {renderSortableHeader(courseHeader)}
-            <th className="px-3 py-2 text-left font-medium">{t.grades.letter}</th>
-            {numericHeaders.map(renderSortableHeader)}
-          </tr>
-        </thead>
-        <tbody>
-          {grades.map((grade) => {
-            const expanded = expandedIds.has(grade.id);
-            return (
-              <Fragment key={grade.id}>
-                <tr
-                  className="table-row-motion cursor-pointer border-t border-border"
-                  onClick={(event) => {
-                    if ((event.target as HTMLElement).closest("button")) return;
-                    toggleExpanded(grade.id);
-                  }}
-                >
-                  <td className="px-3 py-2">
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => toggleExpanded(grade.id)}
-                        aria-expanded={expanded}
-                        aria-label={t.grades.toggleDetails(grade.courseName)}
-                        className="shrink-0 rounded-md p-0.5 text-muted-foreground hover:text-foreground max-lg:-mx-1.5 max-lg:-my-2 max-lg:p-2"
-                      >
-                        <ChevronDown className={cn("h-4 w-4 transition-transform", expanded && "rotate-180")} />
-                      </button>
-                      <span>{grade.courseName}</span>
-                      {isSummerGrade(grade, universityId) ? <SummerBadge /> : null}
-                    </div>
-                  </td>
-                  <td className="px-3 py-2"><LetterBadge letter={letterForGrade(grade, universityId)} /></td>
-                  <td className="px-3 py-2 text-right tabular-nums">{grade.credits ?? "-"}</td>
-                  <td className="px-3 py-2 text-right tabular-nums">{grade.point10 ?? "-"}</td>
-                  <td className="px-3 py-2 text-right tabular-nums max-sm:hidden">{grade.point4 ?? "-"}</td>
-                </tr>
-                <tr>
-                  <td colSpan={5} className="p-0">
-                    <div className="collapsible-panel" data-open={expanded} data-testid="grade-detail">
-                      <div>
-                        <GradeDetail grade={grade} universityId={universityId} />
-                      </div>
-                    </div>
-                  </td>
-                </tr>
-              </Fragment>
-            );
-          })}
-        </tbody>
-      </table>
-    </div>
-  );
+function GradesGradeTable({ grades, sort, onSortChange, universityId, emptyText }: { grades: Grade[]; sort: GradeSortState; onSortChange: (sort: GradeSortState) => void; universityId: string; emptyText: string }) {
+  const rows: GradeTableRow[] = grades.map((grade) => ({
+    id: grade.id,
+    courseName: grade.courseName,
+    credits: grade.credits,
+    point10: grade.point10,
+    letter: letterForGrade(grade, universityId),
+    point4: grade.point4,
+    isSummer: isSummerGrade(grade, universityId),
+    detail: { kind: "available", render: () => <GradeDetail grade={grade} universityId={universityId} /> },
+  }));
+  return <GradeTable rows={rows} sort={sort} onSortChange={onSortChange} emptyText={emptyText} />;
 }
 
 export function GradesPage() {
@@ -291,22 +209,23 @@ export function GradesPage() {
               }) : undefined;
               const headingId = `grade-term-${encodeURIComponent(summary.termKey)}`;
               return (
-              <section key={summary.termKey} aria-labelledby={headingId} data-testid="term-summary" className="space-y-2">
-                <header data-testid="academic-term-header" className="flex flex-wrap items-center gap-x-4 gap-y-2 border-y border-border py-3">
-                  <div className="flex min-w-0 flex-wrap items-center gap-2">
-                    <h2 id={headingId} className="text-base font-semibold">{label}</h2>
-                    {summary.includesSummer ? <Badge className="border border-border bg-background text-foreground">{t.grades.includesSummer}</Badge> : null}
-                  </div>
-                  <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-                    <Badge className="border border-border bg-muted text-foreground" title={t.grades.derivedDetail}>{t.grades.derived}</Badge>
-                    <CompactAcademicMetric label={t.grades.termGpa} value={summary.termGpa4?.toFixed(2) ?? "-"} />
-                    <CompactAcademicMetric label={t.grades.cpa} value={summary.cpa4?.toFixed(2) ?? "-"} />
-                    <CompactAcademicMetric label={t.grades.includedCredits} value={t.grades.creditRatio(summary.includedCredits, summary.listedCredits)} />
-                  </div>
-                  {termExportModel ? <ExportMenu model={termExportModel} className="ml-auto" /> : null}
-                </header>
-                <GradeTable grades={sortedCourses} sort={sort} onSortChange={setSort} universityId={state.universityId} />
-              </section>
+              <AcademicTermSection
+                key={summary.termKey}
+                id={headingId}
+                label={label}
+                headingLevel="h2"
+                includesSummer={summary.includesSummer}
+                includesSummerLabel={t.grades.includesSummer}
+                derivedLabel={t.grades.derived}
+                metrics={<>
+                  <CompactAcademicMetric label={t.grades.termGpa} value={summary.termGpa4?.toFixed(2) ?? "-"} />
+                  <CompactAcademicMetric label={t.grades.cpa} value={summary.cpa4?.toFixed(2) ?? "-"} />
+                  <CompactAcademicMetric label={t.grades.includedCredits} value={t.grades.creditRatio(summary.includedCredits, summary.listedCredits)} />
+                </>}
+                action={termExportModel ? <ExportMenu model={termExportModel} /> : null}
+              >
+                <GradesGradeTable grades={sortedCourses} sort={sort} onSortChange={setSort} universityId={state.universityId} emptyText={t.grades.noGrades} />
+              </AcademicTermSection>
             );})}
           </div>
       )}
