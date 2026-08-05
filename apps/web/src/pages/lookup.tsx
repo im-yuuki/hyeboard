@@ -101,34 +101,25 @@ function PointDetailPanel({ classId, termOrdinal }: { classId: string; termOrdin
     },
   });
 
-  if (detailQuery.isLoading) return <Skeleton className="my-2 h-20" />;
-  if (detailQuery.error) return <div className="space-y-2 py-3" role="alert"><p className="text-sm text-muted-foreground">{t.lookup.pointDetailError}</p><Button type="button" size="sm" variant="outline" className="min-h-11" onClick={() => void detailQuery.refetch()}>{t.lookup.retry}</Button></div>;
+  if (detailQuery.isLoading) return <div className="px-4 py-3"><Skeleton className="h-12" /></div>;
+  if (detailQuery.error) return <div className="px-4 py-3" role="alert"><p className="text-sm text-muted-foreground">{t.lookup.pointDetailError}</p></div>;
   const detail = detailQuery.data;
-  if (!detail?.components.length) return <div className="py-2"><Empty text={t.lookup.pointDetailEmpty} /></div>;
+  if (!detail?.components.length) return <div className="px-4 py-3"><Empty text={t.lookup.pointDetailEmpty} /></div>;
   return (
-    <div className="space-y-2 py-2">
-      {detail.headerLabel ? <p className="text-xs text-muted-foreground">{detail.headerLabel}</p> : null}
-      <div className="flex items-center justify-between gap-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-        <span>{t.lookup.pointDetailComponentColumn}</span>
-        <span>{t.lookup.pointDetailScoreColumn}</span>
-      </div>
-      <div className="divide-y divide-border">
-        {detail.components.map((component) => (
-          <div key={component.index} className="list-row">
-            <div className="min-w-0">
-              <p className="break-words text-sm font-medium">{component.index}. {component.nature}</p>
-              <p className="break-words text-xs text-muted-foreground">
-                {[
-                  component.weight != null ? t.lookup.pointDetailWeight(component.weight) : undefined,
-                  component.attempt != null ? t.lookup.pointDetailAttempt(component.attempt) : undefined,
-                  component.notes || undefined,
-                ].filter(Boolean).join(" · ") || "-"}
-              </p>
-            </div>
-            <Badge className="shrink-0 border border-border bg-background font-normal tabular-nums text-foreground">{component.score ?? "-"}</Badge>
+    <div className="divide-y divide-border bg-muted/30 px-4">
+      {detail.components.map((component) => (
+        <div key={component.index} className="list-row">
+          <div className="min-w-0">
+            <p className="break-words text-sm font-medium">{component.nature || "-"}</p>
+            <p className="text-xs text-muted-foreground">{
+              [
+                component.weight != null ? t.lookup.pointDetailWeight(component.weight) : undefined,
+                component.attempt != null ? t.lookup.pointDetailAttempt(component.attempt) : undefined,
+              ].filter(Boolean).join(" · ") || "-"}</p>
           </div>
-        ))}
-      </div>
+          <Badge className="shrink-0 border border-border bg-background font-normal tabular-nums text-foreground">{component.score ?? "-"}</Badge>
+        </div>
+      ))}
     </div>
   );
 }
@@ -1139,8 +1130,16 @@ export function LookupPage() {
     <FeatureFrame title={t.lookup.title} description={t.lookup.description} query={profileQuery}>
       {(profile) => (
         <div className="space-y-6">
-          <ClassIdentifierTools />
-          <StudentRecordTools profile={profile} crossLookupEnabled={crossLookupEnabled} crossDetailEnabled={crossDetailEnabled} />
+          <section className="space-y-4">
+            <header>
+              <h2 className="text-lg font-semibold">{t.lookup.utilitiesTitle}</h2>
+              <p className="text-sm text-muted-foreground">{t.lookup.utilitiesDescription}</p>
+            </header>
+            <div className="space-y-6">
+              <ClassIdentifierTools />
+              <StudentRecordTools profile={profile} crossLookupEnabled={crossLookupEnabled} crossDetailEnabled={crossDetailEnabled} />
+            </div>
+          </section>
           {bulkLookupEnabled ? <BulkLookupSection key={bulkFreshnessKey} maximum={bulkMaximum!} modeMaximums={bulkModeMaximums} directChunkMaximum={bulkDirectChunkMaximum} freshnessKey={bulkFreshnessKey} /> : null}
         </div>
       )}
