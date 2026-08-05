@@ -956,34 +956,26 @@ async function fetchVnuCrossDetail(
   warmClient?: DaotaoClient,
 ) {
   const { consumed, envelope } = await consumeVnuCrossDetailPermit(session, requesterToken, permit);
-  const fetchDetail = async (client: DaotaoClient): Promise<VnuCrossDetailComponent[]> => {
+  try {
+    const client = warmClient ?? new DaotaoClient(session);
+    if (!warmClient) {
+      // Validate session freshness before the heavy transcript fetch.
+      // Accumulates fresh cookies if daotao issues new ones, and fails fast
+      // with VNU_SESSION_EXPIRED if the session is truly dead.
+      await client.validateSession(signal);
+      // Warm up cross-student session cookies by fetching the target student's
+      // transcript page on the same client. Daotao sets additional cookies on
+      // the transcript page that authorize subsequent detailPoint.asp access.
+      // A new DaotaoClient would miss these cookies, so we pre-warm here.
+      await client.getTranscriptByStdIdHtml(envelope.selector.stdId, signal);
+    }
     const detailHtml = await client.getPointDetailHtml({
       id: envelope.selector.classId,
       stdId: envelope.selector.stdId,
       term: envelope.selector.termOrdinal,
     }, signal);
-    return projectCrossDetailComponents(parsePointDetailHtml(detailHtml));
-  };
-  try {
-    const client = warmClient ?? new DaotaoClient(session);
-    try {
-      if (!warmClient) {
-        // Warm up cross-student session cookies by fetching the target student's
-        // transcript page. Daotao sets additional cookies on the transcript page
-        // that authorize subsequent detailPoint.asp access. validateSession is
-        // deferred to the retry path — only called if the warm-up fails with
-        // VNU_SESSION_EXPIRED.
-        await client.getTranscriptByStdIdHtml(envelope.selector.stdId, signal);
-      }
-      return await fetchDetail(client);
-    } catch (error) {
-      if (!(error instanceof HyeboardError && error.code === "VNU_SESSION_EXPIRED")) throw error;
-      // Session expired — refresh credentials and retry once.
-      const retryClient = new DaotaoClient(session);
-      await retryClient.validateSession(signal);
-      await retryClient.getTranscriptByStdIdHtml(envelope.selector.stdId, signal);
-      return await fetchDetail(retryClient);
-    }
+    const result = projectCrossDetailComponents(parsePointDetailHtml(detailHtml));
+    return result;
   } finally {
     await vnuProbeBudgetCoordinator.releaseCrossDetailLease(await vnuProbeBudgetKey(session), consumed.leaseId).catch(() => undefined);
   }
