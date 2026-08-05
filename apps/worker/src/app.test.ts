@@ -4183,7 +4183,7 @@ describe("VNU cross-detail HTTP routes", () => {
     return encryptSession({ ...vnuSession(), vnu: { ...vnuSession().vnu!, value: cookie } }, SESSION_SECRET);
   }
 
-  async function issuePermit(token: string): Promise<string> {
+  async function issuePermit(token: string, targetStdId = "99000000001"): Promise<string> {
     const minter = createVnuCrossDetailMinter({
       secret: SESSION_SECRET,
       requesterToken: token,
@@ -4192,7 +4192,7 @@ describe("VNU cross-detail HTTP routes", () => {
       permitTtlSeconds: 60,
     });
     const permit = await minter.mint({
-      targetStdId: "99000000001",
+      targetStdId,
       transcriptHtml: "<table>synthetic transcript</table>",
       row: { courseCode: "SYN9901", classId: "990099", termOrdinal: "2" },
     });
@@ -4236,6 +4236,7 @@ describe("VNU cross-detail HTTP routes", () => {
     profileSpy.mockRestore();
     transcriptSpy.mockRestore();
     validateSpy.mockRestore();
+    vi.unstubAllGlobals();
   });
 
   it("keeps transcript permit issuance and its errors private", async () => {
@@ -4289,6 +4290,33 @@ describe("VNU cross-detail HTTP routes", () => {
     await expect(replay.json()).resolves.toMatchObject({ error: { code: "VNU_CROSS_DETAIL_PERMIT_INVALID" } });
     expect(selectedExport.status).toBe(200);
     expect(selectedExport.headers.get("Cache-Control")).toBe("no-store, private");
+  });
+
+  it("pads the upstream detail student ID and rejects a generic portal page", async () => {
+    const token = await bearerToken("SYNTHETIC_SHAPE_COOKIE");
+    const permit = await issuePermit(token, "12345");
+    detailSpy.mockRestore();
+    const wrongPageHtml = `<html><head><title>Xem thông tin sinh vien</title></head><body><table><tr><td>Synthetic portal shell</td></tr></table></body></html>`;
+    const upstreamResponse = new Response(wrongPageHtml);
+    Object.defineProperty(upstreamResponse, "url", { value: "https://daotao.vnu.edu.vn/ListPoint/detailPoint.asp" });
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(upstreamResponse);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await requestRoute("/api/vnu/cross-lookup/detail", token, { allowCrossLookup: true, permit });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://daotao.vnu.edu.vn/ListPoint/detailPoint.asp?id=990099&val=&StdID=00000012345&Term=2",
+      expect.objectContaining({ redirect: "follow" }),
+    );
+    expect(response.status).toBe(502);
+    await expect(response.json()).resolves.toEqual({
+      data: null,
+      error: {
+        code: "VNU_UPSTREAM_RESPONSE_INVALID",
+        message: "daotao.vnu.edu.vn returned an unexpected point-detail page.",
+      },
+    });
+    expect(probeBudget.releasedCrossDetailLeases).toHaveLength(1);
   });
 
   it("releases consumed detail leases after upstream rejection and request abort", async () => {

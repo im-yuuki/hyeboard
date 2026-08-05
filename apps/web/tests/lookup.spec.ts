@@ -70,7 +70,7 @@ test("lookup renders only own-session point-detail components", async ({ page })
   await page.getByRole("option").first().click();
   const result = page.getByTestId("lookup-results");
   await expect(result.getByText("Synthetic Export Systems")).toBeVisible();
-  await result.getByRole("button", { name: "Grade breakdown" }).click();
+  await result.getByRole("button", { name: "Grade breakdown", exact: true }).click();
   await expect(result.getByText("Giữa kỳ")).toBeVisible();
   await expect(result.getByText("Thi cuối kỳ")).toBeVisible();
   await expect(result.getByText("Weight 0.4 · Attempt 1")).toBeVisible();
@@ -692,6 +692,22 @@ test("lookup successful single results export both formats without refetch and c
   await expect(derivedHeader.getByText("Term GPA").locator("..")).toContainText("4.00");
   await expect(derivedHeader.getByText("CPA", { exact: true }).locator("..")).toContainText("3.50");
   await expect(derivedHeader.getByText("Included credits").locator("..")).toContainText("3 / 5 listed");
+  const gradeTable = transcriptSection.locator("table").first();
+  await expect(gradeTable.getByRole("columnheader", { name: "Course" })).toBeVisible();
+  await expect(gradeTable.getByRole("columnheader", { name: "Grade" })).toBeVisible();
+  await expect(gradeTable.getByRole("columnheader", { name: "Credits" })).toBeVisible();
+  await expect(gradeTable.getByRole("columnheader", { name: "Point 10" })).toBeVisible();
+  await expect(gradeTable.getByRole("columnheader", { name: "Point 4" })).toBeVisible();
+  const headerButtons = gradeTable.locator("thead th");
+  await expect(headerButtons.nth(0).locator("button")).toContainText("Course");
+  await expect(headerButtons.nth(2).locator("button")).toHaveText("Credits");
+  await expect(headerButtons.nth(3).locator("button")).toHaveText("Point 10");
+  await expect(headerButtons.nth(4).locator("button")).toHaveText("Point 4");
+  await expect(headerButtons.nth(4)).toHaveClass(/max-sm:hidden/);
+  await page.setViewportSize({ width: 375, height: 812 });
+  await expect(gradeTable.getByRole("columnheader", { name: "Point 4" })).not.toBeVisible();
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await expect(gradeTable.getByRole("columnheader", { name: "Point 4" })).toBeVisible();
   await expect(transcriptSection.getByRole("button", { name: "Export" })).toHaveCount(1);
   const transcriptDocument = await expectExportFormats(page, "cross-transcript", apiRequestCount, {
     sourcePath: "/api/vnu/cross-lookup/transcript",
@@ -823,7 +839,8 @@ test("cross-detail sends only an opaque permit and never persists detail state",
   const section = page.getByTestId("cross-transcript");
   await section.getByLabel("Target internal student ID").fill(SYNTHETIC_TARGET_INTERNAL_ID);
   await section.getByRole("button", { name: "View transcript" }).click();
-  await section.getByRole("button", { name: "Details" }).click();
+  await section.getByRole("button", { name: "Toggle details for Synthetic Foundations" }).click();
+  await expect(section.getByTestId("grade-detail").nth(2)).toHaveAttribute("data-open", "true");
   await expect(section.getByText("Synthetic component")).toBeVisible();
 
   expect(submittedBodies).toEqual([{ allowCrossLookup: true, permit: "synthetic-detail-permit" }]);
@@ -839,7 +856,9 @@ test("cross-detail UI stays unavailable without its published capability", async
   await section.getByLabel("Target internal student ID").fill(SYNTHETIC_TARGET_INTERNAL_ID);
   await section.getByRole("button", { name: "View transcript" }).click();
 
-  await expect(section.getByRole("button", { name: "Details" })).toHaveCount(0);
+  await section.getByRole("button", { name: "Toggle details for Synthetic Foundations" }).click();
+  await expect(section.getByTestId("grade-detail").nth(2)).toHaveAttribute("data-open", "true");
+  await expect(section.getByText("Assessment detail is unavailable because this grade has no verified class identity.")).toBeVisible();
 });
 
 test("cross-detail local state clears on account changes and route unmount", async ({ page }) => {
@@ -851,7 +870,8 @@ test("cross-detail local state clears on account changes and route unmount", asy
   const section = page.getByTestId("cross-transcript");
   await section.getByLabel("Target internal student ID").fill(SYNTHETIC_TARGET_INTERNAL_ID);
   await section.getByRole("button", { name: "View transcript" }).click();
-  await section.getByRole("button", { name: "Details" }).click();
+  await section.getByRole("button", { name: "Toggle details for Synthetic Foundations" }).click();
+  await expect(section.getByTestId("grade-detail").nth(2)).toHaveAttribute("data-open", "true");
   await expect(section.getByText("Synthetic transient detail")).toBeVisible();
 
   await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:account-switched")));
@@ -860,4 +880,30 @@ test("cross-detail local state clears on account changes and route unmount", asy
   const stored = await page.evaluate(() => ({ local: Object.values(localStorage), session: Object.values(sessionStorage) }));
   expect(JSON.stringify(stored)).not.toContain("synthetic-detail-permit");
   expect(JSON.stringify(stored)).not.toContain("Synthetic transient detail");
+});
+
+test("cross-transcript grade-detail supports expanding multiple rows simultaneously", async ({ page }) => {
+  await openMockedLookup(page, 50, 5, undefined, 2, true);
+  await page.route("**/api/vnu/cross-lookup/detail", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { components: [{ index: 1, nature: "Multi-open detail", score: 8 }] }, error: null }) });
+  });
+  await page.getByRole("button", { name: "Transcript", exact: true }).click();
+  const section = page.getByTestId("cross-transcript");
+  await section.getByLabel("Target internal student ID").fill(SYNTHETIC_TARGET_INTERNAL_ID);
+  await section.getByRole("button", { name: "View transcript" }).click();
+  await expect(section.getByTestId("academic-term-header")).toHaveCount(2);
+
+  const resBtn = section.getByRole("button", { name: "Toggle details for Synthetic Resolution" });
+  await expect(resBtn).toHaveAttribute("aria-expanded", "false");
+  await resBtn.click();
+  await expect(resBtn).toHaveAttribute("aria-expanded", "true");
+  await expect(section.locator('[data-testid="grade-detail"][data-open="true"]')).toHaveCount(1);
+
+  await section.getByRole("button", { name: "Toggle details for Synthetic Foundations" }).click();
+  await expect(section.locator('[data-testid="grade-detail"][data-open="true"]')).toHaveCount(2);
+  await expect(section.getByText("Multi-open detail")).toBeVisible();
+
+  await section.getByRole("button", { name: "Toggle details for Synthetic Resolution" }).click();
+  await expect(section.locator('[data-testid="grade-detail"][data-open="true"]')).toHaveCount(1);
+  await expect(section.getByText("Multi-open detail")).toBeVisible();
 });

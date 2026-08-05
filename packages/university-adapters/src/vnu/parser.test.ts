@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   isDaotaoSessionExpired,
+  isPointDetailPageHtml,
   findPointDetailSelector,
   parseExamCatalogHtml,
   parseExamsHtml,
@@ -311,6 +312,14 @@ describe("parsePointDetailHtml", () => {
       { index: 2, nature: "Giữa kỳ", weight: 0.4, attempt: 1, score: 9.3, notes: undefined },
     ]);
     expect(detail.displayTotalEcho).toBeUndefined();
+  });
+
+  it("classifies recognizable zero-component detail pages separately from generic portal pages", () => {
+    const emptyDetailHtml = `<p>Điểm chi tiết môn học - Học kỳ 1. Mã học kỳ 251</p><table><tr><td>STT</td><td>Bản chất kỳ thi</td><td>TS</td><td>Lần thi</td><td>Điểm</td><td>Ghi chú</td></tr></table>`;
+    const genericStudentPageHtml = `<html><head><title>Xem thông tin sinh vien</title></head><body><table><tr><td>Synthetic portal shell</td></tr></table></body></html>`;
+
+    expect(isPointDetailPageHtml(emptyDetailHtml)).toBe(true);
+    expect(isPointDetailPageHtml(genericStudentPageHtml)).toBe(false);
   });
 });
 

@@ -1,6 +1,6 @@
 import type { Grade } from "@hyeboard/schemas";
 import { describe, expect, it } from "vitest";
-import { ALL_GRADE_TERMS, createGradeExportTerm, decodeGradeTermKey, encodeGradeTermKey, selectVisibleGradeSummaries, sortGrades } from "./grade-view-model";
+import { ALL_GRADE_TERMS, createGradeExportTerm, decodeGradeTermKey, encodeGradeTermKey, selectVisibleGradeSummaries, sortGrades, sortGradeTableRows, type GradeTableRow } from "./grade-view-model";
 import type { AcademicTermSummary } from "./term-academic-summary";
 
 const grades: Grade[] = [
@@ -42,5 +42,58 @@ describe("grade view model", () => {
       ["courseCode", "courseName", "credits", "point10", "letter", "point4"],
       ["courseCode", "courseName", "credits", "point10", "letter", "point4"],
     ]);
+  });
+});
+
+describe("sortGradeTableRows", () => {
+  const rows: readonly GradeTableRow[] = [
+    { id: "1", courseName: "Toán", credits: 3, point10: 8, point4: 3, letter: "B", detail: { kind: "unavailable", render: () => null } },
+    { id: "2", courseName: "Anh văn", credits: 2, point10: 9, point4: 4, letter: "A", detail: { kind: "unavailable", render: () => null } },
+    { id: "3", courseName: "Toán", credits: 4, point10: null, point4: null, letter: "-", detail: { kind: "unavailable", render: () => null } },
+  ];
+
+  it("sorts by name ascending", () => {
+    const result = sortGradeTableRows(rows, { key: "name", direction: "asc" });
+    expect(result.map(r => r.courseName)).toEqual(["Anh văn", "Toán", "Toán"]);
+  });
+
+  it("sorts by name descending", () => {
+    const result = sortGradeTableRows(rows, { key: "name", direction: "desc" });
+    expect(result.map(r => r.courseName)).toEqual(["Toán", "Toán", "Anh văn"]);
+  });
+
+  it("sorts by credits ascending", () => {
+    const result = sortGradeTableRows(rows, { key: "credits", direction: "asc" });
+    expect(result.map(r => r.credits)).toEqual([2, 3, 4]);
+  });
+
+  it("sorts by point10 with null as -1", () => {
+    const result = sortGradeTableRows(rows, { key: "point10", direction: "desc" });
+    expect(result.map(r => r.point10)).toEqual([9, 8, null]);
+  });
+
+  it("sorts by point4 ascending (null → -1 sorts first)", () => {
+    const result = sortGradeTableRows(rows, { key: "point4", direction: "asc" });
+    expect(result.map(r => r.point4)).toEqual([null, 3, 4]);
+  });
+
+  it("sorts by point10 ascending (null → -1 sorts first)", () => {
+    const result = sortGradeTableRows(rows, { key: "point10", direction: "asc" });
+    expect(result.map(r => r.point10)).toEqual([null, 8, 9]);
+  });
+
+  it("returns empty array for empty input", () => {
+    expect(sortGradeTableRows([], { key: "name", direction: "asc" })).toEqual([]);
+  });
+
+  it("returns single-element array unchanged", () => {
+    const single = rows.slice(0, 1);
+    expect(sortGradeTableRows(single, { key: "point10", direction: "desc" })).toEqual(single);
+  });
+
+  it("does not mutate source", () => {
+    const copy = [...rows];
+    sortGradeTableRows(rows, { key: "name", direction: "asc" });
+    expect(rows).toEqual(copy);
   });
 });

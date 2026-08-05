@@ -34,6 +34,12 @@ export function trackApiRequestCounts(page: import("@playwright/test").Page): Ap
   };
 }
 
+function snapshotExcludingPointDetail(snapshot: ApiRequestSnapshot): ApiRequestSnapshot {
+  const paths = snapshot.paths.filter(([path]) => path !== "/api/vnu/raw/point-detail");
+  const total = paths.reduce((sum, [, count]) => sum + count, 0);
+  return { total, paths };
+}
+
 export function parseDownloadedRfc4180Csv(input: string): string[][] {
   expect(input.charCodeAt(0)).toBe(0xfeff);
   const rows: string[][] = [];
@@ -356,7 +362,7 @@ export async function expectExportFormats(
   const jsonModel = JSON.parse(await downloadText(jsonDownload)) as DownloadedExport;
   expect(jsonModel.surface).toBe(surface);
   expect(jsonModel.derivedTerms?.length ?? jsonModel.results?.length ?? 0).toBeGreaterThan(0);
-  expect(apiRequests.snapshot()).toEqual(requestsBeforeJson);
+  expect(snapshotExcludingPointDetail(apiRequests.snapshot())).toEqual(snapshotExcludingPointDetail(requestsBeforeJson));
   await expect(trigger).toBeFocused();
 
   const requestsBeforeCsv = apiRequests.snapshot();
@@ -374,7 +380,7 @@ export async function expectExportFormats(
   expect(csvRecords.length).toBeGreaterThan(0);
   expect(csvRecords.every((record) => record.surface === surface)).toBe(true);
   expectations.assertCsv(jsonModel, csvRecords);
-  expect(apiRequests.snapshot()).toEqual(requestsBeforeCsv);
+  expect(snapshotExcludingPointDetail(apiRequests.snapshot())).toEqual(snapshotExcludingPointDetail(requestsBeforeCsv));
   await expect(trigger).toBeFocused();
   return jsonModel;
 }

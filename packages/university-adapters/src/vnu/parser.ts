@@ -437,33 +437,57 @@ export function parseSyllabusHtml(html: string): VnuSyllabusRow[] {
 // STT | Bản chất kỳ thi | TS | Lần thi | Điểm | Ghi chú. The trailing
 // "Tổng điểm" row is parsed into displayTotalEcho — it merely echoes the
 // request's val= param back (verified live) and is never a computed total.
+type PointDetailColumns = {
+  index: number;
+  nature: number;
+  weight: number;
+  attempt: number;
+  score: number;
+  notes?: number;
+};
+
+function pointDetailColumns(cells: string[]): PointDetailColumns | undefined {
+  const normalizedCells = cells.map((cell) => cell.trim().toLocaleLowerCase("vi-VN"));
+  const indexes = {
+    index: normalizedCells.indexOf("stt"),
+    nature: normalizedCells.indexOf("bản chất kỳ thi"),
+    weight: normalizedCells.indexOf("ts"),
+    attempt: normalizedCells.indexOf("lần thi"),
+    score: normalizedCells.indexOf("điểm"),
+    notes: normalizedCells.indexOf("ghi chú"),
+  };
+  if (indexes.index < 0 || indexes.nature < 0 || indexes.weight < 0 || indexes.attempt < 0 || indexes.score < 0) return undefined;
+
+  return {
+    ...indexes,
+    notes: indexes.notes >= 0 ? indexes.notes : undefined,
+  };
+}
+
+function pointDetailRows(html: string): string[][] {
+  return [...html.matchAll(/<tr\b[^>]*>([\s\S]*?)(?=<\/tr>|<tr\b|<\/t(?:able|body)>)/gi)]
+    .map((match) => tdCells(match[1]));
+}
+
+export function isPointDetailPageHtml(html: string): boolean {
+  const plain = stripTags(html);
+  if (!/Điểm chi tiết môn học.*?Mã học kỳ\s*[0-9A-Za-z]+/i.test(plain)) return false;
+  return pointDetailRows(html).some((cells) => pointDetailColumns(cells) !== undefined);
+}
+
 export function parsePointDetailHtml(html: string): VnuPointDetail {
   const plain = stripTags(html);
   const headerMatch = plain.match(/Điểm chi tiết môn học.*?Mã học kỳ\s*[0-9A-Za-z]+/i);
   const termCodeMatch = plain.match(/Mã học kỳ\s*([0-9A-Za-z]+)/i);
   const components: VnuPointDetailComponent[] = [];
   let displayTotalEcho: string | undefined;
-  let componentColumns: { index: number; nature: number; weight: number; attempt: number; score: number; notes?: number } | undefined;
-  const trRe = /<tr\b[^>]*>([\s\S]*?)(?=<\/tr>|<tr\b|<\/t(?:able|body)>)/gi;
-  let match: RegExpExecArray | null;
-  while ((match = trRe.exec(html))) {
-    const cells = tdCells(match[1]);
+  let componentColumns: PointDetailColumns | undefined;
+  for (const cells of pointDetailRows(html)) {
     if (!cells.length) continue;
     const joined = cells.join(" ");
-    const normalizedCells = cells.map((cell) => cell.trim().toLocaleLowerCase("vi-VN"));
-    const headerIndexes = {
-      index: normalizedCells.indexOf("stt"),
-      nature: normalizedCells.indexOf("bản chất kỳ thi"),
-      weight: normalizedCells.indexOf("ts"),
-      attempt: normalizedCells.indexOf("lần thi"),
-      score: normalizedCells.indexOf("điểm"),
-      notes: normalizedCells.indexOf("ghi chú"),
-    };
-    if (headerIndexes.index >= 0 && headerIndexes.nature >= 0 && headerIndexes.weight >= 0 && headerIndexes.attempt >= 0 && headerIndexes.score >= 0) {
-      componentColumns = {
-        ...headerIndexes,
-        notes: headerIndexes.notes >= 0 ? headerIndexes.notes : undefined,
-      };
+    const parsedColumns = pointDetailColumns(cells);
+    if (parsedColumns) {
+      componentColumns = parsedColumns;
       continue;
     }
     if (/Tổng điểm/i.test(joined)) {

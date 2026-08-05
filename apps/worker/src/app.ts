@@ -940,35 +940,11 @@ function crossDetailLimits() {
 
 async function consumeVnuCrossDetailPermit(session: EncryptedSessionPayload, requesterToken: string, permit: string) {
   const parsed = parseVnuCrossDetailPermitString(permit);
-  console.log("[cross-detail] permit parsed:", { permitId: parsed.permitId, envelopeLen: parsed.envelope.length });
-
   const envelope = await decryptVnuCrossDetailPermitEnvelope(parsed.envelope, getSessionSecret());
-  console.log("[cross-detail] envelope decrypted:", {
-    selector: `${envelope.selector.stdId}/${envelope.selector.classId}/${envelope.selector.termOrdinal}`,
-    nonce: envelope.nonce.slice(0, 8) + "...",
-    targetHmac: envelope.targetHmac.slice(0, 8) + "...",
-    revisionHmac: envelope.revisionHmac.slice(0, 8) + "...",
-    rowHmac: envelope.rowHmac.slice(0, 8) + "...",
-  });
-
   const limits = crossDetailLimits();
   const identity = await vnuProbeBudgetKey(session);
-  console.log("[cross-detail] limits+identity:", { identity: identity.slice(0, 8) + "...", maxTargets: limits.maxTargets, maxRows: limits.maxRows, budget: limits.budget });
-
   const input = await buildVnuCrossDetailConsumeInput(getSessionSecret(), requesterToken, parsed, envelope);
-  console.log("[cross-detail] consume input built:", {
-    permitHash: input.permitHash.slice(0, 8) + "...",
-    nonce: input.nonce.slice(0, 8) + "...",
-    requesterHmac: input.requesterHmac.slice(0, 8) + "...",
-    targetHmac: input.targetHmac.slice(0, 8) + "...",
-    revisionHmac: input.revisionHmac.slice(0, 8) + "...",
-    rowHmac: input.rowHmac.slice(0, 8) + "...",
-    policyVersion: input.policyVersion,
-  });
-
   const consumed = await vnuProbeBudgetCoordinator.consumeCrossDetailPermit(identity, input, limits);
-  console.log("[cross-detail] permit consumed:", { allowed: "leaseId" in consumed, leaseId: "leaseId" in consumed ? (consumed as { leaseId: string }).leaseId.slice(0, 8) + "..." : "N/A" });
-
   return { consumed, envelope };
 }
 
@@ -976,25 +952,17 @@ async function fetchVnuCrossDetail(session: EncryptedSessionPayload, requesterTo
   const { consumed, envelope } = await consumeVnuCrossDetailPermit(session, requesterToken, permit);
   try {
     const client = new DaotaoClient(session);
-    await client.validateSession(signal);
+    // Warm up cross-student session cookies by fetching the target student's
+    // transcript page on the same client. Daotao sets additional cookies on
+    // the transcript page that authorize subsequent detailPoint.asp access.
+    // A new DaotaoClient would miss these cookies, so we pre-warm here.
+    await client.getTranscriptByStdIdHtml(envelope.selector.stdId, signal);
     const detailHtml = await client.getPointDetailHtml({
       id: envelope.selector.classId,
       stdId: envelope.selector.stdId,
       term: envelope.selector.termOrdinal,
-      val: "0",
     }, signal);
-    console.log("[cross-detail] daotao HTML:", {
-      stdId: envelope.selector.stdId,
-      classId: envelope.selector.classId,
-      term: envelope.selector.termOrdinal,
-      htmlLen: detailHtml.length,
-      trCount: (detailHtml.match(/<tr\b/gi) || []).length,
-      hasTable: detailHtml.includes('<table'),
-      hasSixTdRows: (detailHtml.match(/(?=<tr\b)[\s\S]*?<\/tr>/gi) || []).filter(s => (s.match(/<td\b[^>]*>/gi) || []).length === 6).length,
-      first200: detailHtml.slice(0, 200),
-    });
     const result = projectCrossDetailComponents(parsePointDetailHtml(detailHtml));
-    console.log("[cross-detail] parsed:", { componentCount: result.length, components: result.slice(0, 3).map(c => c.nature) });
     return result;
   } finally {
     await vnuProbeBudgetCoordinator.releaseCrossDetailLease(await vnuProbeBudgetKey(session), consumed.leaseId).catch(() => undefined);
@@ -1837,12 +1805,7 @@ export function createApp(adapter: any) {
       const requesterToken = parseBearerToken(new Headers(headers as Record<string, string>).get("Authorization"));
       if (!requesterToken) throw new HyeboardError("MISSING_SESSION", "Missing Authorization bearer token", 401);
       const { permit } = await readVnuCrossDetailBody(request, "single", crossDetailLimits().maxRows);
-      try {
-        return ok({ components: await fetchVnuCrossDetail(session, requesterToken, permit, request.signal) });
-      } catch (error) {
-        console.error("[cross-detail] route error:", error instanceof HyeboardError ? { code: error.code, status: error.status, message: error.message } : error);
-        throw error;
-      }
+      return ok({ components: await fetchVnuCrossDetail(session, requesterToken, permit, request.signal) });
     }, { parse: "none" })
     .post("/api/vnu/cross-lookup/detail/bulk", async ({ headers, request, set }) => {
       set.headers["Cache-Control"] = "no-store, private";

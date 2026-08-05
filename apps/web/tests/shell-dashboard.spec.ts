@@ -110,7 +110,7 @@ test("sidebar collapses and expands via toggle button", async ({ authenticatedPa
   await expect(page.getByText("Demo", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Overview", { exact: true })).toBeVisible();
   await expect(page.getByText("Study", { exact: true })).toBeVisible();
-  await expect(page.getByText("Services", { exact: true })).toBeVisible();
+  await expect(page.getByText("Utilities", { exact: true })).toBeVisible();
   await expect(page.getByText("System", { exact: true })).toBeVisible();
   await expect(page.getByText(/Powered by Hyeboard/)).toHaveCount(0);
   await expect(page.getByRole("link", { name: "Dashboard" })).toHaveAttribute("aria-current", "page");

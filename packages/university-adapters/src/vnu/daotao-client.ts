@@ -6,30 +6,50 @@
 
 import { HyeboardError, type EncryptedSessionPayload } from "@hyeboard/core";
 import { BROWSER_USER_AGENT } from "../http";
-import { isDaotaoSessionExpired } from "./parser";
+import { isDaotaoSessionExpired, isPointDetailPageHtml } from "./parser";
 
 const BASE = "https://daotao.vnu.edu.vn";
 
 export class DaotaoClient {
-  constructor(private readonly session?: EncryptedSessionPayload) {}
+  private cookies: string;
 
-  private cookie(): string | undefined {
-    return this.session?.vnu?.value;
+  constructor(private readonly session?: EncryptedSessionPayload) {
+    this.cookies = this.session?.vnu?.value ?? "";
+  }
+
+  private mergeSetCookies(response: Response): void {
+    const setCookies =
+      typeof response.headers.getSetCookie === "function"
+        ? response.headers.getSetCookie()
+        : (response.headers.get("set-cookie")?.split(/,(?=[^;]+?=)/) ?? []);
+    for (const entry of setCookies) {
+      const [nameValue] = entry.split(";");
+      const [name] = nameValue.split("=");
+      if (!name) continue;
+      const cookieName = name.trim() + "=";
+      const idx = this.cookies.indexOf(cookieName);
+      if (idx >= 0) {
+        const end = this.cookies.indexOf(";", idx);
+        this.cookies = this.cookies.slice(0, idx) + nameValue.trim() + (end >= 0 ? this.cookies.slice(end) : "");
+      } else {
+        this.cookies = this.cookies ? `${this.cookies}; ${nameValue.trim()}` : nameValue.trim();
+      }
+    }
   }
 
   private async fetchPage(path: string, signal?: AbortSignal): Promise<string> {
-    const cookie = this.cookie();
     let response: Response;
     try {
       response = await fetch(`${BASE}${path}`, {
         redirect: "follow",
         signal,
-        headers: { "User-Agent": BROWSER_USER_AGENT, ...(cookie ? { Cookie: cookie } : {}) },
+        headers: { "User-Agent": BROWSER_USER_AGENT, ...(this.cookies ? { Cookie: this.cookies } : {}) },
       });
     } catch {
       if (signal?.aborted) throw signal.reason ?? new DOMException("This operation was aborted", "AbortError");
       throw new HyeboardError("VNU_UPSTREAM_UNAVAILABLE", "Could not reach daotao.vnu.edu.vn. The portal may be down or your network may be blocking it.", 502);
     }
+    this.mergeSetCookies(response);
     if (response.status === 429) throw new HyeboardError("VNU_RATE_LIMITED", "daotao.vnu.edu.vn is rate-limiting requests. Wait a few minutes and try again.", 429);
     if (response.status >= 500) throw new HyeboardError("VNU_UPSTREAM_UNAVAILABLE", `daotao.vnu.edu.vn returned ${response.status}. Try again later.`, 502);
     if (!response.ok) throw new HyeboardError("VNU_REQUEST_FAILED", `daotao.vnu.edu.vn rejected the request with HTTP ${response.status}.`, response.status);
@@ -40,9 +60,6 @@ export class DaotaoClient {
       if (signal?.aborted) throw signal.reason ?? new DOMException("This operation was aborted", "AbortError");
       throw new HyeboardError("VNU_UPSTREAM_UNAVAILABLE", "Could not read the response from daotao.vnu.edu.vn. The portal connection may have been interrupted.", 502);
     }
-    // The ASP portal doesn't return 401s for an expired/invalid session — it
-    // just re-renders the login page. Detect that explicitly so callers get
-    // a real "sign in again" error instead of silently parsing an empty page.
     if (isDaotaoSessionExpired(response.url, html)) {
       throw new HyeboardError("VNU_SESSION_EXPIRED", "The university portal session has expired. Sign in again.", 401);
     }
@@ -112,8 +129,21 @@ export class DaotaoClient {
   // stdId here must come from the authenticated grades row (server-side),
   // never from a client query param; val is a cosmetic echo the portal
   // renders into the footer without validating it (see har-notes.md).
-  getPointDetailHtml(params: { id: string; stdId: string; term: string; val?: string }, signal?: AbortSignal): Promise<string> {
-    const query = new URLSearchParams({ id: params.id, val: params.val ?? "", StdID: params.stdId, Term: params.term });
-    return this.fetchPage(`/ListPoint/detailPoint.asp?${query.toString()}`, signal);
+  async getPointDetailHtml(params: { id: string; stdId: string; term: string; val?: string }, signal?: AbortSignal): Promise<string> {
+    const query = new URLSearchParams({
+      id: params.id,
+      val: params.val ?? "",
+      StdID: params.stdId.padStart(11, "0"),
+      Term: params.term,
+    });
+    const html = await this.fetchPage(`/ListPoint/detailPoint.asp?${query.toString()}`, signal);
+    if (!isPointDetailPageHtml(html)) {
+      throw new HyeboardError(
+        "VNU_UPSTREAM_RESPONSE_INVALID",
+        "daotao.vnu.edu.vn returned an unexpected point-detail page.",
+        502,
+      );
+    }
+    return html;
   }
 }

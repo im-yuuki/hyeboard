@@ -1,4 +1,5 @@
 import type { Grade } from "@hyeboard/schemas";
+import type React from "react";
 import { letterForGrade } from "./presentation";
 import type { AcademicTermSummary } from "./term-academic-summary";
 import type { ExportDerivedTerm } from "./data-export";
@@ -9,6 +10,21 @@ const ESCAPED_TERM_PREFIX = "~hyeboard:known:";
 
 export type GradeSortKey = "name" | "credits" | "point10" | "point4";
 export type GradeSortState = Readonly<{ key: GradeSortKey; direction: "asc" | "desc" }>;
+
+export type GradeTableDetail =
+  | { kind: "available"; render: () => React.ReactNode }
+  | { kind: "unavailable"; render: () => React.ReactNode };
+
+export type GradeTableRow = {
+  id: string;
+  courseName: string;
+  credits?: number | null;
+  point10?: number | null;
+  letter?: string;
+  point4?: number | null;
+  isSummer?: boolean;
+  detail: GradeTableDetail;
+};
 
 export function encodeGradeTermKey(termCode: string | undefined): string {
   const trimmedTermCode = termCode?.trim();
@@ -27,6 +43,20 @@ export function decodeGradeTermKey(termKey: string): string | undefined {
 export function isSummerGrade(grade: Grade, universityId: string): boolean {
   const usesUetRules = universityId === "uet" || universityId === "mock";
   return usesUetRules && Boolean(grade.termCode?.endsWith("3"));
+}
+
+export function sortGradeTableRows(rows: readonly GradeTableRow[], sort: GradeSortState): GradeTableRow[] {
+  const sorted = [...rows];
+  sorted.sort((a, b) => {
+    let comparison = 0;
+    if (sort.key === "credits") comparison = (a.credits ?? -1) - (b.credits ?? -1);
+    else if (sort.key === "point10") comparison = (a.point10 ?? -1) - (b.point10 ?? -1);
+    else if (sort.key === "point4") comparison = (a.point4 ?? -1) - (b.point4 ?? -1);
+    else comparison = a.courseName.localeCompare(b.courseName, "vi");
+    if (comparison === 0) comparison = a.courseName.localeCompare(b.courseName, "vi");
+    return sort.direction === "desc" ? -comparison : comparison;
+  });
+  return sorted;
 }
 
 function sortGradeValue(grade: Grade, key: GradeSortKey): string | number {

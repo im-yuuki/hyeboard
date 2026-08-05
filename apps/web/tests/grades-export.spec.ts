@@ -310,3 +310,29 @@ test("export menu keeps download focus and remains contained across viewports @w
   await expect(trigger).toBeFocused();
   await expect(resultText).toBeVisible();
 });
+
+test("grades detail is lazy-loaded — no API request before expanding", async ({ authenticatedPage: page }) => {
+  const apiPaths = new Set<string>();
+  page.on("request", (request) => {
+    const path = new URL(request.url()).pathname;
+    if (path.startsWith("/api/")) apiPaths.add(path);
+  });
+  await page.goto("/grades");
+  await page.getByRole("combobox", { name: "Term" }).click();
+  await page.getByRole("option", { name: "Semester 2, 2024–2025" }).click();
+  await expect(page.getByText("Signals and Systems")).toBeVisible();
+
+  const requestsBeforeExpand = new Set(apiPaths);
+  expect(requestsBeforeExpand.has("/api/vnu/raw/point-detail")).toBe(false);
+
+  const toggleBtn = page.getByRole("button", { name: "Toggle details for Signals and Systems" });
+  await expect(toggleBtn).toHaveAttribute("aria-expanded", "false");
+  await toggleBtn.click();
+  await expect(toggleBtn).toHaveAttribute("aria-expanded", "true");
+  await expect(page.getByText("Summer semester, 2024–2025")).toBeVisible();
+
+  // Mock adapter renders detail inline — no extra API call for detail
+  expect(apiPaths.has("/api/vnu/raw/point-detail")).toBe(false);
+  const newRequests = [...apiPaths].filter((p) => !requestsBeforeExpand.has(p));
+  expect(newRequests).toHaveLength(0);
+});

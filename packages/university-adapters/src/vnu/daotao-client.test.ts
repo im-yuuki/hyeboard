@@ -165,6 +165,47 @@ describe("DaotaoClient status precedence", () => {
   });
 });
 
+describe("DaotaoClient point detail", () => {
+  const DETAIL_URL = "https://daotao.vnu.edu.vn/ListPoint/detailPoint.asp";
+  const EMPTY_DETAIL_HTML = `<html><body>
+    <p>Điểm chi tiết môn học - Học kỳ 1. Mã học kỳ 251</p>
+    <table><tr><td>STT</td><td>Bản chất kỳ thi</td><td>TS</td><td>Lần thi</td><td>Điểm</td><td>Ghi chú</td></tr></table>
+  </body></html>`;
+
+  it("normalizes a short student ID to the upstream 11-digit request shape", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(responseWithFinalUrl(EMPTY_DETAIL_HTML, 200, DETAIL_URL));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await new DaotaoClient().getPointDetailHtml({ id: "123456", stdId: "12345", term: "045" });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${DETAIL_URL}?id=123456&val=&StdID=00000012345&Term=045`,
+      expect.objectContaining({ redirect: "follow" }),
+    );
+  });
+
+  it("rejects a generic student-information page instead of returning a false empty detail", async () => {
+    const wrongPageHtml = `<html><head><title>Xem thông tin sinh vien</title></head><body><table><tr><td>Synthetic portal shell</td></tr></table></body></html>`;
+    mockFetchResponse(wrongPageHtml, 200, DETAIL_URL);
+
+    const error = await expectHyeboardError(
+      new DaotaoClient().getPointDetailHtml({ id: "123456", stdId: "12345", term: "045" }),
+      { code: "VNU_UPSTREAM_RESPONSE_INVALID", status: 502 },
+    );
+
+    expect(error.message).not.toContain(wrongPageHtml);
+    expect(error.details).toBeUndefined();
+  });
+
+  it("accepts a recognizable point-detail page with zero component rows", async () => {
+    mockFetchResponse(EMPTY_DETAIL_HTML, 200, DETAIL_URL);
+
+    await expect(
+      new DaotaoClient().getPointDetailHtml({ id: "123456", stdId: "00000012345", term: "045" }),
+    ).resolves.toBe(EMPTY_DETAIL_HTML);
+  });
+});
+
 const SYNTHETIC_STUDENT_CODE = "99000001";
 const SYNTHETIC_INTERNAL_ID = `${SYNTHETIC_STUDENT_CODE.slice(0, 2)}000000001`;
 
