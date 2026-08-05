@@ -957,25 +957,31 @@ async function fetchVnuCrossDetail(
 ) {
   const { consumed, envelope } = await consumeVnuCrossDetailPermit(session, requesterToken, permit);
   try {
-    const client = warmClient ?? new DaotaoClient(session);
-    if (!warmClient) {
-      // Validate session freshness before the heavy transcript fetch.
-      // Accumulates fresh cookies if daotao issues new ones, and fails fast
-      // with VNU_SESSION_EXPIRED if the session is truly dead.
-      await client.validateSession(signal);
-      // Warm up cross-student session cookies by fetching the target student's
-      // transcript page on the same client. Daotao sets additional cookies on
-      // the transcript page that authorize subsequent detailPoint.asp access.
-      // A new DaotaoClient would miss these cookies, so we pre-warm here.
-      await client.getTranscriptByStdIdHtml(envelope.selector.stdId, signal);
-    }
-    const detailHtml = await client.getPointDetailHtml({
+    const selector = {
       id: envelope.selector.classId,
       stdId: envelope.selector.stdId,
       term: envelope.selector.termOrdinal,
-    }, signal);
-    const result = projectCrossDetailComponents(parsePointDetailHtml(detailHtml));
-    return result;
+    };
+
+    // First attempt — no proactive validateSession; let the request fail naturally.
+    try {
+      const client = warmClient ?? new DaotaoClient(session);
+      if (!warmClient) {
+        await client.getTranscriptByStdIdHtml(envelope.selector.stdId, signal);
+      }
+      const detailHtml = await client.getPointDetailHtml(selector, signal);
+      return projectCrossDetailComponents(parsePointDetailHtml(detailHtml));
+    } catch (error) {
+      if (!(error instanceof HyeboardError && error.code === "VNU_SESSION_EXPIRED")) throw error;
+
+      // Retry once with a fresh client: re-validate session freshness,
+      // re-warm transcript cookies, then re-fetch detail.
+      const retryClient = new DaotaoClient(session);
+      await retryClient.validateSession(signal);
+      await retryClient.getTranscriptByStdIdHtml(envelope.selector.stdId, signal);
+      const detailHtml = await retryClient.getPointDetailHtml(selector, signal);
+      return projectCrossDetailComponents(parsePointDetailHtml(detailHtml));
+    }
   } finally {
     await vnuProbeBudgetCoordinator.releaseCrossDetailLease(await vnuProbeBudgetKey(session), consumed.leaseId).catch(() => undefined);
   }
