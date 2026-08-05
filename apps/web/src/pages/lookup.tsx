@@ -1130,16 +1130,8 @@ export function LookupPage() {
     <FeatureFrame title={t.lookup.title} description={t.lookup.description} query={profileQuery}>
       {(profile) => (
         <div className="space-y-6">
-          <section className="space-y-4">
-            <header>
-              <h2 className="text-lg font-semibold">{t.lookup.utilitiesTitle}</h2>
-              <p className="text-sm text-muted-foreground">{t.lookup.utilitiesDescription}</p>
-            </header>
-            <div className="space-y-6">
-              <ClassIdentifierTools />
-              <StudentRecordTools profile={profile} crossLookupEnabled={crossLookupEnabled} crossDetailEnabled={crossDetailEnabled} />
-            </div>
-          </section>
+          <ClassIdentifierTools />
+          <StudentRecordTools profile={profile} crossLookupEnabled={crossLookupEnabled} crossDetailEnabled={crossDetailEnabled} />
           {bulkLookupEnabled ? <BulkLookupSection key={bulkFreshnessKey} maximum={bulkMaximum!} modeMaximums={bulkModeMaximums} directChunkMaximum={bulkDirectChunkMaximum} freshnessKey={bulkFreshnessKey} /> : null}
         </div>
       )}

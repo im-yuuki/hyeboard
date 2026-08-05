@@ -14,7 +14,7 @@ import { useHyeboard } from "@/state";
 
 type NavCapability = "timetable" | "courses" | "assignments" | "grades" | "exams" | "tuition" | "documentsHub" | "trainingPoints" | "classLookup";
 type NavKey = "dashboard" | "timetable" | "courses" | "assignments" | "grades" | "exams" | "tuition" | "documents" | "trainingPoints" | "lookup" | "settings";
-type NavGroupKey = "overview" | "study" | "services" | "system";
+type NavGroupKey = "overview" | "study" | "utilities" | "system";
 type NavItem = { key: NavKey; to: string; icon: typeof LayoutDashboard; capability?: NavCapability };
 type NavGroup = { key: NavGroupKey; items: NavItem[] };
 
@@ -31,7 +31,7 @@ const navGroups: NavGroup[] = [
     ],
   },
   {
-    key: "services",
+    key: "utilities",
     items: [
       { key: "tuition", to: "/tuition", icon: WalletCards, capability: "tuition" },
       { key: "documents", to: "/documents", icon: Files, capability: "documentsHub" },
