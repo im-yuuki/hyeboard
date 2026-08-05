@@ -541,7 +541,8 @@ function CrossTranscriptDetail({ permit }: { permit: string }) {
   });
 
   if (detailQuery.isLoading) return <div className="px-4 py-3"><Skeleton className="h-12" /></div>;
-  if (detailQuery.error || !detailQuery.data?.length) return <div className="px-4 py-3"><Empty text={t.lookup.pointDetailEmpty} /></div>;
+  if (detailQuery.error) return <div className="px-4 py-3" role="alert"><p className="text-sm text-muted-foreground">{t.lookup.pointDetailError}</p></div>;
+  if (!detailQuery.data?.length) return <div className="px-4 py-3"><Empty text={t.lookup.pointDetailEmpty} /></div>;
   return (
     <div className="divide-y divide-border bg-muted/30 px-4">
       {detailQuery.data.map((component) => (
