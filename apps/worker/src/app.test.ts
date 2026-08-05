@@ -4177,6 +4177,7 @@ describe("VNU cross-detail HTTP routes", () => {
   let detailSpy: ReturnType<typeof vi.spyOn>;
   let profileSpy: ReturnType<typeof vi.spyOn>;
   let transcriptSpy: ReturnType<typeof vi.spyOn>;
+  let validateSpy: ReturnType<typeof vi.spyOn>;
 
   async function bearerToken(cookie: string): Promise<string> {
     return encryptSession({ ...vnuSession(), vnu: { ...vnuSession().vnu!, value: cookie } }, SESSION_SECRET);
@@ -4226,6 +4227,7 @@ describe("VNU cross-detail HTTP routes", () => {
     profileSpy = vi.spyOn(DaotaoClient.prototype, "getProfileHtml").mockResolvedValue('<input name="hidStdID" value="1000"><input name="StdCode" value="20000000">');
     transcriptSpy = vi.spyOn(DaotaoClient.prototype, "getTranscriptByStdIdHtml").mockResolvedValue("<table><tr><td>Sinh viên: SYNTHETIC</td><td>Mã số: 20000001</td></tr></table>");
     detailSpy = vi.spyOn(DaotaoClient.prototype, "getPointDetailHtml").mockResolvedValue("<table><tr><td>1</td><td>Synthetic component</td><td>0.5</td><td>1</td><td>9</td></tr></table>");
+    validateSpy = vi.spyOn(DaotaoClient.prototype, "validateSession").mockResolvedValue("");
     app = createApp(undefined);
   });
 
@@ -4233,6 +4235,7 @@ describe("VNU cross-detail HTTP routes", () => {
     detailSpy.mockRestore();
     profileSpy.mockRestore();
     transcriptSpy.mockRestore();
+    validateSpy.mockRestore();
   });
 
   it("keeps transcript permit issuance and its errors private", async () => {

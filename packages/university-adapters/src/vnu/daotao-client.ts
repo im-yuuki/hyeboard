@@ -79,6 +79,12 @@ export class DaotaoClient {
   }
 
   getProfileHtml(signal?: AbortSignal) { return this.fetchPage("/StdInfo/TabStdSelf.asp", signal); }
+
+  // Lightweight session validation — fetches a minimal page to confirm the
+  // daotao cookie is still accepted. Throws VNU_SESSION_EXPIRED if the cookie
+  // is rejected, confirming freshness otherwise. ~8 KB; cheaper than any
+  // data-bearing page.
+  validateSession(signal?: AbortSignal) { return this.fetchPage("/dkmh/login.asp", signal); }
   getGradesHtml() { return this.fetchPage("/ListPoint/listpoint_Brc1.asp"); }
   getStudyProgressHtml() { return this.fetchPage("/StdInfo/TabStdStudy.asp"); }
   getExamBaseHtml() { return this.fetchPage("/StdExamination/StdExamination.asp?selViewType=StdExam"); }
