@@ -4335,3 +4335,239 @@ describe("VNU cross-detail HTTP routes", () => {
     expect(probeBudget.releasedCrossDetailLeases).toHaveLength(2);
   });
 });
+
+describe("VNU cross-detail bulk grouping", () => {
+  let app: ReturnType<typeof createApp>;
+  let probeBudget: TestVnuProbeBudget;
+  let detailSpy: ReturnType<typeof vi.spyOn>;
+  let profileSpy: ReturnType<typeof vi.spyOn>;
+  let transcriptSpy: ReturnType<typeof vi.spyOn>;
+  let validateSpy: ReturnType<typeof vi.spyOn>;
+
+  async function bearerToken(cookie: string): Promise<string> {
+    return encryptSession({ ...vnuSession(), vnu: { ...vnuSession().vnu!, value: cookie } }, SESSION_SECRET);
+  }
+
+  async function requestRoute(path: string, token: string, body: unknown): Promise<Response> {
+    return app.handle(new Request(`http://localhost${path}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }));
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setRuntimeConfig({
+      HYEB_SESSION_SECRET: SESSION_SECRET,
+      VNU_CROSS_DETAIL_MAX_TARGETS: "4",
+      VNU_CROSS_DETAIL_MAX_ROWS: "6",
+      VNU_CROSS_DETAIL_CONCURRENCY: "1",
+      VNU_CROSS_DETAIL_BUDGET: "10",
+      VNU_CROSS_DETAIL_WINDOW_SECONDS: "60",
+      VNU_CROSS_DETAIL_PERMIT_TTL_SECONDS: "60",
+      VNU_CROSS_DETAIL_EXPORT_MODE: "selected",
+    });
+    probeBudget = new TestVnuProbeBudget();
+    setVnuProbeBudgetCoordinator(probeBudget);
+    profileSpy = vi.spyOn(DaotaoClient.prototype, "getProfileHtml").mockResolvedValue('<input name="hidStdID" value="1000"><input name="StdCode" value="20000000">');
+    transcriptSpy = vi.spyOn(DaotaoClient.prototype, "getTranscriptByStdIdHtml").mockResolvedValue("<table><tr><td>Sinh viên: SYNTHETIC</td><td>Mã số: 20000001</td></tr></table>");
+    detailSpy = vi.spyOn(DaotaoClient.prototype, "getPointDetailHtml").mockResolvedValue("<table><tr><td>1</td><td>Synthetic component</td><td>0.5</td><td>1</td><td>9</td></tr></table>");
+    validateSpy = vi.spyOn(DaotaoClient.prototype, "validateSession").mockResolvedValue("");
+    app = createApp(undefined);
+  });
+
+  afterEach(() => {
+    detailSpy.mockRestore();
+    profileSpy.mockRestore();
+    transcriptSpy.mockRestore();
+    validateSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  async function issuePermits(token: string, options: {
+    count: number;
+    targetStdId?: string;
+    startClassId?: number;
+  }): Promise<string[]> {
+    const targetStdId = options.targetStdId ?? "99000000001";
+    const minter = createVnuCrossDetailMinter({
+      secret: SESSION_SECRET,
+      requesterToken: token,
+      maxTargets: 4,
+      maxRows: options.count,
+      permitTtlSeconds: 60,
+    });
+    const permits: string[] = [];
+    const start = options.startClassId ?? 990099;
+    for (let index = 0; index < options.count; index += 1) {
+      const permit = await minter.mint({
+        targetStdId,
+        transcriptHtml: "<table>synthetic transcript</table>",
+        row: { courseCode: `SYN${9901 + index}`, classId: String(start + index), termOrdinal: "2" },
+      });
+      if (!permit) throw new Error("Synthetic cross-detail permit was not minted");
+      permits.push(permit);
+    }
+    await probeBudget.issueCrossDetailPermits("synthetic-session", minter.issued);
+    return permits;
+  }
+
+  it("groups same-stdId bulk permits under a single warm-up and processes sequentially", async () => {
+    const token = await bearerToken("SYNTHETIC_GROUP_COOKIE");
+    const permits = await issuePermits(token, { count: 3 });
+
+    const response = await requestRoute("/api/vnu/cross-lookup/detail/bulk", token, {
+      allowCrossLookup: true,
+      permits,
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Cache-Control")).toBe("no-store, private");
+    const body = await response.json() as { data: { items: Array<{ permit: string; status: string; components?: unknown; errorCode?: string }> }; error: null };
+    expect(body.data.items).toHaveLength(3);
+    for (const item of body.data.items) {
+      expect(item.status).toBe("ok");
+      expect(item.components).toBeDefined();
+    }
+
+    // Warm-up happened exactly once (single stdId group)
+    expect(transcriptSpy).toHaveBeenCalledTimes(1);
+    expect(transcriptSpy).toHaveBeenCalledWith("99000000001", expect.anything());
+
+    // Detail fetched for each permit
+    expect(detailSpy).toHaveBeenCalledTimes(3);
+
+    // All leases released
+    expect(probeBudget.releasedCrossDetailLeases).toHaveLength(3);
+  });
+
+  it("warms up once per distinct stdId and processes each group independently", async () => {
+    const token = await bearerToken("SYNTHETIC_MULTI_GROUP_COOKIE");
+    const permitsA = await issuePermits(token, { count: 2, targetStdId: "99000000001", startClassId: 990100 });
+    const permitsB = await issuePermits(token, { count: 2, targetStdId: "99000000002", startClassId: 990200 });
+    const permits = [...permitsA, ...permitsB];
+
+    const response = await requestRoute("/api/vnu/cross-lookup/detail/bulk", token, {
+      allowCrossLookup: true,
+      permits,
+    });
+
+    expect(response.status).toBe(200);
+    const body = await response.json() as { data: { items: Array<{ permit: string; status: string }> }; error: null };
+    expect(body.data.items).toHaveLength(4);
+    expect(body.data.items.every((item) => item.status === "ok")).toBe(true);
+
+    // Two warm-ups: one per stdId group
+    expect(transcriptSpy).toHaveBeenCalledTimes(2);
+    expect(detailSpy).toHaveBeenCalledTimes(4);
+    expect(probeBudget.releasedCrossDetailLeases).toHaveLength(4);
+  });
+
+  it("propagates warm-up failure to all permits in the same group", async () => {
+    const token = await bearerToken("SYNTHETIC_WARM_FAIL_COOKIE");
+
+    // Group A: will succeed
+    const permitsA = await issuePermits(token, { count: 1, targetStdId: "99000000001", startClassId: 990300 });
+
+    // Group B: warm-up will fail
+    const permitsB = await issuePermits(token, { count: 2, targetStdId: "99000000002", startClassId: 990400 });
+    transcriptSpy.mockRestore();
+    transcriptSpy = vi.spyOn(DaotaoClient.prototype, "getTranscriptByStdIdHtml").mockImplementation(async (stdId: string) => {
+      if (stdId === "99000000002") throw new HyeboardError("VNU_SESSION_EXPIRED", "Synthetic session expiry", 401);
+      return "<table><tr><td>Sinh viên: SYNTHETIC</td><td>Mã số: 20000001</td></tr></table>";
+    });
+
+    const permits = [...permitsA, ...permitsB];
+    const response = await requestRoute("/api/vnu/cross-lookup/detail/bulk", token, {
+      allowCrossLookup: true,
+      permits,
+    });
+
+    expect(response.status).toBe(200);
+    const body = await response.json() as { data: { items: Array<{ permit: string; status: string; errorCode?: string }> }; error: null };
+    expect(body.data.items).toHaveLength(3);
+
+    // Permit from group A succeeds
+    const itemA = body.data.items.find((item) => item.permit === permitsA[0]);
+    expect(itemA!.status).toBe("ok");
+
+    // Permits from group B (warm-up failed) get the error
+    for (const permitB of permitsB) {
+      const item = body.data.items.find((item) => item.permit === permitB);
+      expect(item!.status).toBe("error");
+      expect(item!.errorCode).toBe("VNU_SESSION_EXPIRED");
+    }
+
+    // Two warm-up calls: one succeeded, one threw
+    expect(transcriptSpy).toHaveBeenCalledTimes(2);
+    // Only group A's permit reached detail fetch
+    expect(detailSpy).toHaveBeenCalledTimes(1);
+    // Only group A's lease was released
+    expect(probeBudget.releasedCrossDetailLeases).toHaveLength(1);
+  });
+
+  it("preserves original permit order in the response", async () => {
+    const token = await bearerToken("SYNTHETIC_ORDER_COOKIE");
+    const permits = await issuePermits(token, { count: 3 });
+
+    const response = await requestRoute("/api/vnu/cross-lookup/detail/bulk", token, {
+      allowCrossLookup: true,
+      permits,
+    });
+
+    expect(response.status).toBe(200);
+    const body = await response.json() as { data: { items: Array<{ permit: string }> }; error: null };
+    expect(body.data.items.map((item) => item.permit)).toEqual(permits);
+  });
+
+  it("handles invalid permits alongside valid ones in the same batch", async () => {
+    const token = await bearerToken("SYNTHETIC_MIXED_COOKIE");
+    const valid = await issuePermits(token, { count: 2 });
+    const invalid = "ffffffffffffffffffffffffffffffff.XYZ.invalid";
+
+    const response = await requestRoute("/api/vnu/cross-lookup/detail/bulk", token, {
+      allowCrossLookup: true,
+      permits: [valid[0], invalid, valid[1]],
+    });
+
+    expect(response.status).toBe(200);
+    const body = await response.json() as { data: { items: Array<{ permit: string; status: string; errorCode?: string }> }; error: null };
+    expect(body.data.items).toHaveLength(3);
+    expect(body.data.items.map((item) => item.permit)).toEqual([valid[0], invalid, valid[1]]);
+
+    const invalidItem = body.data.items.find((item) => item.permit === invalid);
+    expect(invalidItem!.status).toBe("error");
+    expect(invalidItem!.errorCode).toBe("VNU_CROSS_DETAIL_PERMIT_INVALID");
+
+    const validItems = body.data.items.filter((item) => item !== invalidItem);
+    expect(validItems.every((item) => item.status === "ok")).toBe(true);
+    expect(probeBudget.releasedCrossDetailLeases).toHaveLength(2);
+  });
+
+  it("processes both bulk and export routes through the batch grouper", async () => {
+    const token = await bearerToken("SYNTHETIC_EXPORT_COOKIE");
+    const permits = await issuePermits(token, { count: 2 });
+
+    const bulk = await requestRoute("/api/vnu/cross-lookup/detail/bulk", token, {
+      allowCrossLookup: true,
+      permits,
+    });
+    expect(bulk.status).toBe(200);
+    expect(((await bulk.json()) as { data: { items: unknown[] } }).data.items).toHaveLength(2);
+
+    // Export has its own permit set (single-use, bulk consumed the old ones)
+    const exportPermits = await issuePermits(token, { count: 2 });
+    const selectedExport = await requestRoute("/api/vnu/cross-lookup/detail/export", token, {
+      allowCrossLookup: true,
+      permits: exportPermits,
+    });
+    expect(selectedExport.status).toBe(200);
+    expect(((await selectedExport.json()) as { data: { items: unknown[] } }).data.items).toHaveLength(2);
+
+    // Two groups (one per request), one warm-up each
+    expect(transcriptSpy).toHaveBeenCalledTimes(2);
+    expect(detailSpy).toHaveBeenCalledTimes(4);
+    expect(probeBudget.releasedCrossDetailLeases).toHaveLength(4);
+  });
+});

@@ -8,7 +8,7 @@ import { probeBudgetUnavailable, VNU_BRC1_PERMIT_LIMIT, type VnuProbeBudgetCoord
 import { vnuRefreshUnavailable, type BeginRefreshResult, type LinkedPair, type VnuRefreshControlCoordinator } from "./vnu-refresh-control";
 import { resolveVnuStudentId, VNU_STUDENT_ID_RESOLVER_MAX_PROBES } from "./vnu-student-id-resolver";
 import { normalizeSelfHostedInteger, parseVnuRuntimeConfig, type EffectiveVnuRuntimeConfig } from "./vnu-runtime-config";
-import { buildVnuCrossDetailConsumeInput, createVnuCrossDetailMinter, crossDetailUnavailable, parseVnuCrossDetailPermitString, projectCrossDetailComponents, readVnuCrossDetailBody } from "./vnu-cross-detail";
+import { buildVnuCrossDetailConsumeInput, createVnuCrossDetailMinter, crossDetailUnavailable, parseVnuCrossDetailPermitString, projectCrossDetailComponents, readVnuCrossDetailBody, type VnuCrossDetailComponent } from "./vnu-cross-detail";
 
 // ─── Runtime config ───────────────────────────────────────────
 // Self-hosted (Node/Bun) loads config from config.json + env var overrides
@@ -948,15 +948,23 @@ async function consumeVnuCrossDetailPermit(session: EncryptedSessionPayload, req
   return { consumed, envelope };
 }
 
-async function fetchVnuCrossDetail(session: EncryptedSessionPayload, requesterToken: string, permit: string, signal: AbortSignal) {
+async function fetchVnuCrossDetail(
+  session: EncryptedSessionPayload,
+  requesterToken: string,
+  permit: string,
+  signal: AbortSignal,
+  warmClient?: DaotaoClient,
+) {
   const { consumed, envelope } = await consumeVnuCrossDetailPermit(session, requesterToken, permit);
   try {
-    const client = new DaotaoClient(session);
-    // Warm up cross-student session cookies by fetching the target student's
-    // transcript page on the same client. Daotao sets additional cookies on
-    // the transcript page that authorize subsequent detailPoint.asp access.
-    // A new DaotaoClient would miss these cookies, so we pre-warm here.
-    await client.getTranscriptByStdIdHtml(envelope.selector.stdId, signal);
+    const client = warmClient ?? new DaotaoClient(session);
+    if (!warmClient) {
+      // Warm up cross-student session cookies by fetching the target student's
+      // transcript page on the same client. Daotao sets additional cookies on
+      // the transcript page that authorize subsequent detailPoint.asp access.
+      // A new DaotaoClient would miss these cookies, so we pre-warm here.
+      await client.getTranscriptByStdIdHtml(envelope.selector.stdId, signal);
+    }
     const detailHtml = await client.getPointDetailHtml({
       id: envelope.selector.classId,
       stdId: envelope.selector.stdId,
@@ -967,6 +975,83 @@ async function fetchVnuCrossDetail(session: EncryptedSessionPayload, requesterTo
   } finally {
     await vnuProbeBudgetCoordinator.releaseCrossDetailLease(await vnuProbeBudgetKey(session), consumed.leaseId).catch(() => undefined);
   }
+}
+
+// ─── Cross-detail batch grouping ───────────────────────────────
+// When multiple permits target the same stdId, they share one DaotaoClient
+// warmed once, avoiding concurrent getTranscriptByStdIdHtml calls that race
+// the ASP server's per-request ASPSESSIONID rotation (causing VNU_SESSION_EXPIRED).
+// Permits belonging to different stdIds still run in parallel via Promise.all.
+
+type VnuCrossDetailBatchItem =
+  | { permit: string; status: "ok"; components: VnuCrossDetailComponent[] }
+  | { permit: string; status: "error"; errorCode: string };
+
+async function peekCrossDetailPermitStdId(permit: string): Promise<string> {
+  const parsed = parseVnuCrossDetailPermitString(permit);
+  const envelope = await decryptVnuCrossDetailPermitEnvelope(parsed.envelope, getSessionSecret());
+  return envelope.selector.stdId;
+}
+
+async function fetchVnuCrossDetailBatch(
+  session: EncryptedSessionPayload,
+  requesterToken: string,
+  permits: string[],
+  signal: AbortSignal,
+): Promise<VnuCrossDetailBatchItem[]> {
+  // Group permits by stdId (peeked without consuming the DO permit)
+  const groups = new Map<string, string[]>();
+  for (const permit of permits) {
+    let stdId: string;
+    try {
+      stdId = await peekCrossDetailPermitStdId(permit);
+    } catch {
+      // Invalid permit — will fail at consumption; isolate from valid groups
+      stdId = `__invalid__${permit.slice(0, 8)}`;
+    }
+    const existing = groups.get(stdId);
+    if (existing) existing.push(permit);
+    else groups.set(stdId, [permit]);
+  }
+
+  // Each group: shared warm-up, sequential permit consumption
+  const groupResults = await Promise.all([...groups.entries()].map(async ([stdId, groupPermits]) => {
+    if (stdId.startsWith("__invalid__")) {
+      return Promise.all(groupPermits.map(async (permit) => {
+        try {
+          return { permit, status: "ok" as const, components: await fetchVnuCrossDetail(session, requesterToken, permit, signal) };
+        } catch (error) {
+          return { permit, status: "error" as const, errorCode: error instanceof HyeboardError ? error.code : "VNU_REQUEST_FAILED" };
+        }
+      }));
+    }
+
+    const client = new DaotaoClient(session);
+    let warmErrorCode: string | undefined;
+    try {
+      await client.getTranscriptByStdIdHtml(stdId, signal);
+    } catch (error) {
+      warmErrorCode = error instanceof HyeboardError ? error.code : "VNU_REQUEST_FAILED";
+    }
+
+    const results: VnuCrossDetailBatchItem[] = [];
+    for (const permit of groupPermits) {
+      if (warmErrorCode !== undefined) {
+        results.push({ permit, status: "error", errorCode: warmErrorCode });
+        continue;
+      }
+      try {
+        results.push({ permit, status: "ok", components: await fetchVnuCrossDetail(session, requesterToken, permit, signal, client) });
+      } catch (error) {
+        results.push({ permit, status: "error", errorCode: error instanceof HyeboardError ? error.code : "VNU_REQUEST_FAILED" });
+      }
+    }
+    return results;
+  }));
+
+  // Preserve original permit order
+  const itemMap = new Map(groupResults.flat().map((item) => [item.permit, item]));
+  return permits.map((permit) => itemMap.get(permit)!);
 }
 
 async function vnuImportCacheKey(username: string, password: string): Promise<string> {
@@ -1814,10 +1899,7 @@ export function createApp(adapter: any) {
       const requesterToken = parseBearerToken(new Headers(headers as Record<string, string>).get("Authorization"));
       if (!requesterToken) throw new HyeboardError("MISSING_SESSION", "Missing Authorization bearer token", 401);
       const { permits } = await readVnuCrossDetailBody(request, "bulk", crossDetailLimits().maxRows);
-      const items = await Promise.all(permits.map(async (permit) => {
-        try { return { permit, status: "ok" as const, components: await fetchVnuCrossDetail(session, requesterToken, permit, request.signal) }; }
-        catch (error) { return { permit, status: "error" as const, errorCode: error instanceof HyeboardError ? error.code : "VNU_REQUEST_FAILED" }; }
-      }));
+      const items = await fetchVnuCrossDetailBatch(session, requesterToken, permits, request.signal);
       return ok({ items });
     }, { parse: "none" })
     .post("/api/vnu/cross-lookup/detail/export", async ({ headers, request, set }) => {
@@ -1827,10 +1909,7 @@ export function createApp(adapter: any) {
       const requesterToken = parseBearerToken(new Headers(headers as Record<string, string>).get("Authorization"));
       if (!requesterToken) throw new HyeboardError("MISSING_SESSION", "Missing Authorization bearer token", 401);
       const { permits } = await readVnuCrossDetailBody(request, "export", crossDetailLimits().maxRows);
-      const items = await Promise.all(permits.map(async (permit) => {
-        try { return { permit, status: "ok" as const, components: await fetchVnuCrossDetail(session, requesterToken, permit, request.signal) }; }
-        catch (error) { return { permit, status: "error" as const, errorCode: error instanceof HyeboardError ? error.code : "VNU_REQUEST_FAILED" }; }
-      }));
+      const items = await fetchVnuCrossDetailBatch(session, requesterToken, permits, request.signal);
       return ok({ items });
     }, { parse: "none" })
     .post("/api/vnu/cross-lookup/bulk", async ({ headers, request }) => {
