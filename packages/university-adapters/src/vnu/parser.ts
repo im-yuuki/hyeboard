@@ -36,8 +36,8 @@ const DAOTAO_NOTIFICATION_LOGIN_LABEL = "vào đây";
 const DAOTAO_NOTIFICATION_LOGIN_SUFFIX = "để đăng nhập lại";
 const HTML_ENTITY_RE = /&(?:nbsp|amp|lt|gt|quot|#[^;&\s]*);/gi;
 const VNU_COURSE_CODE_TERMINAL_SOURCE = "[A-Za-zĐđ]{2,6} ?\\d{3,4}[A-Za-zĐđ]*(?:-[A-Za-zĐđ]+)?";
-const VNU_COURSE_CODE_SOURCE = `(?:[A-Za-z0-9]+\\.)*${VNU_COURSE_CODE_TERMINAL_SOURCE}`;
-const VNU_COURSE_CODE_RE = new RegExp(`^${VNU_COURSE_CODE_SOURCE}$`);
+const VNU_COURSE_CODE_SOURCE = `(?:[A-Za-zĐđ0-9]+\\.)*${VNU_COURSE_CODE_TERMINAL_SOURCE}`;
+const VNU_COURSE_CODE_RE = new RegExp(`^${VNU_COURSE_CODE_SOURCE}[*#]*$`);
 const VNU_EXAM_COMPOSITE_RE = new RegExp(
   `^(\\d{3})-(${VNU_COURSE_CODE_SOURCE})(?:[ -]+(\\d+|[A-Za-zĐđ]+\\d+))?$`,
 );

@@ -65,6 +65,17 @@ describe("VNU course-code cells", () => {
     ["single namespace", "UET.COM1050", "UET.COM1050"],
     ["repeated namespaces", "VNU.UET.COM1050", "VNU.UET.COM1050"],
     ["numeric namespace segments", "ABC2.DEF3.COM1050", "ABC2.DEF3.COM1050"],
+    ["single star annotation", "AIT3005*", "AIT3005*"],
+    ["single hash annotation", "AIT2004#", "AIT2004#"],
+    ["triple star annotation", "AIT4002***", "AIT4002***"],
+    ["multiple star annotation", "AIT3009**", "AIT3009**"],
+    ["mixed star hash", "AIT3009*#", "AIT3009*#"],
+    ["dotted namespace with star", "UET.COM1050*", "UET.COM1050*"],
+    ["namespace with Đđ character", "ĐT.INT3103", "ĐT.INT3103"],
+    ["double-dotted namespace with hash", "VNU.UET.COM1050#", "VNU.UET.COM1050#"],
+    ["hyphen suffix with annotation", "INT3103-E*", "INT3103-E*"],
+    ["hyphen suffix with hash annotation", "INT3103-E#", "INT3103-E#"],
+    ["Đđ namespace with annotation", "đt3103*", "đt3103*"],
   ])("preserves normalized display for %s in grades, term groups, transcript, and syllabus", (_case, source, display) => {
     const gradesHtml = `<table><tr><td>HỌC KỲ. MÃ HỌC KỲ 252</td></tr>${gradeRow(source)}</table>`;
     const grades = parseGradesHtml(gradesHtml);
@@ -89,6 +100,14 @@ describe("VNU course-code cells", () => {
     ["multiple hyphen suffixes", "INE2102-E-F"],
     ["namespace without a terminal course code", "VNU.UET."],
     ["malformed namespace delimiter", "VNU..UET.COM1050"],
+    ["annotation mid-code", "AIT*3005"],
+    ["hash mid-code", "INT#1001"],
+    ["wrong annotation character", "AIT3005$"],
+    ["wrong annotation character at sign", "AIT3005@"],
+    ["annotation before hyphen suffix", "AIT3005*-E"],
+    ["annotation before hyphen suffix with hash", "INT3103#-E"],
+    ["hyphen suffix with annotation before", "INE2102*-E"],
+    ["annotation in namespace", "UET*.COM1050"],
   ])("skips malformed %s grade and syllabus rows", (_case, source) => {
     expect(parseGradesHtml(`<table>${gradeRow(source)}</table>`).rows).toEqual([]);
     expect(parseSyllabusHtml(`<table>${syllabusRow(source)}</table>`)).toEqual([]);
