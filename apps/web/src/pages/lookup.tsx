@@ -571,7 +571,7 @@ function CrossTranscriptTerm({ summary, permits }: {
   const label = formatTermLabel(summary.termKey, "vnu", t.terms);
   const headingId = `cross-transcript-term-${summary.termKey}`;
 
-  const rows: GradeTableRow[] = summary.courses.map((row, index) => {
+  const rows: GradeTableRow[] = useMemo(() => summary.courses.map((row, index) => {
     const permitKey = `${summary.termKey}:${row.courseCode}:${row.classId ?? index}`;
     const permit = permits.get(permitKey);
     const id = `${summary.termKey}:${index}`;
@@ -586,7 +586,7 @@ function CrossTranscriptTerm({ summary, permits }: {
         ? { kind: "available" as const, render: () => <CrossTranscriptDetail permit={permit} /> }
         : { kind: "unavailable" as const, render: () => <div className="px-4 py-3"><Empty text={t.grades.componentDetailUnavailable} /></div> },
     };
-  });
+  }), [summary.courses, summary.termKey, permits, t]);
 
   return (
     <AcademicTermSection
