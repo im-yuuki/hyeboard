@@ -42,6 +42,7 @@ export function requestPolicyFor(input: { method: string; pathname: string }): V
   const method = input.method.toUpperCase();
   const pathname = new URL(input.pathname, "https://hyeboard.invalid").pathname;
   if (method === "POST" && pathname === "/api/vnu/cross-lookup/bulk") return "refresh-no-replay";
+  if (method === "POST" && pathname.startsWith("/api/vnu/cross-lookup/detail")) return "refresh-no-replay";
   if (method !== "GET") return "never";
   if (pathname.startsWith("/api/vnu/auth/")) return "never";
   if (pathname.startsWith("/api/vnu/cross-lookup/")) return "refresh-no-replay";
