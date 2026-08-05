@@ -959,6 +959,10 @@ async function fetchVnuCrossDetail(
   try {
     const client = warmClient ?? new DaotaoClient(session);
     if (!warmClient) {
+      // Validate session freshness before the heavy transcript fetch.
+      // Accumulates fresh cookies if daotao issues new ones, and fails fast
+      // with VNU_SESSION_EXPIRED if the session is truly dead.
+      await client.validateSession(signal);
       // Warm up cross-student session cookies by fetching the target student's
       // transcript page on the same client. Daotao sets additional cookies on
       // the transcript page that authorize subsequent detailPoint.asp access.
