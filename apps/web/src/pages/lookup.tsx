@@ -570,7 +570,32 @@ function CrossTranscriptTerm({ summary, permits, expandedPermit, details, onTogg
                 <td className="px-3 py-2 text-right"><Badge data-tone={row.letterGrade ? "neutral" : undefined} className="min-w-9 justify-center tabular-nums">{row.letterGrade ?? "-"}</Badge></td>
                 <td className="px-3 py-2 text-right tabular-nums">{row.grade4 ?? "-"}{permit ? <Button type="button" variant="ghost" size="sm" className="ml-1 min-h-8" aria-expanded={expandedPermit === permit} onClick={() => onToggle(permit)}>{t.lookup.crossDetailAction}</Button> : null}</td>
               </tr>
-              {permit && expandedPermit === permit ? <tr key={`${permit}-detail`}><td colSpan={5} className="px-3 py-3"><div className="space-y-1">{components ? components.length ? components.map((component) => <div key={component.index} className="flex justify-between gap-3 text-sm"><span>{component.index}. {component.nature}</span><span className="tabular-nums">{component.score ?? "-"}</span></div>) : <Empty text={t.lookup.pointDetailEmpty} /> : <Skeleton className="h-12" />}</div></td></tr> : null}
+              {permit && expandedPermit === permit ? (
+                <tr key={`${permit}-detail`}>
+                  <td colSpan={5} className="p-0">
+                    <div className="divide-y divide-border bg-muted/30 px-4">
+                      {components
+                        ? components.length
+                          ? components.map((component) => (
+                              <div key={component.index} className="list-row">
+                                <div className="min-w-0">
+                                  <p className="break-words text-sm font-medium">{component.nature || "-"}</p>
+                                  <p className="text-xs text-muted-foreground">
+                                    {[
+                                      component.weight != null ? t.lookup.pointDetailWeight(component.weight) : undefined,
+                                      component.attempt != null ? t.lookup.pointDetailAttempt(component.attempt) : undefined,
+                                    ].filter(Boolean).join(" · ") || "-"}
+                                  </p>
+                                </div>
+                                <Badge className="shrink-0 border border-border bg-background font-normal tabular-nums text-foreground">{component.score ?? "-"}</Badge>
+                              </div>
+                            ))
+                          : <div className="px-4 py-3"><Empty text={t.lookup.pointDetailEmpty} /></div>
+                        : <div className="px-4 py-3"><Skeleton className="h-12" /></div>}
+                    </div>
+                  </td>
+                </tr>
+              ) : null}
               </Fragment>;
             })}
           </tbody>
