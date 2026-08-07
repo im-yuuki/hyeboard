@@ -24,7 +24,7 @@
     "VNU_CROSS_DETAIL_BUDGET": "300",
     "VNU_CROSS_DETAIL_WINDOW_SECONDS": "600",
     "VNU_CROSS_DETAIL_EXPORT_MODE": "selected",
-    "VNU_CROSS_DETAIL_PERMIT_TTL_SECONDS": "60"
+    "VNU_CROSS_DETAIL_PERMIT_TTL_SECONDS": "1200"
   },
   "assets": {
     "directory": "../web/dist",

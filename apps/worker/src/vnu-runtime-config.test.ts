@@ -15,7 +15,7 @@ describe("parseVnuRuntimeConfig", () => {
       crossDetailConcurrency: 6,
       crossDetailBudget: 300,
       crossDetailWindowSeconds: 600,
-      crossDetailPermitTtlSeconds: 60,
+      crossDetailPermitTtlSeconds: 1200,
       crossDetailExportMode: "selected",
       crossDetailEnabled: true,
     });
@@ -117,11 +117,11 @@ describe("parseVnuRuntimeConfig cross-detail", () => {
     expect(config.crossDetailEnabled).toBe(false);
   });
 
-  it.each(["1", "60", "600"])("accepts cross-detail permit TTL %s seconds", (value) => {
+  it.each(["1", "60", "600", "1200"])("accepts cross-detail permit TTL %s seconds", (value) => {
     expect(parseVnuRuntimeConfig({ crossDetailPermitTtlSeconds: value }).crossDetailPermitTtlSeconds).toBe(Number(value));
   });
 
-  it.each(["0", "601"])("disables cross-detail for out-of-range permit TTL %s", (value) => {
+  it.each(["0", "1201"])("disables cross-detail for out-of-range permit TTL %s", (value) => {
     const config = parseVnuRuntimeConfig({ crossDetailPermitTtlSeconds: value });
     expect(config.crossDetailPermitTtlSeconds).toBe(0);
     expect(config.crossDetailEnabled).toBe(false);

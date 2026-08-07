@@ -42,7 +42,7 @@ const CROSS_DETAIL_DEFAULTS = {
   concurrency: 6,
   budget: 300,
   windowSeconds: 600,
-  permitTtlSeconds: 60,
+  permitTtlSeconds: 1200, // 20 min; operator can only lower from this unless parse max (line 92) is raised too
 } as const;
 
 function parseSafeInteger(value: string | undefined): number | undefined {
@@ -89,7 +89,7 @@ export function parseVnuRuntimeConfig(input: VnuRuntimeConfigInput, warn?: VnuCo
   const crossDetailConcurrency = parseCrossDetailRanged(input.crossDetailConcurrency, CROSS_DETAIL_DEFAULTS.concurrency, 1, 16);
   const crossDetailBudget = parseCrossDetailBound(input.crossDetailBudget, CROSS_DETAIL_DEFAULTS.budget);
   const crossDetailWindowSeconds = parseCrossDetailRanged(input.crossDetailWindowSeconds, CROSS_DETAIL_DEFAULTS.windowSeconds, 1, 86_400);
-  const crossDetailPermitTtlSeconds = parseCrossDetailRanged(input.crossDetailPermitTtlSeconds, CROSS_DETAIL_DEFAULTS.permitTtlSeconds, 1, 600);
+  const crossDetailPermitTtlSeconds = parseCrossDetailRanged(input.crossDetailPermitTtlSeconds, CROSS_DETAIL_DEFAULTS.permitTtlSeconds, 1, 1200);
   const crossDetailExportMode = input.crossDetailExportMode === undefined || input.crossDetailExportMode === "selected" ? "selected" as const : undefined;
   const crossDetailEnabled = crossDetailMaxTargets > 0
     && crossDetailMaxRows > 0
