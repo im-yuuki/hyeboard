@@ -639,7 +639,9 @@ describe("PDF export", () => {
     expect(definition).toContain(labels.point4);
     expect(definition).toContain("B+");
     expect(definition).toContain("3.5");
-    expect(definition).toContain(SYNTHETIC_INTERNAL_ID);
+    expect(definition).toContain(SYNTHETIC_STUDENT_CODE);
+    expect(definition).not.toContain(SYNTHETIC_INTERNAL_ID);
+    expect(definition).not.toContain(labels.internalStudentId);
   });
 
   it("maps lookup class numbers and Vietnamese identity labels into report metadata", () => {
@@ -681,7 +683,7 @@ describe("PDF export", () => {
         universityId: "vnu",
         mode: "stdid-to-transcript",
         total: 1,
-        items: [{ target: SYNTHETIC_INTERNAL_ID, status: "ok", result: { identity: { internalStudentId: SYNTHETIC_INTERNAL_ID, studentName: "Synthetic Student" }, derivedTerms: [term] } }],
+        items: [{ target: SYNTHETIC_INTERNAL_ID, status: "ok", result: { identity: { studentCode: SYNTHETIC_STUDENT_CODE, internalStudentId: SYNTHETIC_INTERNAL_ID, studentName: "Synthetic Student" }, derivedTerms: [term] } }],
       }),
       "en",
       labels,
@@ -692,12 +694,38 @@ describe("PDF export", () => {
       expect(definition).toContain(labels.title);
       expect(definition).toContain('"pageOrientation":"landscape"');
       expect(definition).toContain("Synthetic Student");
-      expect(definition).toContain(labels.internalStudentId);
-      expect(definition).toContain(SYNTHETIC_INTERNAL_ID);
+       expect(definition).not.toContain(labels.internalStudentId);
+       expect(definition).not.toContain(SYNTHETIC_INTERNAL_ID);
+       expect(definition).toContain(SYNTHETIC_STUDENT_CODE);
       expect(definition).toContain("Reliable, \\\"Systems\\\"");
       expect(definition).toContain(labels.letter);
       expect(definition).toContain(labels.point4);
     }
+  });
+
+  it("uses restrained print tokens, compact spacing, and preserves studentCode", () => {
+    const definition = createPdfExportDefinition(
+      createGradesExport({
+        surface: "grades-page",
+        universityId: "mock",
+        identity: { studentCode: SYNTHETIC_STUDENT_CODE, internalStudentId: SYNTHETIC_INTERNAL_ID },
+        derivedTerms: [term],
+      }),
+      "en",
+      labels,
+      new Date("2026-08-02T12:00:00Z"),
+    );
+    const serialized = JSON.stringify(definition);
+
+    expect(serialized).toContain("#1f4e79");
+    expect(serialized).toContain(SYNTHETIC_STUDENT_CODE);
+    expect(serialized).not.toContain(SYNTHETIC_INTERNAL_ID);
+    expect(serialized).not.toContain("lightHorizontalLines");
+    expect(definition).toMatchObject({ pageSize: "A4", pageMargins: [32, 32, 32, 30], defaultStyle: { fontSize: 8.5 } });
+    expect((definition.content as Array<{ layout?: unknown }>).some((item) => typeof item.layout === "object")).toBe(true);
+    const table = (definition.content as Array<{ table?: unknown }>).find((item) => item.table) as { layout: { hLineColor: () => string; paddingTop: () => number } };
+    expect(table.layout.hLineColor()).toBe("#cbd5df");
+    expect(table.layout.paddingTop()).toBe(4);
   });
 
   it("renders a real pdfmake Blob from the formal report definition", async () => {

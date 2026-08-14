@@ -280,6 +280,26 @@ export type PdfGenerator = { getBlob(callback: (blob: Blob) => void): void };
 export type PdfLibrary = { createPdf(definition: PdfDocumentDefinition): PdfGenerator };
 export type PdfLibraryLoader = () => Promise<PdfLibrary>;
 
+const PDF_COLORS = {
+  accent: "#1f4e79",
+  accentFill: "#eaf1f7",
+  border: "#cbd5df",
+  muted: "#64748b",
+  stripe: "#f7f9fb",
+} as const;
+
+const PDF_TABLE_LAYOUT = {
+  hLineColor: () => PDF_COLORS.border,
+  vLineColor: () => PDF_COLORS.border,
+  hLineWidth: () => 0.5,
+  vLineWidth: () => 0.5,
+  paddingLeft: () => 5,
+  paddingRight: () => 5,
+  paddingTop: () => 4,
+  paddingBottom: () => 4,
+  fillColor: (rowIndex: number) => rowIndex === 0 ? PDF_COLORS.accentFill : rowIndex % 2 === 0 ? PDF_COLORS.stripe : undefined,
+};
+
 type PdfMakeModule = PdfLibrary & { vfs?: unknown };
 type PdfVfsModule = { pdfMake?: { vfs?: unknown }; default?: unknown };
 
@@ -303,8 +323,8 @@ function pdfValue(value: string | number | undefined): string {
 function pdfMetadataTable(value: Record<string, string | number | undefined>): PdfDocumentDefinition | undefined {
   const body = Object.entries(value)
     .filter(([, field]) => field !== undefined)
-    .map(([label, field]) => [{ text: label, bold: true }, pdfValue(field)]);
-  return body.length ? { table: { widths: [140, "*"], body }, layout: "lightHorizontalLines", margin: [0, 4, 0, 12] } : undefined;
+    .map(([label, field]) => [{ text: label, bold: true, color: PDF_COLORS.accent }, pdfValue(field)]);
+  return body.length ? { table: { widths: [118, "*"], body }, layout: PDF_TABLE_LAYOUT, fontSize: 8.5, margin: [0, 3, 0, 9] } : undefined;
 }
 
 function pdfCourseTable(terms: readonly ExportDerivedTerm[], labels: PdfExportLabels): PdfDocumentDefinition | undefined {
@@ -322,19 +342,27 @@ function pdfCourseTable(terms: readonly ExportDerivedTerm[], labels: PdfExportLa
     table: {
       headerRows: 1,
       widths: ["auto", "auto", "*", "auto", "auto", "auto", "auto"],
-      body: [[labels.terms, labels.course, labels.name, labels.credits, labels.score, labels.letter, labels.point4], ...rows],
+      body: [[
+        { text: labels.terms, bold: true, color: PDF_COLORS.accent },
+        { text: labels.course, bold: true, color: PDF_COLORS.accent },
+        { text: labels.name, bold: true, color: PDF_COLORS.accent },
+        { text: labels.credits, bold: true, color: PDF_COLORS.accent },
+        { text: labels.score, bold: true, color: PDF_COLORS.accent },
+        { text: labels.letter, bold: true, color: PDF_COLORS.accent },
+        { text: labels.point4, bold: true, color: PDF_COLORS.accent },
+      ], ...rows],
     },
-    layout: "lightHorizontalLines",
-    fontSize: 8,
-    margin: [0, 4, 0, 14],
+    layout: PDF_TABLE_LAYOUT,
+    fontSize: 7.5,
+    margin: [0, 3, 0, 10],
   };
 }
 
 function pdfResultContent(result: ExportResult, labels: PdfExportLabels): PdfDocumentDefinition[] {
   const content: PdfDocumentDefinition[] = [];
-  const identity = result.identity && pdfMetadataTable({ [labels.name]: result.identity.studentName, [labels.studentCode]: result.identity.studentCode, [labels.internalStudentId]: result.identity.internalStudentId, [labels.managingClass]: result.identity.managingClass });
+  const identity = result.identity && pdfMetadataTable({ [labels.name]: result.identity.studentName, [labels.studentCode]: result.identity.studentCode, [labels.managingClass]: result.identity.managingClass });
   const classResult = result.classResult && pdfMetadataTable({ [labels.course]: result.classResult.courseName, [labels.classCode]: result.classResult.classCode, [labels.classNumber]: result.classResult.classNumber, [labels.classId]: result.classResult.classId });
-  const resolver = result.resolver && pdfMetadataTable({ [labels.studentCode]: result.resolver.resolvedStudentCode, [labels.internalStudentId]: result.resolver.resolvedInternalStudentId, [labels.probes]: result.resolver.probes });
+  const resolver = result.resolver && pdfMetadataTable({ [labels.studentCode]: result.resolver.resolvedStudentCode, [labels.probes]: result.resolver.probes });
   const reported = result.reported && pdfMetadataTable({ [labels.gpa]: result.reported.cumulativeGpa4, [labels.credits]: result.reported.totalCredits, [labels.accumulatedCredits]: result.reported.accumulatedCredits });
   for (const section of [identity, classResult, resolver, reported]) if (section) content.push(section);
   const courses = result.derivedTerms && pdfCourseTable(result.derivedTerms, labels);
@@ -373,9 +401,8 @@ export function createPdfExportDefinition(model: ExportDocument, locale: string,
     [labels.surface]: document.surface,
     [labels.university]: document.universityId,
     [labels.mode]: document.query?.mode,
-    [labels.value]: document.query?.value,
+    [labels.value]: document.query?.mode === "stdId" ? undefined : document.query?.value,
     [labels.studentCode]: document.identity?.studentCode,
-    [labels.internalStudentId]: document.identity?.internalStudentId,
     [labels.name]: document.identity?.studentName,
     [labels.managingClass]: document.identity?.managingClass,
   });
@@ -401,7 +428,7 @@ export function createPdfExportDefinition(model: ExportDocument, locale: string,
     content.push({ text: labels.results, style: "section" });
     for (const item of document.results) {
       if ("status" in item) {
-        content.push({ text: item.target, style: "subsection" });
+        if (document.surface === "bulk-code-to-id") content.push({ text: item.target, style: "subsection" });
         if (item.status === "error") {
           const error = pdfMetadataTable({ [labels.error]: item.errorCode });
           if (error) content.push(error);
@@ -412,11 +439,17 @@ export function createPdfExportDefinition(model: ExportDocument, locale: string,
   return {
     pageSize: "A4",
     pageOrientation: resolvePdfPageOrientation(document),
-    pageMargins: [36, 42, 36, 42],
-    defaultStyle: { font: "Roboto", fontSize: 9 },
-    styles: { heading: { fontSize: 14, bold: true }, title: { fontSize: 20, bold: true, margin: [0, 4, 0, 2] }, timestamp: { fontSize: 8, color: "#555555", margin: [0, 0, 0, 14] }, section: { fontSize: 13, bold: true, margin: [0, 8, 0, 4] }, subsection: { fontSize: 10, bold: true, margin: [0, 6, 0, 2] } },
+    pageMargins: [32, 32, 32, 30],
+    defaultStyle: { font: "Roboto", fontSize: 8.5, color: "#1f2933" },
+    styles: {
+      heading: { fontSize: 12, bold: true, color: PDF_COLORS.accent, margin: [0, 0, 0, 2] },
+      title: { fontSize: 17, bold: true, color: "#1f2933", margin: [0, 2, 0, 1] },
+      timestamp: { fontSize: 7.5, color: PDF_COLORS.muted, margin: [0, 0, 0, 9] },
+      section: { fontSize: 11, bold: true, color: PDF_COLORS.accent, margin: [0, 6, 0, 3] },
+      subsection: { fontSize: 9, bold: true, color: PDF_COLORS.accent, margin: [0, 4, 0, 1] },
+    },
     content,
-    footer: (currentPage: number, pageCount: number) => ({ text: `${labels.page} ${currentPage} / ${pageCount}`, alignment: "center", fontSize: 8, margin: [0, 8, 0, 0] }),
+    footer: (currentPage: number, pageCount: number) => ({ text: `${labels.page} ${currentPage} / ${pageCount}`, alignment: "center", fontSize: 7.5, color: PDF_COLORS.muted, margin: [0, 6, 0, 0] }),
   };
 }
 
