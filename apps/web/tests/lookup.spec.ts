@@ -832,7 +832,7 @@ test("cross-detail sends only an opaque permit and never persists detail state",
   const submittedBodies: unknown[] = [];
   await page.route("**/api/vnu/cross-lookup/detail", async (route) => {
     submittedBodies.push(route.request().postDataJSON());
-    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { components: [{ index: 1, nature: "Synthetic component", score: 9 }] }, error: null }) });
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { permit: "synthetic-detail-permit", html: `<p>Điểm chi tiết môn học - Học kỳ 2. Mã học kỳ 252</p><table><tr><td>STT</td><td>Bản chất kỳ thi</td><td>TS</td><td>Lần thi</td><td>Điểm</td><td>Ghi chú</td></tr><tr><td>1</td><td>Synthetic component</td><td>0.5</td><td>1</td><td>9</td><td></td></tr></table>` } , error: null }) });
   });
 
   await page.getByRole("button", { name: "Transcript", exact: true }).click();
@@ -864,7 +864,7 @@ test("cross-detail UI stays unavailable without its published capability", async
 test("cross-detail local state clears on account changes and route unmount", async ({ page }) => {
   await openMockedLookup(page, 50, 5, undefined, 2, true);
   await page.route("**/api/vnu/cross-lookup/detail", async (route) => {
-    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { components: [{ index: 1, nature: "Synthetic transient detail", score: 9 }] }, error: null }) });
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { permit: "synthetic-detail-permit", html: `<p>Điểm chi tiết môn học - Học kỳ 2. Mã học kỳ 252</p><table><tr><td>STT</td><td>Bản chất kỳ thi</td><td>TS</td><td>Lần thi</td><td>Điểm</td><td>Ghi chú</td></tr><tr><td>1</td><td>Synthetic transient detail</td><td>0.5</td><td>1</td><td>9</td><td></td></tr></table>` } , error: null }) });
   });
   await page.getByRole("button", { name: "Transcript", exact: true }).click();
   const section = page.getByTestId("cross-transcript");
@@ -885,7 +885,7 @@ test("cross-detail local state clears on account changes and route unmount", asy
 test("cross-transcript grade-detail supports expanding multiple rows simultaneously", async ({ page }) => {
   await openMockedLookup(page, 50, 5, undefined, 2, true);
   await page.route("**/api/vnu/cross-lookup/detail", async (route) => {
-    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { components: [{ index: 1, nature: "Multi-open detail", score: 8 }] }, error: null }) });
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { permit: "synthetic-detail-permit", html: `<p>Điểm chi tiết môn học - Học kỳ 2. Mã học kỳ 252</p><table><tr><td>STT</td><td>Bản chất kỳ thi</td><td>TS</td><td>Lần thi</td><td>Điểm</td><td>Ghi chú</td></tr><tr><td>1</td><td>Multi-open detail</td><td>0.5</td><td>1</td><td>8</td><td></td></tr></table>` } , error: null }) });
   });
   await page.getByRole("button", { name: "Transcript", exact: true }).click();
   const section = page.getByTestId("cross-transcript");

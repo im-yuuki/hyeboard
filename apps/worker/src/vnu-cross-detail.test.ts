@@ -4,7 +4,6 @@ import {
   buildVnuCrossDetailConsumeInput,
   createVnuCrossDetailMinter,
   parseVnuCrossDetailPermitString,
-  projectCrossDetailComponents,
   readVnuCrossDetailBody,
 } from "./vnu-cross-detail";
 
@@ -104,6 +103,13 @@ describe("cross-detail minter", () => {
     expect(minter.issued[0].record.expiresAt).toBeGreaterThanOrEqual(before + 45_000);
     expect(minter.issued[0].record.expiresAt).toBeLessThanOrEqual(Date.now() + 45_000);
   });
+
+  it("serializes concurrent mints within row and target caps", async () => {
+    const minter = createVnuCrossDetailMinter({ secret: SECRET, requesterToken: "token-a", maxTargets: 1, maxRows: 2, permitTtlSeconds: 60 });
+    const permits = await Promise.all(Array.from({ length: 8 }, (_, index) => minter.mint({ targetStdId: TARGET, transcriptHtml: TRANSCRIPT_HTML, row: { ...ROW, courseCode: `SYN${index}` } })));
+    expect(permits.filter(Boolean)).toHaveLength(2);
+    expect(minter.issued).toHaveLength(2);
+  });
 });
 
 describe("parseVnuCrossDetailPermitString", () => {
@@ -179,29 +185,5 @@ describe("readVnuCrossDetailBody", () => {
     await expect(readVnuCrossDetailBody(new Request("http://localhost/x", { method: "POST", body: "{" }), "single", 10)).rejects.toMatchObject({ code: "VNU_CROSS_DETAIL_BODY_INVALID", status: 400 });
     const huge = JSON.stringify({ allowCrossLookup: true, permit: `${"a".repeat(32)}.AAAAAAAAAAAAAAAA.${"A".repeat(300_000)}` });
     await expect(readVnuCrossDetailBody(new Request("http://localhost/x", { method: "POST", body: huge }), "single", 10)).rejects.toMatchObject({ status: 413 });
-  });
-});
-
-describe("projectCrossDetailComponents", () => {
-  it("projects only the strict component allowlist", () => {
-    const projected = projectCrossDetailComponents({
-      headerLabel: "Điểm chi tiết môn học — SYNTHETIC HEADER",
-      termCode: "251",
-      displayTotalEcho: "8.8",
-      components: [
-        { index: 1, nature: "Giữa kỳ", weight: 0.4, attempt: 1, score: 8.5, notes: "SYNTHETIC NOTE" },
-        { index: 2, nature: "Thi cuối kỳ", weight: 0.6, score: 9 },
-      ],
-    });
-
-    expect(projected).toEqual([
-      { index: 1, nature: "Giữa kỳ", weight: 0.4, attempt: 1, score: 8.5 },
-      { index: 2, nature: "Thi cuối kỳ", weight: 0.6, attempt: undefined, score: 9 },
-    ]);
-    const serialized = JSON.stringify(projected);
-    expect(serialized).not.toContain("SYNTHETIC NOTE");
-    expect(serialized).not.toContain("SYNTHETIC HEADER");
-    expect(serialized).not.toContain("251");
-    expect(serialized).not.toContain("8.8");
   });
 });

@@ -1,14 +1,14 @@
 import { cors } from "@elysiajs/cors";
 import { createVnuRefreshAccessDescriptor, createVnuRefreshGrant, decryptSession, decryptSessionForVnuLogout, decryptSessionForVnuRefresh, decryptVnuCrossDetailPermitEnvelope, decryptVnuRefreshGrant, decryptVnuRefreshGrantForLogout, deriveVnuRefreshPrincipal, encryptSession, encryptVnuRefreshGrant, fail, getLogger, HyeboardError, isExpired, ok, parseBearerToken, rotateVnuRefreshGrant, VNU_REFRESH_GRANT_MAX_LENGTH, type EncryptedSessionPayload, type VnuRefreshAccessDescriptor, type VnuRefreshGrantPayload } from "@hyeboard/core";
 import { apiErrorDetailsSchema, type AuthResult } from "@hyeboard/schemas";
-import { DaotaoClient, findPointDetailSelector, getAdapter, isDaotaoSessionExpired, listUniversities, parsePointDetailHtml, parseProfileHtml, parseTranscriptHeader, parseTranscriptHtml, type BrowserBinding, type BrowserConnection, type VnuTranscript } from "@hyeboard/university-adapters";
+import { DaotaoClient, findPointDetailSelector, getAdapter, isDaotaoSessionExpired, listUniversities, parseProfileHtml, parseTranscriptHeader, parseTranscriptHtml, type BrowserBinding, type BrowserConnection, type VnuTranscript } from "@hyeboard/university-adapters";
 import { Elysia, t } from "elysia";
 import { LocalCaptchaRelayCoordinator, captchaRelayCancelled, captchaRelayNotFound, type CaptchaRelayCoordinator, type PreparedCaptchaRelay } from "./captcha-relay";
 import { probeBudgetUnavailable, VNU_BRC1_PERMIT_LIMIT, type VnuProbeBudgetCoordinator } from "./vnu-probe-budget";
 import { vnuRefreshUnavailable, type BeginRefreshResult, type LinkedPair, type VnuRefreshControlCoordinator } from "./vnu-refresh-control";
 import { resolveVnuStudentId, VNU_STUDENT_ID_RESOLVER_MAX_PROBES } from "./vnu-student-id-resolver";
 import { normalizeSelfHostedInteger, parseVnuRuntimeConfig, type EffectiveVnuRuntimeConfig } from "./vnu-runtime-config";
-import { buildVnuCrossDetailConsumeInput, createVnuCrossDetailMinter, crossDetailUnavailable, parseVnuCrossDetailPermitString, projectCrossDetailComponents, readVnuCrossDetailBody, type VnuCrossDetailComponent } from "./vnu-cross-detail";
+import { buildVnuCrossDetailConsumeInput, createVnuCrossDetailMinter, crossDetailUnavailable, parseVnuCrossDetailPermitString, readVnuCrossDetailBody } from "./vnu-cross-detail";
 
 // ─── Runtime config ───────────────────────────────────────────
 // Self-hosted (Node/Bun) loads config from config.json + env var overrides
@@ -970,7 +970,7 @@ async function fetchVnuCrossDetail(
         await client.getTranscriptByStdIdHtml(envelope.selector.stdId, signal);
       }
       const detailHtml = await client.getPointDetailHtml(selector, signal);
-      return projectCrossDetailComponents(parsePointDetailHtml(detailHtml));
+       return detailHtml;
     } catch (error) {
       if (!(error instanceof HyeboardError && error.code === "VNU_SESSION_EXPIRED")) throw error;
 
@@ -980,7 +980,7 @@ async function fetchVnuCrossDetail(
       await retryClient.validateSession(signal);
       await retryClient.getTranscriptByStdIdHtml(envelope.selector.stdId, signal);
       const detailHtml = await retryClient.getPointDetailHtml(selector, signal);
-      return projectCrossDetailComponents(parsePointDetailHtml(detailHtml));
+       return detailHtml;
     }
   } finally {
     await vnuProbeBudgetCoordinator.releaseCrossDetailLease(await vnuProbeBudgetKey(session), consumed.leaseId).catch(() => undefined);
@@ -994,7 +994,7 @@ async function fetchVnuCrossDetail(
 // Permits belonging to different stdIds still run in parallel via Promise.all.
 
 type VnuCrossDetailBatchItem =
-  | { permit: string; status: "ok"; components: VnuCrossDetailComponent[] }
+  | { permit: string; status: "ok"; html: string }
   | { permit: string; status: "error"; errorCode: string };
 
 async function peekCrossDetailPermitStdId(permit: string): Promise<string> {
@@ -1025,23 +1025,32 @@ async function fetchVnuCrossDetailBatch(
   }
 
   // Each group: shared warm-up, sequential permit consumption
-  const groupResults = await Promise.all([...groups.entries()].map(async ([stdId, groupPermits]) => {
+  const groupEntries = [...groups.entries()];
+  const groupResults: VnuCrossDetailBatchItem[][] = [];
+  let nextGroupIndex = 0;
+  const processGroup = async (): Promise<void> => {
+    while (true) {
+      const groupIndex = nextGroupIndex++;
+      if (groupIndex >= groupEntries.length) return;
+      const [stdId, groupPermits] = groupEntries[groupIndex];
     if (stdId.startsWith("__invalid__")) {
-      return Promise.all(groupPermits.map(async (permit) => {
+      groupResults[groupIndex] = await Promise.all(groupPermits.map(async (permit) => {
         try {
-          return { permit, status: "ok" as const, components: await fetchVnuCrossDetail(session, requesterToken, permit, signal) };
+          return { permit, status: "ok" as const, html: await fetchVnuCrossDetail(session, requesterToken, permit, signal) };
         } catch (error) {
           return { permit, status: "error" as const, errorCode: error instanceof HyeboardError ? error.code : "VNU_REQUEST_FAILED" };
         }
       }));
+      continue;
     }
 
     const client = new DaotaoClient(session);
     let warmErrorCode: string | undefined;
     try {
-      await client.getTranscriptByStdIdHtml(stdId, signal);
+      await withVnuOraclePermit(session, signal, (permitSignal) => client.getTranscriptByStdIdHtml(stdId, permitSignal));
     } catch (error) {
-      warmErrorCode = error instanceof HyeboardError ? error.code : "VNU_REQUEST_FAILED";
+      if (!(error instanceof HyeboardError) || !isCrossDetailItemError(error)) throw error;
+      warmErrorCode = error.code;
     }
 
     const results: VnuCrossDetailBatchItem[] = [];
@@ -1051,17 +1060,28 @@ async function fetchVnuCrossDetailBatch(
         continue;
       }
       try {
-        results.push({ permit, status: "ok", components: await fetchVnuCrossDetail(session, requesterToken, permit, signal, client) });
+        results.push({ permit, status: "ok", html: await fetchVnuCrossDetail(session, requesterToken, permit, signal, client) });
       } catch (error) {
-        results.push({ permit, status: "error", errorCode: error instanceof HyeboardError ? error.code : "VNU_REQUEST_FAILED" });
+        if (!(error instanceof HyeboardError) || !isCrossDetailItemError(error)) throw error;
+        results.push({ permit, status: "error", errorCode: error.code });
       }
     }
-    return results;
-  }));
+      groupResults[groupIndex] = results;
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(effectiveVnuRuntimeConfig.crossDetailConcurrency, groupEntries.length) }, () => processGroup()));
 
   // Preserve original permit order
   const itemMap = new Map(groupResults.flat().map((item) => [item.permit, item]));
   return permits.map((permit) => itemMap.get(permit)!);
+}
+
+function isCrossDetailItemError(error: HyeboardError): boolean {
+  return error.code === "VNU_CROSS_LOOKUP_NOT_FOUND"
+    || error.code === "VNU_CROSS_LOOKUP_NOT_CONVERGED"
+    || error.code === "VNU_CROSS_DETAIL_PERMIT_INVALID"
+    || error.code === "VNU_UPSTREAM_RESPONSE_INVALID"
+    || error.code === "VNU_REQUEST_FAILED";
 }
 
 async function vnuImportCacheKey(username: string, password: string): Promise<string> {
@@ -1900,7 +1920,7 @@ export function createApp(adapter: any) {
       const requesterToken = parseBearerToken(new Headers(headers as Record<string, string>).get("Authorization"));
       if (!requesterToken) throw new HyeboardError("MISSING_SESSION", "Missing Authorization bearer token", 401);
       const { permit } = await readVnuCrossDetailBody(request, "single", crossDetailLimits().maxRows);
-      return ok({ components: await fetchVnuCrossDetail(session, requesterToken, permit, request.signal) });
+       return ok({ permit, html: await fetchVnuCrossDetail(session, requesterToken, permit, request.signal) });
     }, { parse: "none" })
     .post("/api/vnu/cross-lookup/detail/bulk", async ({ headers, request, set }) => {
       set.headers["Cache-Control"] = "no-store, private";

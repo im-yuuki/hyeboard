@@ -1,7 +1,7 @@
 import { apiErrorDetailsSchema, type ApiErrorDetails, type ApiResponse, type Assignment, type ClassSession, type Course, type DashboardSummary, type DocumentItem, type ExamSession, type Grade, type NewsItem, type ServiceRequest, type Term, type TrainingPoint, type TuitionStatus, type University } from "@hyeboard/schemas";
 import type { VnuExamCatalogRow, VnuPointDetail, VnuProfile, VnuTranscript } from "@hyeboard/university-adapters/src/vnu/types";
 import { mapExamRow, mapGpaSummary, mapGradeRow, mapProfile, mapSyllabusRow, mapTerms, mapTrainingPoints } from "@hyeboard/university-adapters/src/vnu/mapper";
-import { parseExamCatalogHtml, parseExamTermOptions, parseExamsHtml, parseGradesHtml, parsePointDetailHtml, parseProfileHtml, parseStudyProgressHtml, parseSyllabusHtml } from "@hyeboard/university-adapters/src/vnu/parser";
+import { isPointDetailPageHtml, parseExamCatalogHtml, parseExamTermOptions, parseExamsHtml, parseGradesHtml, parsePointDetailHtml, parseProfileHtml, parseStudyProgressHtml, parseSyllabusHtml } from "@hyeboard/university-adapters/src/vnu/parser";
 import { createLinkedAbortController } from "./abort-deadline";
 import { canReauthenticateInline, requestInlineReauth } from "./reauth";
 import { readUetSessionStream } from "./uet-session-stream";
@@ -622,12 +622,54 @@ async function vnuCrossTranscript(input: VnuCrossTranscriptInput): Promise<VnuCr
   return sanitizeCrossTranscript(await request<VnuTranscript>(`/api/vnu/cross-lookup/transcript${queryString({ ...target, allowCrossLookup: "true" })}`));
 }
 
-async function vnuCrossDetail(permit: string, signal?: AbortSignal): Promise<VnuCrossDetailComponent[]> {
-  return (await request<{ components: VnuCrossDetailComponent[] }>("/api/vnu/cross-lookup/detail", { method: "POST", body: JSON.stringify({ allowCrossLookup: true, permit }), signal })).components;
+function parseCrossDetailHtml(html: unknown): VnuCrossDetailComponent[] {
+  if (typeof html !== "string" || !isPointDetailPageHtml(html)) throw new ApiError("The university returned an invalid point-detail page.", "VNU_CROSS_DETAIL_RESPONSE_INVALID", 502);
+  return parsePointDetailHtml(html).components.map(({ index, nature, weight, attempt, score }) => ({ index, nature, weight, attempt, score }));
+}
+
+type CrossDetailWorkerItem = { permit: string; status: "ok"; html: string } | { permit: string; status: "error"; errorCode: string };
+
+function parseCrossDetailBatchResponse(value: unknown, permits: string[]): CrossDetailWorkerItem[] {
+  if (typeof value !== "object" || value === null || !Array.isArray((value as { items?: unknown }).items)) throw new ApiError("The cross-detail response is invalid.", "VNU_CROSS_DETAIL_RESPONSE_INVALID", 502);
+  const items = (value as { items: unknown[] }).items;
+  if (items.length !== permits.length) throw new ApiError("The cross-detail response is incomplete.", "VNU_CROSS_DETAIL_RESPONSE_INVALID", 502);
+  return items.map((item, index) => {
+    if (typeof item !== "object" || item === null || (item as { permit?: unknown }).permit !== permits[index]) throw new ApiError("The cross-detail response does not match its permits.", "VNU_CROSS_DETAIL_RESPONSE_INVALID", 502);
+    const candidate = item as { permit: unknown; status?: unknown; html?: unknown; errorCode?: unknown };
+    if (candidate.status === "ok" && typeof candidate.html === "string") return { permit: candidate.permit as string, status: "ok", html: candidate.html };
+    if (candidate.status === "error" && typeof candidate.errorCode === "string") return { permit: candidate.permit as string, status: "error", errorCode: candidate.errorCode };
+    throw new ApiError("The cross-detail response item is invalid.", "VNU_CROSS_DETAIL_RESPONSE_INVALID", 502);
+  });
 }
 
 async function vnuCrossDetailBulk(permits: string[], signal?: AbortSignal): Promise<VnuCrossDetailItem[]> {
-  return (await request<{ items: VnuCrossDetailItem[] }>("/api/vnu/cross-lookup/detail/bulk", { method: "POST", body: JSON.stringify({ allowCrossLookup: true, permits }), signal })).items;
+  const items = parseCrossDetailBatchResponse(await request<unknown>("/api/vnu/cross-lookup/detail/bulk", { method: "POST", body: JSON.stringify({ allowCrossLookup: true, permits }), signal }), permits);
+  return items.map((item) => {
+    if (item.status === "error") return item;
+    try {
+      return { permit: item.permit, status: "ok" as const, components: parseCrossDetailHtml(item.html) };
+    } catch {
+      return { permit: item.permit, status: "error" as const, errorCode: "VNU_CROSS_DETAIL_RESPONSE_INVALID" };
+    }
+  });
+}
+
+async function vnuCrossDetail(permit: string, signal?: AbortSignal): Promise<VnuCrossDetailComponent[]> {
+  const response = await request<{ permit: string; html: string }>("/api/vnu/cross-lookup/detail", { method: "POST", body: JSON.stringify({ allowCrossLookup: true, permit }), signal });
+  if (response.permit !== permit) throw new ApiError("The cross-detail response does not match its permit.", "VNU_CROSS_DETAIL_RESPONSE_INVALID", 502);
+  return parseCrossDetailHtml(response.html);
+}
+
+async function vnuCrossDetailExport(permits: string[], signal?: AbortSignal): Promise<VnuCrossDetailItem[]> {
+  const items = parseCrossDetailBatchResponse(await request<unknown>("/api/vnu/cross-lookup/detail/export", { method: "POST", body: JSON.stringify({ allowCrossLookup: true, permits }), signal }), permits);
+  return items.map((item) => {
+    if (item.status === "error") return item;
+    try {
+      return { permit: item.permit, status: "ok" as const, components: parseCrossDetailHtml(item.html) };
+    } catch {
+      return { permit: item.permit, status: "error" as const, errorCode: "VNU_CROSS_DETAIL_RESPONSE_INVALID" };
+    }
+  });
 }
 
 export type VnuBulkLookupMode = "stdid-to-code" | "code-to-stdid" | "stdid-to-transcript";
@@ -683,6 +725,7 @@ export const api = {
   vnuCrossTranscript: (input: VnuCrossTranscriptInput) => vnuCrossTranscript(input),
   vnuCrossDetail: (permit: string, signal?: AbortSignal) => vnuCrossDetail(permit, signal),
   vnuCrossDetailBulk: (permits: string[], signal?: AbortSignal) => vnuCrossDetailBulk(permits, signal),
+  vnuCrossDetailExport: (permits: string[], signal?: AbortSignal) => vnuCrossDetailExport(permits, signal),
   vnuCrossLookupBulk: (mode: VnuBulkLookupMode, targets: string[], signal?: AbortSignal) => vnuCrossLookupBulk(mode, targets, signal),
   importSession: async (universityId: string, body: ImportSessionInput): Promise<ImportedAccountResult> => {
     const auth = await request<AuthResult>(`/api/${universityId}/auth/import-session`, { method: "POST", body: JSON.stringify(body) });

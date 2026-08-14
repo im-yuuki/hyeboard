@@ -1,5 +1,4 @@
 import { decryptVnuCrossDetailPermitEnvelope, encryptVnuCrossDetailPermitEnvelope, HyeboardError, type VnuCrossDetailPermitEnvelope } from "@hyeboard/core";
-import type { VnuPointDetail } from "@hyeboard/university-adapters";
 import { VNU_CROSS_DETAIL_POLICY_VERSION, type VnuCrossDetailConsumeInput, type VnuCrossDetailIssuedPermit } from "./vnu-probe-budget";
 
 // ─── VNU cross-student grade detail ────────────────────────────────────────
@@ -60,16 +59,6 @@ function crossDetailExportNotSelected(): HyeboardError {
   return new HyeboardError("VNU_CROSS_DETAIL_EXPORT_NOT_SELECTED", "Cross-detail export requires an explicit selected set of row permits.", 400);
 }
 
-export function projectCrossDetailComponents(detail: VnuPointDetail): VnuCrossDetailComponent[] {
-  return detail.components.map((component) => ({
-    index: component.index,
-    nature: component.nature,
-    weight: component.weight,
-    attempt: component.attempt,
-    score: component.score,
-  }));
-}
-
 export type VnuCrossDetailMinter = {
   readonly issued: VnuCrossDetailIssuedPermit[];
   mint(input: { targetStdId: string; transcriptHtml: string; row: VnuCrossDetailRow }): Promise<string | undefined>;
@@ -87,43 +76,48 @@ export function createVnuCrossDetailMinter(options: {
 }): VnuCrossDetailMinter {
   const issued: VnuCrossDetailIssuedPermit[] = [];
   const targets = new Set<string>();
+  let pending = Promise.resolve();
   return {
     issued,
-    async mint(input) {
-      if (issued.length >= options.maxRows) return undefined;
-      const isNewTarget = !targets.has(input.targetStdId);
-      if (isNewTarget && targets.size >= options.maxTargets) return undefined;
+    mint(input) {
+      const result = pending.then(async () => {
+        if (issued.length >= options.maxRows) return undefined;
+        const isNewTarget = !targets.has(input.targetStdId);
+        if (isNewTarget && targets.size >= options.maxTargets) return undefined;
 
-      const requesterHmac = await hmacVnuCrossDetail(options.secret, "requester", options.requesterToken);
-      const targetHmac = await hmacVnuCrossDetail(options.secret, "target", input.targetStdId);
-      const revisionHmac = await hmacVnuCrossDetail(options.secret, "revision", input.transcriptHtml);
-      const rowHmac = await hmacVnuCrossDetail(options.secret, "row", `${input.targetStdId}\n${input.row.termOrdinal}\n${input.row.classId}\n${input.row.courseCode}`);
-      const permitId = toHex(crypto.getRandomValues(new Uint8Array(16)));
-      const nonce = toHex(crypto.getRandomValues(new Uint8Array(16)));
-      const envelope = await encryptVnuCrossDetailPermitEnvelope({
-        version: 1,
-        purpose: "vnu-cross-detail",
-        nonce,
-        targetHmac,
-        revisionHmac,
-        rowHmac,
-        selector: { stdId: input.targetStdId, classId: input.row.classId, termOrdinal: input.row.termOrdinal },
-      }, options.secret);
-      issued.push({
-        permitHash: await hmacVnuCrossDetail(options.secret, "permit", permitId),
-        record: {
-          requesterHmac,
+        const requesterHmac = await hmacVnuCrossDetail(options.secret, "requester", options.requesterToken);
+        const targetHmac = await hmacVnuCrossDetail(options.secret, "target", input.targetStdId);
+        const revisionHmac = await hmacVnuCrossDetail(options.secret, "revision", input.transcriptHtml);
+        const rowHmac = await hmacVnuCrossDetail(options.secret, "row", `${input.targetStdId}\n${input.row.termOrdinal}\n${input.row.classId}\n${input.row.courseCode}`);
+        const permitId = toHex(crypto.getRandomValues(new Uint8Array(16)));
+        const nonce = toHex(crypto.getRandomValues(new Uint8Array(16)));
+        const envelope = await encryptVnuCrossDetailPermitEnvelope({
+          version: 1,
+          purpose: "vnu-cross-detail",
+          nonce,
           targetHmac,
           revisionHmac,
           rowHmac,
-          policyVersion: VNU_CROSS_DETAIL_POLICY_VERSION,
-          nonce,
-          envelope,
-          expiresAt: Date.now() + options.permitTtlSeconds * 1000,
-        },
+          selector: { stdId: input.targetStdId, classId: input.row.classId, termOrdinal: input.row.termOrdinal },
+        }, options.secret);
+        issued.push({
+          permitHash: await hmacVnuCrossDetail(options.secret, "permit", permitId),
+          record: {
+            requesterHmac,
+            targetHmac,
+            revisionHmac,
+            rowHmac,
+            policyVersion: VNU_CROSS_DETAIL_POLICY_VERSION,
+            nonce,
+            envelope,
+            expiresAt: Date.now() + options.permitTtlSeconds * 1000,
+          },
+        });
+        targets.add(input.targetStdId);
+        return `${permitId}.${envelope}`;
       });
-      targets.add(input.targetStdId);
-      return `${permitId}.${envelope}`;
+      pending = result.then(() => undefined, () => undefined);
+      return result;
     },
   };
 }

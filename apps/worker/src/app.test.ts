@@ -557,6 +557,7 @@ class TestVnuProbeBudget implements VnuProbeBudgetCoordinator {
     const record = this.crossDetailPermits.get(input.permitHash);
     const matches = record !== undefined
       && !this.consumedCrossDetailPermits.has(input.permitHash)
+      && record.expiresAt > Date.now()
       && record.nonce === input.nonce
       && record.requesterHmac === input.requesterHmac
       && record.targetHmac === input.targetHmac
@@ -4226,7 +4227,7 @@ describe("VNU cross-detail HTTP routes", () => {
     setVnuProbeBudgetCoordinator(probeBudget);
     profileSpy = vi.spyOn(DaotaoClient.prototype, "getProfileHtml").mockResolvedValue('<input name="hidStdID" value="1000"><input name="StdCode" value="20000000">');
     transcriptSpy = vi.spyOn(DaotaoClient.prototype, "getTranscriptByStdIdHtml").mockResolvedValue("<table><tr><td>Sinh viên: SYNTHETIC</td><td>Mã số: 20000001</td></tr></table>");
-    detailSpy = vi.spyOn(DaotaoClient.prototype, "getPointDetailHtml").mockResolvedValue("<table><tr><td>1</td><td>Synthetic component</td><td>0.5</td><td>1</td><td>9</td></tr></table>");
+    detailSpy = vi.spyOn(DaotaoClient.prototype, "getPointDetailHtml").mockResolvedValue("<p>Điểm chi tiết môn học - Học kỳ 2. Mã học kỳ 252</p><table><tr><td>STT</td><td>Bản chất kỳ thi</td><td>TS</td><td>Lần thi</td><td>Điểm</td><td>Ghi chú</td></tr><tr><td>1</td><td>Synthetic component</td><td>0.5</td><td>1</td><td>9</td><td></td></tr></table>");
     validateSpy = vi.spyOn(DaotaoClient.prototype, "validateSession").mockResolvedValue("");
     app = createApp(undefined);
   });
@@ -4248,6 +4249,7 @@ describe("VNU cross-detail HTTP routes", () => {
     expect(success.headers.get("Cache-Control")).toBe("no-store, private");
     expect(failure.headers.get("Cache-Control")).toBe("no-store, private");
   });
+
 
   it("rejects a wrong-bearer permit with the generic invalid response", async () => {
     const permitOwner = await bearerToken("SYNTHETIC_OWNER_COOKIE");
@@ -4291,6 +4293,17 @@ describe("VNU cross-detail HTTP routes", () => {
     expect(selectedExport.status).toBe(200);
     expect(selectedExport.headers.get("Cache-Control")).toBe("no-store, private");
   });
+
+  it("rejects expired permits through the HTTP route", async () => {
+    const token = await bearerToken("SYNTHETIC_EXPIRED_COOKIE");
+    const minter = createVnuCrossDetailMinter({ secret: SESSION_SECRET, requesterToken: token, maxTargets: 1, maxRows: 1, permitTtlSeconds: -1 });
+    const permit = await minter.mint({ targetStdId: "99000000001", transcriptHtml: "synthetic", row: { courseCode: "SYN9901", classId: "990099", termOrdinal: "2" } });
+    await probeBudget.issueCrossDetailPermits("synthetic-session", minter.issued);
+    const response = await requestRoute("/api/vnu/cross-lookup/detail", token, { allowCrossLookup: true, permit });
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_CROSS_DETAIL_PERMIT_INVALID" } });
+  });
+
 
   it("pads the upstream detail student ID and rejects a generic portal page", async () => {
     const token = await bearerToken("SYNTHETIC_SHAPE_COOKIE");
@@ -4372,7 +4385,7 @@ describe("VNU cross-detail bulk grouping", () => {
     setVnuProbeBudgetCoordinator(probeBudget);
     profileSpy = vi.spyOn(DaotaoClient.prototype, "getProfileHtml").mockResolvedValue('<input name="hidStdID" value="1000"><input name="StdCode" value="20000000">');
     transcriptSpy = vi.spyOn(DaotaoClient.prototype, "getTranscriptByStdIdHtml").mockResolvedValue("<table><tr><td>Sinh viên: SYNTHETIC</td><td>Mã số: 20000001</td></tr></table>");
-    detailSpy = vi.spyOn(DaotaoClient.prototype, "getPointDetailHtml").mockResolvedValue("<table><tr><td>1</td><td>Synthetic component</td><td>0.5</td><td>1</td><td>9</td></tr></table>");
+    detailSpy = vi.spyOn(DaotaoClient.prototype, "getPointDetailHtml").mockResolvedValue("<p>Điểm chi tiết môn học - Học kỳ 2. Mã học kỳ 252</p><table><tr><td>STT</td><td>Bản chất kỳ thi</td><td>TS</td><td>Lần thi</td><td>Điểm</td><td>Ghi chú</td></tr><tr><td>1</td><td>Synthetic component</td><td>0.5</td><td>1</td><td>9</td><td></td></tr></table>");
     validateSpy = vi.spyOn(DaotaoClient.prototype, "validateSession").mockResolvedValue("");
     app = createApp(undefined);
   });
@@ -4424,11 +4437,11 @@ describe("VNU cross-detail bulk grouping", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Cache-Control")).toBe("no-store, private");
-    const body = await response.json() as { data: { items: Array<{ permit: string; status: string; components?: unknown; errorCode?: string }> }; error: null };
+    const body = await response.json() as { data: { items: Array<{ permit: string; status: string; html?: string; errorCode?: string }> }; error: null };
     expect(body.data.items).toHaveLength(3);
     for (const item of body.data.items) {
       expect(item.status).toBe("ok");
-      expect(item.components).toBeDefined();
+      expect(item.html).toContain("Synthetic component");
     }
 
     // Warm-up happened exactly once (single stdId group)
@@ -4464,7 +4477,7 @@ describe("VNU cross-detail bulk grouping", () => {
     expect(probeBudget.releasedCrossDetailLeases).toHaveLength(4);
   });
 
-  it("propagates warm-up failure to all permits in the same group", async () => {
+  it("propagates isolated warm-up failure to all permits in the same group", async () => {
     const token = await bearerToken("SYNTHETIC_WARM_FAIL_COOKIE");
 
     // Group A: will succeed
@@ -4484,27 +4497,8 @@ describe("VNU cross-detail bulk grouping", () => {
       permits,
     });
 
-    expect(response.status).toBe(200);
-    const body = await response.json() as { data: { items: Array<{ permit: string; status: string; errorCode?: string }> }; error: null };
-    expect(body.data.items).toHaveLength(3);
-
-    // Permit from group A succeeds
-    const itemA = body.data.items.find((item) => item.permit === permitsA[0]);
-    expect(itemA!.status).toBe("ok");
-
-    // Permits from group B (warm-up failed) get the error
-    for (const permitB of permitsB) {
-      const item = body.data.items.find((item) => item.permit === permitB);
-      expect(item!.status).toBe("error");
-      expect(item!.errorCode).toBe("VNU_SESSION_EXPIRED");
-    }
-
-    // Two warm-up calls: one succeeded, one threw
-    expect(transcriptSpy).toHaveBeenCalledTimes(2);
-    // Only group A's permit reached detail fetch
-    expect(detailSpy).toHaveBeenCalledTimes(1);
-    // Only group A's lease was released
-    expect(probeBudget.releasedCrossDetailLeases).toHaveLength(1);
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "VNU_SESSION_EXPIRED" } });
   });
 
   it("preserves original permit order in the response", async () => {

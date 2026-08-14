@@ -80,6 +80,34 @@ function jsonError(code: string, status: number): Response {
   });
 }
 
+const DETAIL_HTML = `<p>Điểm chi tiết môn học - Học kỳ 2. Mã học kỳ 252</p><table><tr><td>STT</td><td>Bản chất kỳ thi</td><td>TS</td><td>Lần thi</td><td>Điểm</td><td>Ghi chú</td></tr><tr><td>1</td><td>Synthetic component</td><td>0.5</td><td>1</td><td>9</td><td></td></tr></table>`;
+
+describe("frontend cross-detail parsing", () => {
+  beforeEach(() => {
+    vi.stubGlobal("localStorage", new MemoryStorage());
+    vi.stubGlobal("sessionStorage", new MemoryStorage());
+    vi.stubGlobal("window", { dispatchEvent: vi.fn() });
+    vi.stubGlobal("CustomEvent", class { constructor(readonly type: string) {} });
+    seedAccount();
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("parses worker HTML into the existing component model", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonOk({ permit: "permit-a", html: DETAIL_HTML })));
+    await expect(api.vnuCrossDetail("permit-a")).resolves.toEqual([{ index: 1, nature: "Synthetic component", weight: 0.5, attempt: 1, score: 9, }]);
+  });
+
+  it("fails malformed worker HTML safely", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonOk({ permit: "permit-a", html: "<main>not detail</main>" })));
+    await expect(api.vnuCrossDetail("permit-a")).rejects.toMatchObject({ code: "VNU_CROSS_DETAIL_RESPONSE_INVALID" });
+  });
+
+  it("rejects malformed bulk responses and permit mismatches", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonOk({ items: [{ permit: "other", status: "ok", html: DETAIL_HTML }] })));
+    await expect(api.vnuCrossDetailBulk(["permit-a"])).rejects.toMatchObject({ code: "VNU_CROSS_DETAIL_RESPONSE_INVALID" });
+  });
+});
+
 async function requestCrossLookup(): Promise<void> {
   await api.vnuCrossStudentId({ stdCode: "SYNTHETIC-STUDENT" });
 }
