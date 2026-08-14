@@ -86,7 +86,7 @@ export type PrintableExportLabels = {
   processed: string;
 };
 
-export type PdfExportLabels = PrintableExportLabels & {
+export type PdfExportLabels = Omit<PrintableExportLabels, "internalStudentId"> & {
   heading: string;
   exportedAt: string;
   page: string;

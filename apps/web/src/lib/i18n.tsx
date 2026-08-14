@@ -99,7 +99,7 @@ function buildDictionary() {
       pdf: "Download PDF",
       failed: "The export could not be downloaded. Your result is unchanged; try again.",
       pdfFailed: "The PDF could not be generated. Your result is unchanged; try again.",
-      pdfLabels: { heading: "Hyeboard", title: "Export report", exportedAt: "Exported", page: "Page", surface: "Surface", university: "University", query: "Query", run: "Run", identity: "Identity", reported: "Reported summary", terms: "Terms", results: "Results", target: "Target", error: "Error", course: "Course", credits: "Credits", score: "Score", letter: "Letter grade", point4: "4-point score", gpa: "GPA", cpa: "CPA", studentCode: "Student code", name: "Name", managingClass: "Managing class", classCode: "Class code", classNumber: "Class number", classId: "Class ID", internalStudentId: "Internal student ID", probes: "Probes", accumulatedCredits: "Accumulated credits", mode: "Mode", value: "Value", status: "Status", processed: "Processed" },
+      pdfLabels: { heading: "Hyeboard", title: "Export report", exportedAt: "Exported", page: "Page", surface: "Surface", university: "University", query: "Query", run: "Run", identity: "Identity", reported: "Reported summary", terms: "Terms", results: "Results", target: "Target", error: "Error", course: "Course", credits: "Credits", score: "Score", letter: "Letter grade", point4: "4-point score", gpa: "GPA", cpa: "CPA", studentCode: "Student code", name: "Name", managingClass: "Managing class", classCode: "Class code", classNumber: "Class number", classId: "Class ID", probes: "Probes", accumulatedCredits: "Accumulated credits", mode: "Mode", value: "Value", status: "Status", processed: "Processed" },
     },
     dashboard: {
       currentTerm: "Current term",
@@ -596,7 +596,7 @@ function vi(): typeof en {
       pdf: "Tải PDF",
       failed: "Không thể tải dữ liệu xuất. Kết quả vẫn được giữ nguyên; hãy thử lại.",
       pdfFailed: "Không thể tạo PDF. Kết quả vẫn được giữ nguyên; hãy thử lại.",
-      pdfLabels: { heading: "Hyeboard", title: "Báo cáo xuất dữ liệu", exportedAt: "Thời điểm xuất", page: "Trang", surface: "Bề mặt", university: "Trường", query: "Truy vấn", run: "Lượt chạy", identity: "Danh tính", reported: "Tổng kết đã báo cáo", terms: "Học kỳ", results: "Kết quả", target: "Mục tiêu", error: "Lỗi", course: "Môn học", credits: "Tín chỉ", score: "Điểm", letter: "Điểm chữ", point4: "Điểm hệ 4", gpa: "GPA", cpa: "CPA", studentCode: "Mã sinh viên", name: "Họ tên", managingClass: "Lớp quản lý", classCode: "Mã lớp", classNumber: "Số lớp", classId: "ID lớp", internalStudentId: "ID sinh viên nội bộ", probes: "Lần dò", accumulatedCredits: "Tín chỉ tích lũy", mode: "Chế độ", value: "Giá trị", status: "Trạng thái", processed: "Đã xử lý" },
+      pdfLabels: { heading: "Hyeboard", title: "Báo cáo xuất dữ liệu", exportedAt: "Thời điểm xuất", page: "Trang", surface: "Bề mặt", university: "Trường", query: "Truy vấn", run: "Lượt chạy", identity: "Danh tính", reported: "Tổng kết đã báo cáo", terms: "Học kỳ", results: "Kết quả", target: "Mục tiêu", error: "Lỗi", course: "Môn học", credits: "Tín chỉ", score: "Điểm", letter: "Điểm chữ", point4: "Điểm hệ 4", gpa: "GPA", cpa: "CPA", studentCode: "Mã sinh viên", name: "Họ tên", managingClass: "Lớp quản lý", classCode: "Mã lớp", classNumber: "Số lớp", classId: "ID lớp", probes: "Lần dò", accumulatedCredits: "Tín chỉ tích lũy", mode: "Chế độ", value: "Giá trị", status: "Trạng thái", processed: "Đã xử lý" },
     },
     dashboard: {
       currentTerm: "Học kỳ hiện tại",

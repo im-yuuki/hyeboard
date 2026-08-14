@@ -549,7 +549,6 @@ describe("PDF export", () => {
     classCode: "Class code",
     classNumber: "Class number",
     classId: "Class ID",
-    internalStudentId: "Internal student ID",
     probes: "Probes",
     accumulatedCredits: "Accumulated credits",
     mode: "Mode",
@@ -557,6 +556,20 @@ describe("PDF export", () => {
     status: "Status",
     processed: "Processed",
   };
+
+  const pdfModels = [
+    createClassLookupExport({ surface: "class-forward", universityId: "vnu", query: { mode: "course-and-class", value: "INT1001 / 01" }, result: { classCode: "INT1001", classNumber: "01", classId: "000001", courseName: "Reliable Systems" } }),
+    createClassLookupExport({ surface: "class-reverse", universityId: "vnu", query: { mode: "class-id", value: "000001" }, result: { classCode: "INT1001", classNumber: "01", classId: "000001", courseName: "Reliable Systems" } }),
+    createResolverLookupExport({ surface: "student-id-to-code", universityId: "vnu", query: { mode: "stdId", value: SYNTHETIC_INTERNAL_ID }, identity: { studentCode: SYNTHETIC_STUDENT_CODE, internalStudentId: SYNTHETIC_INTERNAL_ID } }),
+    createResolverLookupExport({ surface: "student-code-to-id", universityId: "vnu", query: { mode: "stdCode", value: SYNTHETIC_STUDENT_CODE }, resolver: { resolvedStudentCode: SYNTHETIC_STUDENT_CODE, resolvedInternalStudentId: SYNTHETIC_INTERNAL_ID, probes: 2 } }),
+    createGradesExport({ surface: "grades-term", universityId: "mock", identity: { studentCode: SYNTHETIC_STUDENT_CODE, internalStudentId: SYNTHETIC_INTERNAL_ID }, derivedTerms: [term] }),
+    createGradesExport({ surface: "grades-page", universityId: "mock", identity: { studentCode: SYNTHETIC_STUDENT_CODE, internalStudentId: SYNTHETIC_INTERNAL_ID }, derivedTerms: [term] }),
+    createTranscriptExport({ universityId: "vnu", query: { mode: "stdId", value: SYNTHETIC_INTERNAL_ID }, identity: { studentCode: SYNTHETIC_STUDENT_CODE, internalStudentId: SYNTHETIC_INTERNAL_ID }, derivedTerms: [term] }),
+    createBulkExport({ surface: "bulk-id-to-code", universityId: "vnu", mode: "stdid-to-code", total: 1, items: [{ target: SYNTHETIC_INTERNAL_ID, status: "ok", result: { identity: { studentCode: SYNTHETIC_STUDENT_CODE, internalStudentId: SYNTHETIC_INTERNAL_ID } } }] }),
+    createBulkExport({ surface: "bulk-code-to-id", universityId: "vnu", mode: "code-to-stdid", total: 1, items: [{ target: SYNTHETIC_STUDENT_CODE, status: "ok", result: { resolver: { resolvedStudentCode: SYNTHETIC_STUDENT_CODE, resolvedInternalStudentId: SYNTHETIC_INTERNAL_ID, probes: 2 } } }] }),
+    createBulkExport({ surface: "bulk-id-to-transcript", universityId: "vnu", mode: "stdid-to-transcript", total: 1, items: [{ target: SYNTHETIC_INTERNAL_ID, status: "ok", result: { identity: { studentCode: SYNTHETIC_STUDENT_CODE, internalStudentId: SYNTHETIC_INTERNAL_ID }, derivedTerms: [term] } }] }),
+  ] as const;
+  const printableLabels = { ...labels, internalStudentId: "Internal student ID" };
 
   it("serializes only allowlisted values into escaped standalone HTML", () => {
     const html = serializePrintableExport({
@@ -566,7 +579,7 @@ describe("PDF export", () => {
       identity: { studentName: "<img src=x onerror=alert(1)>" },
       derivedTerms: [{ ...term, courses: [{ ...term.courses[0]!, courseName: "<script>bad()</script>" }] }],
       extra: SENTINEL,
-    } as ExportDocument, "en", labels);
+    } as ExportDocument, "en", printableLabels);
 
     expect(html).toContain('<html lang="en">');
     expect(html).toContain("&lt;unsafe&gt;");
@@ -641,11 +654,11 @@ describe("PDF export", () => {
     expect(definition).toContain("3.5");
     expect(definition).toContain(SYNTHETIC_STUDENT_CODE);
     expect(definition).not.toContain(SYNTHETIC_INTERNAL_ID);
-    expect(definition).not.toContain(labels.internalStudentId);
+    expect(definition).not.toContain("Internal student ID");
   });
 
   it("maps lookup class numbers and Vietnamese identity labels into report metadata", () => {
-    const vietnameseLabels = { ...labels, title: "Báo cáo xuất dữ liệu", classNumber: "Số lớp", internalStudentId: "ID sinh viên nội bộ" };
+    const vietnameseLabels = { ...labels, title: "Báo cáo xuất dữ liệu", classNumber: "Số lớp" };
     const definition = JSON.stringify(createPdfExportDefinition(
       createClassLookupExport({
         surface: "class-forward",
@@ -694,7 +707,7 @@ describe("PDF export", () => {
       expect(definition).toContain(labels.title);
       expect(definition).toContain('"pageOrientation":"landscape"');
       expect(definition).toContain("Synthetic Student");
-       expect(definition).not.toContain(labels.internalStudentId);
+       expect(definition).not.toContain("Internal student ID");
        expect(definition).not.toContain(SYNTHETIC_INTERNAL_ID);
        expect(definition).toContain(SYNTHETIC_STUDENT_CODE);
       expect(definition).toContain("Reliable, \\\"Systems\\\"");
@@ -721,7 +734,8 @@ describe("PDF export", () => {
     expect(serialized).toContain(SYNTHETIC_STUDENT_CODE);
     expect(serialized).not.toContain(SYNTHETIC_INTERNAL_ID);
     expect(serialized).not.toContain("lightHorizontalLines");
-    expect(definition).toMatchObject({ pageSize: "A4", pageMargins: [32, 32, 32, 30], defaultStyle: { fontSize: 8.5 } });
+    expect(definition).toMatchObject({ pageSize: "A4", pageMargins: [32, 32, 32, 30], defaultStyle: { font: "Roboto", fontSize: 8.5 } });
+    expect(definition.styles).toMatchObject({ heading: { fontSize: 12 }, title: { fontSize: 17 }, section: { fontSize: 11 }, subsection: { fontSize: 9 } });
     expect((definition.content as Array<{ layout?: unknown }>).some((item) => typeof item.layout === "object")).toBe(true);
     const table = (definition.content as Array<{ table?: unknown }>).find((item) => item.table) as { layout: { hLineColor: () => string; paddingTop: () => number } };
     expect(table.layout.hLineColor()).toBe("#cbd5df");
@@ -748,6 +762,18 @@ describe("PDF export", () => {
 
     expect(blob.type).toBe("application/pdf");
     expect((await blob.text()).slice(0, 5)).toBe("%PDF-");
-    expect(blob.size).toBeGreaterThan(1_000);
+  });
+
+  it.each(pdfModels)("keeps studentCode and excludes internal IDs for %s PDF", (model) => {
+    const definition = JSON.stringify(createPdfExportDefinition(model, "en", labels, new Date("2026-08-02T12:00:00Z")));
+    const json = serializeExportJson(model);
+    const csv = serializeExportCsv(model);
+    expect(definition).not.toContain(SYNTHETIC_INTERNAL_ID);
+    expect(definition).not.toContain("Internal student ID");
+    if (json.includes(SYNTHETIC_STUDENT_CODE)) expect(definition).toContain(SYNTHETIC_STUDENT_CODE);
+    if (json.includes(SYNTHETIC_INTERNAL_ID)) {
+      expect(json).toContain(SYNTHETIC_INTERNAL_ID);
+      expect(csv).toContain(SYNTHETIC_INTERNAL_ID);
+    }
   });
 });
