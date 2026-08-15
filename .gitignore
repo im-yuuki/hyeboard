@@ -26,3 +26,4 @@ credentials.txt
 
 # Local analysis scratch (probe captures, decoded bodies).
 .tmp/
+.superpowers/
