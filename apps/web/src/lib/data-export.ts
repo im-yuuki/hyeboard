@@ -381,8 +381,8 @@ function pdfResultContent(result: ExportResult, labels: PdfExportLabels): PdfDoc
 function maxPdfTableColumns(model: ExportDocument): number {
   const document = sanitizeExportDocument(model);
   const hasCourses = (terms: readonly ExportDerivedTerm[] | undefined) => terms?.some((term) => term.courses.length > 0) ?? false;
-  if (hasCourses(document.derivedTerms)) return 7;
-  if (document.results?.some((item) => hasCourses("status" in item && item.status === "ok" ? item.result.derivedTerms : "status" in item ? undefined : item.derivedTerms))) return 7;
+  if (hasCourses(document.derivedTerms)) return 6;
+  if (document.results?.some((item) => hasCourses("status" in item && item.status === "ok" ? item.result.derivedTerms : "status" in item ? undefined : item.derivedTerms))) return 6;
   return 2;
 }
 

@@ -638,25 +638,58 @@ describe("PDF export", () => {
       termLabel: "Semester 2, 2025–2026",
       courses: [{ courseCode: "INT2002", courseName: "Separate Course", credits: 3, point10: 9, letter: "A", point4: 4 }],
     };
+    const courseTables = (definition: ReturnType<typeof createPdfExportDefinition>) =>
+      (definition.content as Array<{ table?: { body?: Array<Array<string | { text?: string }>> } }>).filter((item) =>
+        item.table?.body?.[0]?.some((cell) => typeof cell === "object" && cell.text === labels.course),
+      );
     const definition = createPdfExportDefinition(
       createGradesExport({ surface: "grades-page", universityId: "mock", derivedTerms: [term, secondTerm] }),
       "en",
       labels,
       new Date("2026-08-02T12:00:00Z"),
     );
-    const courseTables = (definition.content as Array<{ table?: { body?: unknown[][] } }>).filter((item) =>
-      item.table?.body?.[0]?.some((cell) => typeof cell === "object" && cell !== null && "text" in cell && cell.text === labels.course),
-    );
+    const tables = courseTables(definition);
+    const headers = [labels.course, labels.name, labels.credits, labels.score, labels.letter, labels.point4];
 
-    expect(courseTables).toHaveLength(2);
-    expect(JSON.stringify(courseTables[0])).toContain(term.courses[0]!.courseCode);
-    expect(JSON.stringify(courseTables[0])).not.toContain(secondTerm.courses[0]!.courseCode);
-    expect(JSON.stringify(courseTables[1])).toContain(secondTerm.courses[0]!.courseCode);
-    expect(JSON.stringify(courseTables[1])).not.toContain(term.courses[0]!.courseCode);
-    for (const table of courseTables) expect(JSON.stringify(table.table?.body?.[0])).not.toContain(labels.terms);
+    expect(tables).toHaveLength(2);
+    expect(tables.map((table) => table.table?.body?.[0]?.map((cell) => typeof cell === "object" ? cell.text : cell))).toEqual([headers, headers]);
+    expect(JSON.stringify(tables[0])).toContain(term.courses[0]!.courseCode);
+    expect(JSON.stringify(tables[0])).not.toContain(secondTerm.courses[0]!.courseCode);
+    expect(JSON.stringify(tables[1])).toContain(secondTerm.courses[0]!.courseCode);
+    expect(JSON.stringify(tables[1])).not.toContain(term.courses[0]!.courseCode);
+
+    const emptyTerm: ExportDerivedTerm = { ...secondTerm, termCode: "253", termLabel: "Empty semester", courses: [] };
+    const emptyDefinition = createPdfExportDefinition(
+      createGradesExport({ surface: "grades-page", universityId: "mock", derivedTerms: [term, emptyTerm] }),
+      "en",
+      labels,
+      new Date("2026-08-02T12:00:00Z"),
+    );
+    expect(emptyDefinition.content).toContainEqual({ text: emptyTerm.termLabel, style: "subsection" });
+    expect(emptyDefinition.content).toContainEqual(expect.objectContaining({ table: expect.objectContaining({ body: expect.arrayContaining([[expect.objectContaining({ text: labels.credits }), `${emptyTerm.includedCredits} / ${emptyTerm.listedCredits}`]]) }) }));
+    expect(courseTables(emptyDefinition)).toHaveLength(1);
+
+    const nestedDefinition = createPdfExportDefinition(
+      createBulkExport({
+        surface: "bulk-id-to-transcript",
+        universityId: "mock",
+        mode: "stdid-to-transcript",
+        total: 1,
+        items: [{ target: SYNTHETIC_INTERNAL_ID, status: "ok", result: { derivedTerms: [term, secondTerm] } }],
+      }),
+      "en",
+      labels,
+      new Date("2026-08-02T12:00:00Z"),
+    );
+    const nestedTables = courseTables(nestedDefinition);
+    expect(nestedTables).toHaveLength(2);
+    expect(JSON.stringify(nestedTables[0])).toContain(term.courses[0]!.courseCode);
+    expect(JSON.stringify(nestedTables[0])).not.toContain(secondTerm.courses[0]!.courseCode);
+    expect(JSON.stringify(nestedTables[1])).toContain(secondTerm.courses[0]!.courseCode);
+    expect(JSON.stringify(nestedTables[1])).not.toContain(term.courses[0]!.courseCode);
   });
 
-  it("maps grades into a seven-column landscape course table without conflating letter and 4-point scores", () => {
+  it("maps grades into a six-column landscape course table without conflating letter and 4-point scores", () => {
     const definition = JSON.stringify(createPdfExportDefinition(
       createGradesExport({
         surface: "grades-page",
