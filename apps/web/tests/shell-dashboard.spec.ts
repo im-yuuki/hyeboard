@@ -140,7 +140,7 @@ test("Utility accordion expands Lookup and persists on desktop", async ({ page, 
 
   const utility = page.getByRole("button", { name: "Expand Utility" });
   await utility.click();
-  await expect(utility).toHaveAttribute("aria-expanded", "true");
+  await expect(page.getByRole("button", { name: "Collapse Utility" })).toHaveAttribute("aria-expanded", "true");
   await expect(page.getByRole("link", { name: "Lookup" })).toBeVisible();
   await page.reload();
   await expect(page.getByRole("button", { name: "Collapse Utility" })).toHaveAttribute("aria-expanded", "true");

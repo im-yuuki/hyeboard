@@ -1,7 +1,7 @@
 import type { Notification } from "@hyeboard/schemas";
-import { Link, Outlet, useNavigate } from "@tanstack/react-router";
-import { Award, Bell, BookOpen, CalendarDays, Check, ClipboardCheck, Files, GraduationCap, Hash, LayoutDashboard, ListChecks, LogOut, Menu, PanelLeftClose, PanelLeftOpen, Search, Settings, UserRound, WalletCards, X } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Link, Outlet, useNavigate, useRouterState } from "@tanstack/react-router";
+import { Award, Bell, BookOpen, CalendarDays, Check, ChevronDown, ClipboardCheck, Files, GraduationCap, Hash, LayoutDashboard, ListChecks, LogOut, Menu, PanelLeftClose, PanelLeftOpen, Search, Settings, UserRound, WalletCards, Wrench, X } from "lucide-react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
@@ -36,7 +36,6 @@ const navGroups: NavGroup[] = [
       { key: "tuition", to: "/tuition", icon: WalletCards, capability: "tuition" },
       { key: "documents", to: "/documents", icon: Files, capability: "documentsHub" },
       { key: "trainingPoints", to: "/training-points", icon: Award, capability: "trainingPoints" },
-      { key: "lookup", to: "/lookup", icon: Hash, capability: "classLookup" },
     ],
   },
   { key: "system", items: [{ key: "settings", to: "/settings", icon: Settings }] },
@@ -49,20 +48,61 @@ function isCapabilityVisible(capability: NavCapability | undefined, capabilities
   return capabilities[capability] !== false;
 }
 
-function SidebarNav({ collapsed = false, mobile = false }: { collapsed?: boolean; mobile?: boolean } = {}) {
+function SidebarNav({
+  collapsed = false,
+  mobile = false,
+  utilityOpen,
+  onUtilityOpenChange,
+  onNavigate,
+}: {
+  collapsed?: boolean;
+  mobile?: boolean;
+  utilityOpen: boolean;
+  onUtilityOpenChange: (open: boolean) => void;
+  onNavigate?: () => void;
+}) {
   const state = useHyeboard();
   const { t } = useLocale();
+  const pathname = useRouterState({ select: (routerState) => routerState.location.pathname });
   const capabilities = state.universities.data?.find((u) => u.id === state.universityId)?.capabilities;
+  const utilityExpanded = utilityOpen || pathname === "/lookup";
+  const lookupVisible = isCapabilityVisible("classLookup", capabilities);
+  const lookupControlsId = `utility-lookup-${mobile ? "mobile" : "desktop"}`;
+
   return (
     <nav className="space-y-4 px-3 py-4">
       {navGroups.map((group) => {
         const visibleItems = group.items.filter((item) => isCapabilityVisible(item.capability, capabilities));
-        if (!visibleItems.length) return null;
+        if (!visibleItems.length && (group.key !== "utilities" || !lookupVisible)) return null;
         return (
-          <div key={group.key} className="space-y-1">
-            {!collapsed ? <p className="nav-group-label px-3 pb-1 uppercase tracking-wide">{t.nav.groups[group.key]}</p> : null}
-            {visibleItems.map((item) => <NavLink key={item.to} to={item.to} label={t.nav[item.key]} icon={item.icon} collapsed={collapsed} mobile={mobile} />)}
-          </div>
+          <Fragment key={group.key}>
+            {visibleItems.length ? (
+              <div className="space-y-1">
+                {collapsed ? null : <p className="nav-group-label px-3 pb-1 uppercase tracking-wide">{t.nav.groups[group.key]}</p>}
+                {visibleItems.map((item) => <NavLink key={item.to} to={item.to} label={t.nav[item.key]} icon={item.icon} collapsed={collapsed} mobile={mobile} onClick={onNavigate} />)}
+              </div>
+            ) : null}
+            {group.key === "utilities" && lookupVisible ? (
+              <div className="space-y-1">
+                <button
+                  type="button"
+                  className={cn("nav-link w-full", mobile && "mobile-nav-link", collapsed && "justify-center gap-0 px-0")}
+                  onClick={() => onUtilityOpenChange(!utilityExpanded)}
+                  aria-label={utilityExpanded ? t.nav.collapseUtility : t.nav.expandUtility}
+                  aria-expanded={utilityExpanded}
+                  aria-controls={lookupControlsId}
+                  title={collapsed ? t.nav.utility : undefined}
+                >
+                  <Wrench size={16} className="shrink-0" />
+                  <span className={cn("overflow-hidden whitespace-nowrap transition-[max-width,opacity,transform] duration-300 ease-[var(--ease-out-quint)]", collapsed ? "max-w-0 -translate-x-1 opacity-0" : "max-w-36 translate-x-0 opacity-100")}>{t.nav.utility}</span>
+                  {collapsed ? null : <ChevronDown size={15} className={cn("ml-auto shrink-0 transition-transform", utilityExpanded && "rotate-180")} />}
+                </button>
+                <div id={lookupControlsId} hidden={collapsed || !utilityExpanded} className="space-y-1">
+                  <NavLink to="/lookup" label={t.nav.lookup} icon={Hash} mobile={mobile} onClick={onNavigate} />
+                </div>
+              </div>
+            ) : null}
+          </Fragment>
         );
       })}
     </nav>
@@ -105,10 +145,15 @@ export function RootLayout() {
   const navigate = useNavigate();
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem("hyeboard.sidebarCollapsed") === "true");
+  const [utilityOpen, setUtilityOpen] = useState(() => localStorage.getItem("hyeboard.utilityOpen") === "true");
 
   useEffect(() => {
     localStorage.setItem("hyeboard.sidebarCollapsed", String(sidebarCollapsed));
   }, [sidebarCollapsed]);
+
+  useEffect(() => {
+    localStorage.setItem("hyeboard.utilityOpen", String(utilityOpen));
+  }, [utilityOpen]);
 
   useEffect(() => {
     const redirectToLogin = () => { void navigate({ to: "/login" }); };
@@ -133,7 +178,7 @@ export function RootLayout() {
               {sidebarCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
             </Button>
           </div>
-          <SidebarNav collapsed={sidebarCollapsed} />
+          <SidebarNav collapsed={sidebarCollapsed} utilityOpen={utilityOpen} onUtilityOpenChange={setUtilityOpen} />
         </aside>
 
         <Sheet open={mobileNavOpen} onOpenChange={setMobileNavOpen}>
@@ -146,7 +191,7 @@ export function RootLayout() {
           >
             <SheetTitle className="sr-only">{t.common.navigation}</SheetTitle>
             <BrandMark />
-            <div onClick={() => setMobileNavOpen(false)}><SidebarNav mobile /></div>
+            <SidebarNav mobile utilityOpen={utilityOpen} onUtilityOpenChange={setUtilityOpen} onNavigate={() => setMobileNavOpen(false)} />
           </SheetContent>
         </Sheet>
 
@@ -341,10 +386,11 @@ function AccountMenu() {
   );
 }
 
-function NavLink({ to, label, icon: Icon, collapsed = false, mobile = false }: { to: string; label: string; icon: typeof LayoutDashboard; collapsed?: boolean; mobile?: boolean }) {
+function NavLink({ to, label, icon: Icon, collapsed = false, mobile = false, onClick }: { to: string; label: string; icon: typeof LayoutDashboard; collapsed?: boolean; mobile?: boolean; onClick?: () => void }) {
   return (
     <Link
       to={to}
+      onClick={onClick}
       className={cn("nav-link", mobile && "mobile-nav-link", collapsed && "justify-center gap-0 px-0")}
       activeProps={{ className: cn("nav-link active", mobile && "mobile-nav-link", collapsed && "justify-center gap-0 px-0"), "aria-current": "page" }}
       title={collapsed ? label : undefined}
