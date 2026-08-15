@@ -327,35 +327,44 @@ function pdfMetadataTable(value: Record<string, string | number | undefined>): P
   return body.length ? { table: { widths: [118, "*"], body }, layout: PDF_TABLE_LAYOUT, fontSize: 8.5, margin: [0, 3, 0, 9] } : undefined;
 }
 
-function pdfCourseTable(terms: readonly ExportDerivedTerm[], labels: PdfExportLabels): PdfDocumentDefinition | undefined {
-  const rows = terms.flatMap((term) => term.courses.map((course) => [
-    term.termLabel,
-    course.courseCode,
-    course.courseName,
-    pdfValue(course.credits),
-    pdfValue(course.point10),
-    pdfValue(course.letter),
-    pdfValue(course.point4),
-  ]));
-  if (!rows.length) return undefined;
+function pdfCourseTable(term: ExportDerivedTerm, labels: PdfExportLabels): PdfDocumentDefinition | undefined {
+  if (!term.courses.length) return undefined;
   return {
     table: {
       headerRows: 1,
-      widths: ["auto", "auto", "*", "auto", "auto", "auto", "auto"],
+      widths: ["auto", "*", "auto", "auto", "auto", "auto"],
       body: [[
-        { text: labels.terms, bold: true, color: PDF_COLORS.accent },
         { text: labels.course, bold: true, color: PDF_COLORS.accent },
         { text: labels.name, bold: true, color: PDF_COLORS.accent },
         { text: labels.credits, bold: true, color: PDF_COLORS.accent },
         { text: labels.score, bold: true, color: PDF_COLORS.accent },
         { text: labels.letter, bold: true, color: PDF_COLORS.accent },
         { text: labels.point4, bold: true, color: PDF_COLORS.accent },
-      ], ...rows],
+      ], ...term.courses.map((course) => [
+        course.courseCode,
+        course.courseName,
+        pdfValue(course.credits),
+        pdfValue(course.point10),
+        pdfValue(course.letter),
+        pdfValue(course.point4),
+      ])],
     },
     layout: PDF_TABLE_LAYOUT,
     fontSize: 7.5,
     margin: [0, 3, 0, 10],
   };
+}
+
+function pdfTermContent(terms: readonly ExportDerivedTerm[], labels: PdfExportLabels): PdfDocumentDefinition[] {
+  const content: PdfDocumentDefinition[] = [];
+  for (const term of terms) {
+    content.push({ text: term.termLabel, style: "subsection" });
+    const summary = pdfMetadataTable({ [labels.credits]: `${term.includedCredits} / ${term.listedCredits}`, [labels.gpa]: term.termGpa4, [labels.cpa]: term.derivedCpa4 });
+    if (summary) content.push(summary);
+    const courses = pdfCourseTable(term, labels);
+    if (courses) content.push(courses);
+  }
+  return content;
 }
 
 function pdfResultContent(result: ExportResult, labels: PdfExportLabels): PdfDocumentDefinition[] {
@@ -365,8 +374,7 @@ function pdfResultContent(result: ExportResult, labels: PdfExportLabels): PdfDoc
   const resolver = result.resolver && pdfMetadataTable({ [labels.studentCode]: result.resolver.resolvedStudentCode, [labels.probes]: result.resolver.probes });
   const reported = result.reported && pdfMetadataTable({ [labels.gpa]: result.reported.cumulativeGpa4, [labels.credits]: result.reported.totalCredits, [labels.accumulatedCredits]: result.reported.accumulatedCredits });
   for (const section of [identity, classResult, resolver, reported]) if (section) content.push(section);
-  const courses = result.derivedTerms && pdfCourseTable(result.derivedTerms, labels);
-  if (courses) content.push(courses);
+  if (result.derivedTerms) content.push(...pdfTermContent(result.derivedTerms, labels));
   return content;
 }
 
@@ -410,14 +418,7 @@ export function createPdfExportDefinition(model: ExportDocument, locale: string,
   const reported = document.reported && pdfMetadataTable({ [labels.gpa]: document.reported.cumulativeGpa4, [labels.credits]: document.reported.totalCredits, [labels.accumulatedCredits]: document.reported.accumulatedCredits });
   if (reported) content.push({ text: labels.reported, style: "section" }, reported);
   if (document.derivedTerms?.length) {
-    content.push({ text: labels.terms, style: "section" });
-    for (const term of document.derivedTerms) {
-      content.push({ text: term.termLabel, style: "subsection" });
-      const summary = pdfMetadataTable({ [labels.credits]: `${term.includedCredits} / ${term.listedCredits}`, [labels.gpa]: term.termGpa4, [labels.cpa]: term.derivedCpa4 });
-      if (summary) content.push(summary);
-    }
-    const courses = pdfCourseTable(document.derivedTerms, labels);
-    if (courses) content.push(courses);
+    content.push({ text: labels.terms, style: "section" }, ...pdfTermContent(document.derivedTerms, labels));
   }
   if (document.run) {
     content.push({ text: labels.run, style: "section" });

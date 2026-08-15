@@ -631,6 +631,31 @@ describe("PDF export", () => {
     expect(resolvePdfPageOrientation(createGradesExport({ surface: "grades-page", universityId: "mock", derivedTerms: [term] }))).toBe("landscape");
   });
 
+  it("splits PDF course tables by term", () => {
+    const secondTerm: ExportDerivedTerm = {
+      ...term,
+      termCode: "252",
+      termLabel: "Semester 2, 2025–2026",
+      courses: [{ courseCode: "INT2002", courseName: "Separate Course", credits: 3, point10: 9, letter: "A", point4: 4 }],
+    };
+    const definition = createPdfExportDefinition(
+      createGradesExport({ surface: "grades-page", universityId: "mock", derivedTerms: [term, secondTerm] }),
+      "en",
+      labels,
+      new Date("2026-08-02T12:00:00Z"),
+    );
+    const courseTables = (definition.content as Array<{ table?: { body?: unknown[][] } }>).filter((item) =>
+      item.table?.body?.[0]?.some((cell) => typeof cell === "object" && cell !== null && "text" in cell && cell.text === labels.course),
+    );
+
+    expect(courseTables).toHaveLength(2);
+    expect(JSON.stringify(courseTables[0])).toContain(term.courses[0]!.courseCode);
+    expect(JSON.stringify(courseTables[0])).not.toContain(secondTerm.courses[0]!.courseCode);
+    expect(JSON.stringify(courseTables[1])).toContain(secondTerm.courses[0]!.courseCode);
+    expect(JSON.stringify(courseTables[1])).not.toContain(term.courses[0]!.courseCode);
+    for (const table of courseTables) expect(JSON.stringify(table.table?.body?.[0])).not.toContain(labels.terms);
+  });
+
   it("maps grades into a seven-column landscape course table without conflating letter and 4-point scores", () => {
     const definition = JSON.stringify(createPdfExportDefinition(
       createGradesExport({
