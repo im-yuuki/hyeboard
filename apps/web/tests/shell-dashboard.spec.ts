@@ -156,6 +156,17 @@ test("Utility accordion forces open on Lookup and persists on desktop", async ({
   await expect(page.getByRole("button", { name: "Collapse Utility" })).toHaveAttribute("aria-expanded", "true");
 });
 
+test("collapsed desktop sidebar hides lookup-capable Utility navigation", async ({ page }) => {
+  await openMockedLookup(page);
+
+  await page.getByRole("button", { name: "Collapse sidebar" }).click();
+  await expect(page.getByRole("button", { name: /Utility/ })).toHaveCount(0);
+  await expect(page.getByRole("link", { name: "Lookup" })).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Expand sidebar" }).click();
+  await expect(page.getByRole("button", { name: "Collapse Utility" })).toBeVisible();
+});
+
 test("Utility accordion opens Lookup in the mobile navigation drawer", async ({ page }) => {
   await openMockedLookup(page);
   await page.setViewportSize({ width: 500, height: 900 });
