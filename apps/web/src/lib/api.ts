@@ -1,8 +1,7 @@
-import { apiErrorDetailsSchema, type ApiErrorDetails, type ApiResponse, type Assignment, type ClassSession, type Course, type DashboardSummary, type DocumentItem, type ExamSession, type Grade, type NewsItem, type ServiceRequest, type Term, type TrainingPoint, type TuitionStatus, type University } from "@hyeboard/schemas";
-import type { VnuExamCatalogRow, VnuPointDetail, VnuProfile, VnuTranscript } from "@hyeboard/university-adapters/src/vnu/types";
-import { mapExamRow, mapGpaSummary, mapGradeRow, mapProfile, mapSyllabusRow, mapTerms, mapTrainingPoints } from "@hyeboard/university-adapters/src/vnu/mapper";
-import { isPointDetailPageHtml, parseExamCatalogHtml, parseExamTermOptions, parseExamsHtml, parseGradesHtml, parsePointDetailHtml, parseProfileHtml, parseStudyProgressHtml, parseSyllabusHtml } from "@hyeboard/university-adapters/src/vnu/parser";
+import { apiErrorDetailsSchema, type ApiErrorDetails, type ApiResponse, type Assignment, type ClassSession, type Course, type DashboardSummary, type DocumentItem, type ExamSession, type Grade, type GpaSummary, type NewsItem, type ServiceRequest, type Student, type Term, type TrainingPoint, type TuitionStatus, type University } from "@hyeboard/schemas";
 import { createLinkedAbortController } from "./abort-deadline";
+import { createUetClient } from "./uet-client";
+import { createVnuClient, type VnuBulkLookupItem, type VnuBulkLookupMode, type VnuCrossDetailComponent, type VnuCrossDetailItem, type VnuCrossDetailPermit, type VnuCrossStudentCode, type VnuCrossStudentId, type VnuCrossTranscript, type VnuCrossTranscriptInput } from "./vnu-client";
 import { canReauthenticateInline, requestInlineReauth } from "./reauth";
 import { readUetSessionStream } from "./uet-session-stream";
 import { ApiError, markVnuRefreshAttempted, wasVnuRefreshAttempted, type AuthResult, type ImportedAccountResult, type ImportSessionInput, type StoredAccount } from "./api-types";
@@ -10,6 +9,7 @@ import { classifyVnuRecovery, clearVnuRefreshGrant, readVnuRefreshGrant, request
 
 export { ApiError } from "./api-types";
 export type { AuthResult, ImportedAccountResult, ImportSessionInput, StoredAccount } from "./api-types";
+export type { VnuBulkLookupItem, VnuBulkLookupMode, VnuBulkLookupResult, VnuCrossDetailComponent, VnuCrossDetailItem, VnuCrossDetailPermit, VnuCrossStudentCode, VnuCrossStudentId, VnuCrossTranscript, VnuCrossTranscriptInput } from "./vnu-client";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
 const SESSION_KEY = "hyeboard.sessionToken";
@@ -492,241 +492,37 @@ export function shouldInvalidateVnuRefreshQuery(
     && INVALIDATABLE_VNU_QUERY_NAMES.has(queryName);
 }
 
-function queryString(params: Record<string, string | undefined>): string {
-  const query = new URLSearchParams();
-  for (const [key, value] of Object.entries(params)) {
-    if (value) query.set(key, value);
-  }
-  const rendered = query.toString();
-  return rendered ? `?${rendered}` : "";
-}
-
-async function vnuRaw(page: string, params: Record<string, string | undefined> = {}, signal?: AbortSignal) {
-  return request<{ html: string }>(`/api/vnu/raw/${page}${queryString(params)}`, { signal });
-}
-
-async function vnuDashboard(): Promise<DashboardSummary> {
-  const [profilePage, gradesPage, progressPage] = await Promise.all([
-    vnuRaw("profile"),
-    vnuRaw("grades"),
-    vnuRaw("progress"),
-  ]);
-  const profile = parseProfileHtml(profilePage.html);
-  const grades = parseGradesHtml(gradesPage.html);
-  const progress = parseStudyProgressHtml(progressPage.html);
-  const terms = mapTerms(grades);
-  return {
-    student: mapProfile(profile, "vnu"),
-    currentTerm: terms[0],
-    todaySchedule: [],
-    courses: [],
-    assignments: [],
-    grades: grades.rows.map(mapGradeRow),
-    gpa: mapGpaSummary(grades, progress),
-    exams: [],
-    notifications: [],
-  };
-}
-
-async function vnuTerms(): Promise<Term[]> {
-  return mapTerms(parseGradesHtml((await vnuRaw("grades")).html));
-}
-
-async function vnuGrades(): Promise<Grade[]> {
-  return parseGradesHtml((await vnuRaw("grades")).html).rows.map(mapGradeRow);
-}
-
-async function vnuExams(termCode?: string): Promise<ExamSession[]> {
-  const basePage = await vnuRaw("exam-base");
-  const options = parseExamTermOptions(basePage.html);
-  const option = termCode
-    ? options.find((item) => item.label.startsWith(`${termCode}.`))
-    : (options.find((item) => item.selected) ?? options[0]);
-  if (!option) return [];
-  // selStd/selUniv are derived server-side from the session's own profile
-  // (same hardening as point-detail) — the client only chooses the term.
-  const page = await vnuRaw("exams", { vTermID: option.value });
-  return parseExamsHtml(page.html).map(mapExamRow);
-}
-
-// Raw profile fetch for the Lookup page - needs the hidden internalStudentId
-// (hidStdID) and internalUnivId fields that the schema-typed Student (see
-// mapProfile) intentionally doesn't carry.
-async function vnuOwnProfile(): Promise<VnuProfile> {
-  return parseProfileHtml((await vnuRaw("profile")).html);
-}
-
-async function vnuClassCatalog(params: { vTermID: string }, signal?: AbortSignal): Promise<VnuExamCatalogRow[]> {
-  const page = await vnuRaw("exams", params, signal);
-  return parseExamCatalogHtml(page.html);
-}
-
-// Per-component grade breakdown for one of the student's OWN classes. The
-// worker derives StdID from the session server-side — there is intentionally
-// no stdId param here. val is omitted entirely: the popup footer only echoes
-// it back unvalidated, so sending nothing keeps displayTotalEcho absent
-// instead of surfacing a cosmetic number as if it were data.
-async function vnuPointDetail(params: { id: string; Term: string }): Promise<VnuPointDetail> {
-  const page = await vnuRaw("point-detail", params);
-  return parsePointDetailHtml(page.html);
-}
-
-export type VnuCrossStudentCode = { studentCode?: string; studentName?: string; className?: string };
-
-export type VnuCrossDetailComponent = { index: number; nature: string; weight?: number; attempt?: number; score?: number };
-export type VnuCrossDetailPermit = { termIndex: number; rowIndex: number; permit: string };
-export type VnuCrossDetailItem = { permit: string; status: "ok"; components: VnuCrossDetailComponent[] } | { permit: string; status: "error"; errorCode: string };
-export type VnuCrossTranscript = Omit<VnuTranscript, "notice"> & { detailPermits?: VnuCrossDetailPermit[] };
-
-function sanitizeCrossStudentCode(result: VnuCrossStudentCode): VnuCrossStudentCode {
-  return { studentCode: result.studentCode, studentName: result.studentName, className: result.className };
-}
-
-function sanitizeCrossTranscript(result: VnuTranscript): VnuCrossTranscript {
-  const permits = (result as VnuCrossTranscript).detailPermits;
-  return { header: result.header, terms: result.terms, totals: result.totals, ...(Array.isArray(permits) ? { detailPermits: permits } : {}) };
-}
-
-// Cross-student StdID -> student-code resolver (crossLookup capability, vnu
-// only). The dedicated worker route requires the explicit
-// allowCrossLookup=true flag (sent here as the client-side acknowledgement),
-// rejects self-targets, and never caches. The worker fetches the target
-// student's transcript page (listpoint_Brc1.asp — the only verified
-// student-role StdID -> identity source), parses the identity header itself,
-// and returns only the resolved fields — their raw transcript HTML (and the
-// grade table inside it) never reaches the client. A StdID that resolves to
-// no identity header fails with the stable VNU_CROSS_LOOKUP_NOT_FOUND code.
-async function vnuCrossStudentCode(params: { stdId: string }): Promise<VnuCrossStudentCode> {
-  return sanitizeCrossStudentCode(await request<VnuCrossStudentCode>(`/api/vnu/cross-lookup/student-code${queryString({ stdId: params.stdId, allowCrossLookup: "true" })}`));
-}
-
-export type VnuCrossStudentId = { stdId: string; stdCode: string; probes: number };
-
-// Cross-student student-code -> StdID resolver (crossLookup capability, vnu
-// only) — the reverse direction of vnuCrossStudentCode. The worker walks the
-// Brc1 oracle from the caller's own (StdID, code) anchor pair and returns
-// the zero-padded 11-digit internal id plus how many probes the walk took.
-// Same gating: explicit allowCrossLookup=true, self-target rejection, never
-// cached. An unresolvable code fails with VNU_CROSS_LOOKUP_NOT_CONVERGED
-// (surfaced as an inline empty state, not a session error).
-async function vnuCrossStudentId(params: { stdCode: string }): Promise<VnuCrossStudentId> {
-  return request<VnuCrossStudentId>(`/api/vnu/cross-lookup/student-id${queryString({ stdCode: params.stdCode, allowCrossLookup: "true" })}`);
-}
-
-export type VnuCrossTranscriptInput =
-  | { mode: "stdId"; stdId: string }
-  | { mode: "stdCode"; stdCode: string };
-
-async function vnuCrossTranscript(input: VnuCrossTranscriptInput): Promise<VnuCrossTranscript> {
-  const target = input.mode === "stdId" ? { stdId: input.stdId } : { stdCode: input.stdCode };
-  return sanitizeCrossTranscript(await request<VnuTranscript>(`/api/vnu/cross-lookup/transcript${queryString({ ...target, allowCrossLookup: "true" })}`));
-}
-
-function parseCrossDetailHtml(html: unknown): VnuCrossDetailComponent[] {
-  if (typeof html !== "string" || !isPointDetailPageHtml(html)) throw new ApiError("The university returned an invalid point-detail page.", "VNU_CROSS_DETAIL_RESPONSE_INVALID", 502);
-  return parsePointDetailHtml(html).components.map(({ index, nature, weight, attempt, score }) => ({ index, nature, weight, attempt, score }));
-}
-
-type CrossDetailWorkerItem = { permit: string; status: "ok"; html: string } | { permit: string; status: "error"; errorCode: string };
-
-function parseCrossDetailBatchResponse(value: unknown, permits: string[]): CrossDetailWorkerItem[] {
-  if (typeof value !== "object" || value === null || !Array.isArray((value as { items?: unknown }).items)) throw new ApiError("The cross-detail response is invalid.", "VNU_CROSS_DETAIL_RESPONSE_INVALID", 502);
-  const items = (value as { items: unknown[] }).items;
-  if (items.length !== permits.length) throw new ApiError("The cross-detail response is incomplete.", "VNU_CROSS_DETAIL_RESPONSE_INVALID", 502);
-  return items.map((item, index) => {
-    if (typeof item !== "object" || item === null || (item as { permit?: unknown }).permit !== permits[index]) throw new ApiError("The cross-detail response does not match its permits.", "VNU_CROSS_DETAIL_RESPONSE_INVALID", 502);
-    const candidate = item as { permit: unknown; status?: unknown; html?: unknown; errorCode?: unknown };
-    if (candidate.status === "ok" && typeof candidate.html === "string") return { permit: candidate.permit as string, status: "ok", html: candidate.html };
-    if (candidate.status === "error" && typeof candidate.errorCode === "string") return { permit: candidate.permit as string, status: "error", errorCode: candidate.errorCode };
-    throw new ApiError("The cross-detail response item is invalid.", "VNU_CROSS_DETAIL_RESPONSE_INVALID", 502);
-  });
-}
-
-async function vnuCrossDetailBulk(permits: string[], signal?: AbortSignal): Promise<VnuCrossDetailItem[]> {
-  const items = parseCrossDetailBatchResponse(await request<unknown>("/api/vnu/cross-lookup/detail/bulk", { method: "POST", body: JSON.stringify({ allowCrossLookup: true, permits }), signal }), permits);
-  return items.map((item) => {
-    if (item.status === "error") return item;
-    try {
-      return { permit: item.permit, status: "ok" as const, components: parseCrossDetailHtml(item.html) };
-    } catch {
-      return { permit: item.permit, status: "error" as const, errorCode: "VNU_CROSS_DETAIL_RESPONSE_INVALID" };
-    }
-  });
-}
-
-async function vnuCrossDetail(permit: string, signal?: AbortSignal): Promise<VnuCrossDetailComponent[]> {
-  const response = await request<{ permit: string; html: string }>("/api/vnu/cross-lookup/detail", { method: "POST", body: JSON.stringify({ allowCrossLookup: true, permit }), signal });
-  if (response.permit !== permit) throw new ApiError("The cross-detail response does not match its permit.", "VNU_CROSS_DETAIL_RESPONSE_INVALID", 502);
-  return parseCrossDetailHtml(response.html);
-}
-
-async function vnuCrossDetailExport(permits: string[], signal?: AbortSignal): Promise<VnuCrossDetailItem[]> {
-  const items = parseCrossDetailBatchResponse(await request<unknown>("/api/vnu/cross-lookup/detail/export", { method: "POST", body: JSON.stringify({ allowCrossLookup: true, permits }), signal }), permits);
-  return items.map((item) => {
-    if (item.status === "error") return item;
-    try {
-      return { permit: item.permit, status: "ok" as const, components: parseCrossDetailHtml(item.html) };
-    } catch {
-      return { permit: item.permit, status: "error" as const, errorCode: "VNU_CROSS_DETAIL_RESPONSE_INVALID" };
-    }
-  });
-}
-
-export type VnuBulkLookupMode = "stdid-to-code" | "code-to-stdid" | "stdid-to-transcript";
-export type VnuBulkLookupResult = VnuCrossStudentCode | VnuCrossStudentId | VnuCrossTranscript;
-export type VnuBulkLookupItem =
-  | { target: string; status: "ok"; result: VnuBulkLookupResult }
-  | { target: string; status: "error"; errorCode: string };
-
-async function vnuCrossLookupBulk(mode: VnuBulkLookupMode, targets: string[], signal?: AbortSignal): Promise<VnuBulkLookupItem[]> {
-  const response = await request<{ items: VnuBulkLookupItem[] }>("/api/vnu/cross-lookup/bulk", {
-    method: "POST",
-    body: JSON.stringify({ mode, targets, allowCrossLookup: true }),
-    signal,
-  });
-  return response.items.map((item) => {
-    if (item.status === "error") return item;
-    if (mode === "stdid-to-code") return { ...item, result: sanitizeCrossStudentCode(item.result as VnuCrossStudentCode) };
-    if (mode === "stdid-to-transcript") return { ...item, result: sanitizeCrossTranscript(item.result as VnuTranscript) };
-    const result = item.result as VnuCrossStudentId;
-    return { ...item, result: { stdId: result.stdId, stdCode: result.stdCode, probes: result.probes } };
-  });
-}
-
-async function vnuDocuments(): Promise<DocumentItem[]> {
-  return parseSyllabusHtml((await vnuRaw("syllabus")).html).map(mapSyllabusRow);
-}
-
-async function vnuTrainingPoints(): Promise<TrainingPoint[]> {
-  return mapTrainingPoints(parseStudyProgressHtml((await vnuRaw("progress")).html));
-}
+const vnu = createVnuClient(request);
+const uet = createUetClient(request);
 
 export const api = {
   universities: () => request<University[]>("/api/universities"),
-  dashboard: (universityId: string, termCode?: string) => universityId === "vnu" ? vnuDashboard() : request<DashboardSummary>(`/api/${universityId}/dashboard${termCode ? `?termCode=${encodeURIComponent(termCode)}` : ""}`),
-  terms: (universityId: string) => universityId === "vnu" ? vnuTerms() : request<Term[]>(`/api/${universityId}/terms`),
-  timetable: (universityId: string, termCode?: string) => request<ClassSession[]>(`/api/${universityId}/timetable${termCode ? `?termCode=${encodeURIComponent(termCode)}` : ""}`),
+  profile: (universityId: string) => universityId === "uet" ? uet.profile() : request<Student>(`/api/${universityId}/me`),
+  dashboard: (universityId: string, termCode?: string) => universityId === "vnu" ? vnu.dashboard() : request<DashboardSummary>(`/api/${universityId}/dashboard${termCode ? `?termCode=${encodeURIComponent(termCode)}` : ""}`),
+  terms: (universityId: string) => universityId === "vnu" ? vnu.terms() : universityId === "uet" ? uet.terms() : request<Term[]>(`/api/${universityId}/terms`),
+  timetable: (universityId: string, termCode?: string) => universityId === "uet" ? uet.timetable(termCode) : request<ClassSession[]>(`/api/${universityId}/timetable${termCode ? `?termCode=${encodeURIComponent(termCode)}` : ""}`),
   courses: (universityId: string) => request<Course[]>(`/api/${universityId}/courses`),
   assignments: (universityId: string) => request<Assignment[]>(`/api/${universityId}/assignments`),
-  grades: (universityId: string) => universityId === "vnu" ? vnuGrades() : request<Grade[]>(`/api/${universityId}/grades`),
-  exams: (universityId: string, termCode?: string) => universityId === "vnu" ? vnuExams(termCode) : request<ExamSession[]>(`/api/${universityId}/exams${termCode ? `?termCode=${encodeURIComponent(termCode)}` : ""}`),
-  documents: (universityId: string) => universityId === "vnu" ? vnuDocuments() : request<DocumentItem[]>(`/api/${universityId}/documents`),
-  tuition: (universityId: string) => request<TuitionStatus>(`/api/${universityId}/tuition`),
-  news: (universityId: string) => request<NewsItem[]>(`/api/${universityId}/news`),
-  trainingPoints: (universityId: string) => universityId === "vnu" ? vnuTrainingPoints() : request<TrainingPoint[]>(`/api/${universityId}/training-points`),
+  grades: (universityId: string) => universityId === "vnu" ? vnu.grades() : universityId === "uet" ? uet.grades() : request<Grade[]>(`/api/${universityId}/grades`),
+  gpa: (universityId: string) => universityId === "uet" ? uet.gpa() : request<GpaSummary>(`/api/${universityId}/gpa`),
+  exams: (universityId: string, termCode?: string) => universityId === "vnu" ? vnu.exams(termCode) : universityId === "uet" ? uet.exams(termCode) : request<ExamSession[]>(`/api/${universityId}/exams${termCode ? `?termCode=${encodeURIComponent(termCode)}` : ""}`),
+  documents: (universityId: string) => universityId === "vnu" ? vnu.documents() : request<DocumentItem[]>(`/api/${universityId}/documents`),
+  tuition: (universityId: string) => universityId === "uet" ? uet.tuition() : request<TuitionStatus>(`/api/${universityId}/tuition`),
+  news: (universityId: string) => universityId === "uet" ? uet.news() : request<NewsItem[]>(`/api/${universityId}/news`),
+  trainingPoints: (universityId: string) => universityId === "vnu" ? vnu.trainingPoints() : request<TrainingPoint[]>(`/api/${universityId}/training-points`),
   requests: (universityId: string) => request<ServiceRequest[]>(`/api/${universityId}/requests`),
   // vnu (daotao)-only class-code -> internal-id lookup tool - see the
   // classLookup capability flag, gated in the UI before these are called.
-  vnuOwnProfile: () => vnuOwnProfile(),
-  vnuClassCatalog: (params: { vTermID: string }, signal?: AbortSignal) => vnuClassCatalog(params, signal),
-  vnuPointDetail: (params: { id: string; Term: string }) => vnuPointDetail(params),
-  vnuCrossStudentCode: (params: { stdId: string }) => vnuCrossStudentCode(params),
-  vnuCrossStudentId: (params: { stdCode: string }) => vnuCrossStudentId(params),
-  vnuCrossTranscript: (input: VnuCrossTranscriptInput) => vnuCrossTranscript(input),
-  vnuCrossDetail: (permit: string, signal?: AbortSignal) => vnuCrossDetail(permit, signal),
-  vnuCrossDetailBulk: (permits: string[], signal?: AbortSignal) => vnuCrossDetailBulk(permits, signal),
-  vnuCrossDetailExport: (permits: string[], signal?: AbortSignal) => vnuCrossDetailExport(permits, signal),
-  vnuCrossLookupBulk: (mode: VnuBulkLookupMode, targets: string[], signal?: AbortSignal) => vnuCrossLookupBulk(mode, targets, signal),
+  vnuOwnProfile: () => vnu.ownProfile(),
+  vnuClassCatalog: (params: { vTermID: string }, signal?: AbortSignal) => vnu.classCatalog(params, signal),
+  vnuPointDetail: (params: { id: string; Term: string }) => vnu.pointDetail(params),
+  vnuCrossStudentCode: (params: { stdId: string }) => vnu.crossStudentCode(params),
+  vnuCrossStudentId: (params: { stdCode: string }) => vnu.crossStudentId(params),
+  vnuCrossTranscript: (input: VnuCrossTranscriptInput) => vnu.crossTranscript(input),
+  vnuCrossDetail: (permit: string, signal?: AbortSignal) => vnu.crossDetail(permit, signal),
+  vnuCrossDetailBulk: (permits: string[], signal?: AbortSignal) => vnu.crossDetailBulk(permits, signal),
+  vnuCrossDetailExport: (permits: string[], signal?: AbortSignal) => vnu.crossDetailExport(permits, signal),
+  vnuCrossLookupBulk: (mode: VnuBulkLookupMode, targets: string[], signal?: AbortSignal) => vnu.crossLookupBulk(mode, targets, signal),
   importSession: async (universityId: string, body: ImportSessionInput): Promise<ImportedAccountResult> => {
     const auth = await request<AuthResult>(`/api/${universityId}/auth/import-session`, { method: "POST", body: JSON.stringify(body) });
     const account = commitImportedAccount(universityId, auth);
