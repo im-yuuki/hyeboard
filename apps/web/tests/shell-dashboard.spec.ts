@@ -120,6 +120,8 @@ test("sidebar collapses and expands via toggle button", async ({ authenticatedPa
   await expect(page.getByText("Demo", { exact: true })).toBeHidden();
   await expect(page.getByText(/Powered by Hyeboard/)).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Expand sidebar" })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Utility/ })).toHaveCount(0);
+  await expect(page.getByRole("link", { name: "Lookup" })).toHaveCount(0);
   await expect.poll(async () => {
     const logoBox = await page.locator("aside [data-testid='brand-icon']").boundingBox();
     const expandBox = await page.getByRole("button", { name: "Expand sidebar" }).boundingBox();
@@ -133,15 +135,23 @@ test("sidebar collapses and expands via toggle button", async ({ authenticatedPa
   await expect(page.getByText("Demo", { exact: true }).first()).toBeVisible();
 });
 
-test("Utility accordion expands Lookup and persists on desktop", async ({ page, isMobile }) => {
+test("Utility accordion forces open on Lookup and persists on desktop", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop-only sidebar, hidden below the lg breakpoint on mobile");
+  await page.addInitScript(() => {
+    if (localStorage.getItem("hyeboard.utilityOpen") === null) localStorage.setItem("hyeboard.utilityOpen", "false");
+  });
   await openMockedLookup(page);
-  await page.goto("/");
 
-  const utility = page.getByRole("button", { name: "Expand Utility" });
-  await utility.click();
-  await expect(page.getByRole("button", { name: "Collapse Utility" })).toHaveAttribute("aria-expanded", "true");
-  await expect(page.getByRole("link", { name: "Lookup" })).toBeVisible();
+  const utility = page.getByRole("button", { name: "Collapse Utility" });
+  const controls = await utility.getAttribute("aria-controls");
+  expect(controls).not.toBeNull();
+  const lookup = page.locator(`#${controls}`).getByRole("link", { name: "Lookup" });
+  await expect(page.locator(`#${controls}`)).toBeVisible();
+  await expect(lookup).toHaveAttribute("aria-current", "page");
+
+  await page.goto("/");
+  await expect(page.getByRole("button", { name: "Expand Utility" })).toHaveAttribute("aria-expanded", "false");
+  await page.getByRole("button", { name: "Expand Utility" }).click();
   await page.reload();
   await expect(page.getByRole("button", { name: "Collapse Utility" })).toHaveAttribute("aria-expanded", "true");
 });

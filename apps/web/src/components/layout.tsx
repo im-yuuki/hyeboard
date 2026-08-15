@@ -82,7 +82,7 @@ function SidebarNav({
                 {visibleItems.map((item) => <NavLink key={item.to} to={item.to} label={t.nav[item.key]} icon={item.icon} collapsed={collapsed} mobile={mobile} onClick={onNavigate} />)}
               </div>
             ) : null}
-            {group.key === "utilities" && lookupVisible ? (
+            {group.key === "utilities" && lookupVisible && !collapsed ? (
               <div className="space-y-1">
                 <button
                   type="button"
