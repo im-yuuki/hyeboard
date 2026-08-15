@@ -113,7 +113,7 @@ test("VNU reconnect status is localized", async ({ page }) => {
 
 test("VNU committed event stays inactive after switching accounts", async ({ page, isMobile }) => {
   const counts = await seedVnuReconnectScenario(page);
-  const switchedTimetable = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/uet/timetable");
+  const switchedTimetable = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/uet/raw/timetable");
   await page.getByTestId("account-trigger").click();
   await page.getByTestId("account-switch-item").filter({ hasText: "(UET)" }).click();
   await switchedTimetable;
@@ -121,7 +121,7 @@ test("VNU committed event stays inactive after switching accounts", async ({ pag
   await page.evaluate(() => window.dispatchEvent(new CustomEvent("hyeboard:vnu-refresh-committed", { detail: { accountId: "synthetic-vnu-active" } })));
   await clickVisibleNavigationLink(page, "/settings", isMobile);
   await expect(page).toHaveURL(/\/settings$/);
-  const returnedTimetable = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/uet/timetable");
+  const returnedTimetable = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/uet/raw/timetable");
   await page.goto("/timetable");
   await returnedTimetable;
   expect(counts.vnuTimetable).toBe(afterSwitch.vnuTimetable);

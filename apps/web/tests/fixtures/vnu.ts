@@ -124,7 +124,7 @@ export async function seedVnuReconnectScenario(
     counts.vnuTimetable += 1;
     return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: [], error: null }) });
   });
-  await page.route("**/api/uet/timetable**", (route) => {
+  await page.route("**/api/uet/raw/timetable**", (route) => {
     counts.uetTimetable += 1;
     return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: [], error: null }) });
   });
