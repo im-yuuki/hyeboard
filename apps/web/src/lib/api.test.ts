@@ -112,6 +112,28 @@ async function requestCrossLookup(): Promise<void> {
   await api.vnuCrossStudentId({ stdCode: "SYNTHETIC-STUDENT" });
 }
 
+describe("UET raw client mapping", () => {
+  beforeEach(() => {
+    vi.stubGlobal("localStorage", new MemoryStorage());
+    vi.stubGlobal("sessionStorage", new MemoryStorage());
+    vi.stubGlobal("window", { dispatchEvent: vi.fn() });
+    vi.stubGlobal("CustomEvent", class { constructor(readonly type: string) {} });
+    localStorage.setItem("hyeboard.accounts", JSON.stringify([UET_ACCOUNT]));
+    localStorage.setItem("hyeboard.activeAccountId", UET_ACCOUNT.id);
+  });
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("maps a raw StudentHub grade response", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonOk([{ pointCode: "SYN-GRADE", courseCode: "SYN101", name: "Synthetic course", point4: "3.5", point10: "8.5" }])));
+
+    await expect(api.grades("uet")).resolves.toEqual([{
+      id: "SYN-GRADE", courseCode: "SYN101", courseName: "Synthetic course", credits: undefined, termCode: undefined, point4: 3.5, point10: 8.5,
+    }]);
+    expect(fetch).toHaveBeenCalledWith("/api/uet/raw/grades", expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer stored-uet-session-token" }) }));
+  });
+});
+
 describe("frontend session-death policy", () => {
   beforeEach(() => {
     vi.stubGlobal("localStorage", new MemoryStorage());

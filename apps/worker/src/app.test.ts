@@ -1,5 +1,6 @@
 import { configureLogger, createVnuRefreshGrant, decryptSession, decryptSessionForVnuLogout, decryptVnuRefreshGrant, encryptSession, encryptVnuRefreshGrant, HyeboardError, VNU_REFRESH_GRANT_MAX_LENGTH, type EncryptedSessionPayload } from "@hyeboard/core";
 import { DaotaoClient, parseGradesHtml } from "@hyeboard/university-adapters";
+import { StudentHubClient } from "@hyeboard/university-adapters/src/uet/studenthub-client";
 import { authResultSchema } from "@hyeboard/schemas";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -93,6 +94,16 @@ function parentSession(): EncryptedSessionPayload {
     studentCode: "ACCOUNT_FIELD_SENTINEL",
     uetParentCredential: { username: "PARENT_USERNAME_SENTINEL", password: "PARENT_PASSWORD_SENTINEL" },
     studenthub: { kind: "bearer", value: "ACCESS_TOKEN_SENTINEL", expiresAt: "2000-01-01T00:00:00.000Z" },
+    expiresAt: "2099-01-01T00:00:00.000Z",
+  };
+}
+
+function rawUetSession(): EncryptedSessionPayload {
+  return {
+    version: 1,
+    universityId: "uet",
+    studentCode: "SYNTHETIC-UET",
+    studenthub: { kind: "bearer", value: "SYNTHETIC_STUDENTHUB_TOKEN", expiresAt: "2099-01-01T00:00:00.000Z" },
     expiresAt: "2099-01-01T00:00:00.000Z",
   };
 }
@@ -344,7 +355,6 @@ function productionRefreshAuthorityHarness(
       return output.result;
     });
   };
-  const unsupported = async (): Promise<never> => { throw new Error("not used"); };
   const stub: VnuRefreshControlStub = {
     activatePair: (pair) => mutate((state, now) => applyActivatePair(state, pair, now)),
     checkAccess: (pair) => checkAccessAuthoritatively(storage, pair, Date.now()),
@@ -4170,6 +4180,47 @@ describe("VNU cross-transcript route", () => {
     });
   });
 
+});
+
+describe("UET raw read routes", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET });
+  });
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it("rejects unauthenticated and unknown raw resources", async () => {
+    const app = createApp(undefined);
+    const token = await encryptSession(rawUetSession(), SESSION_SECRET);
+
+    const unauthenticated = await app.handle(new Request("http://localhost/api/uet/raw/profile"));
+    const unknown = await app.handle(new Request("http://localhost/api/uet/raw/not-a-resource", {
+      headers: { Authorization: `Bearer ${token}` },
+    }));
+
+    expect(unauthenticated.status).toBe(401);
+    expect(unauthenticated.headers.get("Cache-Control")).toBe("no-store, private");
+    expect(unknown.status).toBe(404);
+    expect(unknown.headers.get("Cache-Control")).toBe("no-store, private");
+    await expect(unknown.json()).resolves.toMatchObject({ error: { code: "UET_RAW_RESOURCE_UNKNOWN" } });
+  });
+
+  it("returns only an allowlisted unwrapped StudentHub payload", async () => {
+    const timetable = [{ courseCode: "SYN101", termCode: "251", sessionStart: 1 }];
+    const getTimetable = vi.spyOn(StudentHubClient.prototype, "getTimetable").mockResolvedValue(timetable);
+    const app = createApp(undefined);
+    const token = await encryptSession(rawUetSession(), SESSION_SECRET);
+
+    const response = await app.handle(new Request("http://localhost/api/uet/raw/timetable?termCode=251", {
+      headers: { Authorization: `Bearer ${token}` },
+    }));
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Cache-Control")).toBe("no-store, private");
+    await expect(response.json()).resolves.toEqual({ data: timetable, error: null });
+    expect(getTimetable).toHaveBeenCalledWith("251");
+  });
 });
 
 describe("VNU cross-detail HTTP routes", () => {

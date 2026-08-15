@@ -2,6 +2,7 @@ import { cors } from "@elysiajs/cors";
 import { createVnuRefreshAccessDescriptor, createVnuRefreshGrant, decryptSession, decryptSessionForVnuLogout, decryptSessionForVnuRefresh, decryptVnuCrossDetailPermitEnvelope, decryptVnuRefreshGrant, decryptVnuRefreshGrantForLogout, deriveVnuRefreshPrincipal, encryptSession, encryptVnuRefreshGrant, fail, getLogger, HyeboardError, isExpired, ok, parseBearerToken, rotateVnuRefreshGrant, VNU_REFRESH_GRANT_MAX_LENGTH, type EncryptedSessionPayload, type VnuRefreshAccessDescriptor, type VnuRefreshGrantPayload } from "@hyeboard/core";
 import { apiErrorDetailsSchema, type AuthResult } from "@hyeboard/schemas";
 import { DaotaoClient, findPointDetailSelector, getAdapter, isDaotaoSessionExpired, listUniversities, parseProfileHtml, parseTranscriptHeader, parseTranscriptHtml, type BrowserBinding, type BrowserConnection, type VnuTranscript } from "@hyeboard/university-adapters";
+import { StudentHubClient } from "@hyeboard/university-adapters/src/uet/studenthub-client";
 import { Elysia, t } from "elysia";
 import { LocalCaptchaRelayCoordinator, captchaRelayCancelled, captchaRelayNotFound, type CaptchaRelayCoordinator, type PreparedCaptchaRelay } from "./captcha-relay";
 import { probeBudgetUnavailable, VNU_BRC1_PERMIT_LIMIT, type VnuProbeBudgetCoordinator } from "./vnu-probe-budget";
@@ -348,7 +349,7 @@ async function decryptAuthenticatedLegacyVnuSession(token: string, secret: strin
     const value: unknown = JSON.parse(new TextDecoder().decode(decrypted));
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid legacy session");
     const payload = value as Record<string, unknown>;
-    if (Object.prototype.hasOwnProperty.call(payload, "vnuRefresh")) throw new Error("Descriptor-bearing session is not legacy");
+    if (Object.hasOwn(payload, "vnuRefresh")) throw new Error("Descriptor-bearing session is not legacy");
     if (payload.version !== 1 || payload.universityId !== "vnu" || typeof payload.expiresAt !== "string" || new Date(payload.expiresAt).toISOString() !== payload.expiresAt) throw new Error("Invalid legacy session");
     if (!payload.vnu || typeof payload.vnu !== "object" || Array.isArray(payload.vnu)) throw new Error("Invalid legacy session");
     const credential = payload.vnu as Record<string, unknown>;
@@ -403,7 +404,7 @@ function routeError(error: unknown, requestId?: string, requestUrl?: string) {
   const isVnuRoute = requestPath?.startsWith("/api/vnu/") ?? false;
   const isVnuAuthMutation = requestPath === "/api/vnu/auth/refresh" || requestPath === "/api/vnu/auth/logout";
   const isVnuRawExpiry = requestPath?.startsWith("/api/vnu/raw/") && error instanceof HyeboardError && error.code === "VNU_SESSION_EXPIRED";
-  if (isVnuCrossDetailResponsePath(requestPath)) headers.set("Cache-Control", "no-store, private");
+  if (isVnuCrossDetailResponsePath(requestPath) || requestPath?.startsWith("/api/uet/raw/")) headers.set("Cache-Control", "no-store, private");
   else if (requestPath?.startsWith("/api/vnu/cross-lookup/") || isVnuAuthMutation || isVnuRawExpiry) headers.set("Cache-Control", "no-store");
   if (error instanceof HyeboardError) {
     const level = error.status >= 500 ? "error" : "warn";
@@ -528,6 +529,21 @@ async function parseStrictVnuAuthBody(request: Request, kind: "refresh" | "logou
 }
 
 const termCodeQuery = t.Object({ termCode: t.Optional(t.String()) });
+
+async function uetRawRead(session: EncryptedSessionPayload, resource: string, termCode?: string): Promise<unknown> {
+  const client = new StudentHubClient(session);
+  switch (resource) {
+    case "profile": return client.getProfile();
+    case "terms": return client.getTerms();
+    case "timetable": return client.getTimetable(termCode);
+    case "grades": return client.getGrades();
+    case "gpa": return client.getGpa();
+    case "exams": return client.getExams(termCode);
+    case "tuition": return client.getBills();
+    case "news": return client.getNews();
+    default: throw new HyeboardError("UET_RAW_RESOURCE_UNKNOWN", "Unknown UET raw resource", 404);
+  }
+}
 
 const vnuRawQuery = t.Object({
   // selUniv/selStd are still accepted so stale clients don't break, but they
@@ -1465,7 +1481,7 @@ export function createApp(adapter: any) {
       req._hyebReqId = requestId();
       req._hyebStart = Date.now();
       const path = new URL(request.url).pathname;
-       if (isVnuCrossDetailResponsePath(path)) set.headers["Cache-Control"] = "no-store, private";
+       if (isVnuCrossDetailResponsePath(path) || path.startsWith("/api/uet/raw/")) set.headers["Cache-Control"] = "no-store, private";
        else if (path.startsWith("/api/vnu/cross-lookup/") || path === "/api/vnu/auth/import-session" || path === "/api/vnu/auth/refresh" || path === "/api/vnu/auth/logout") set.headers["Cache-Control"] = "no-store";
       // Set HYEB_LOG_LEVEL=debug (Node/Bun .env, or a Cloudflare secret/var)
       // to see one line per incoming request here.
@@ -2044,7 +2060,6 @@ export function createApp(adapter: any) {
             const transcript = parseVnuCrossLookupTranscript(await withVnuOraclePermit(session, deadline.signal, (signal) => client.getTranscriptByStdIdHtml(target, signal)));
             if (!transcript.header.studentCode) throw new HyeboardError("VNU_CROSS_LOOKUP_NOT_FOUND", "Student not found", 404);
             items.push({ target, status: "ok", result: transcript });
-            continue;
           }
         } catch (error) {
           if (!isIsolatedBulkLookupError(error)) throw error;
@@ -2061,6 +2076,25 @@ export function createApp(adapter: any) {
         deadline.cancel();
       }
     }, { parse: "none" })
+
+    .group("/api/uet", (g) =>
+      g
+        .resolve(async ({ headers }) => {
+          const { session, refreshedToken } = await resolveSession(headers);
+          if (session.universityId !== "uet") throw new HyeboardError("SESSION_UNIVERSITY_MISMATCH", "Session university does not match route", 403);
+          return { session, refreshedToken };
+        })
+        .onAfterHandle(({ response, refreshedToken }) => {
+          if (!refreshedToken || !response || typeof response !== "object") return response;
+          const typed = response as { data?: unknown; error?: unknown; meta?: Record<string, unknown> };
+          if (!("data" in typed)) return response;
+          return { ...typed, meta: { ...(typed.meta ?? {}), refreshedToken } };
+        })
+        .get("/raw/:resource", async ({ session, params, query, set }) => {
+          set.headers["Cache-Control"] = "no-store, private";
+          return ok(await uetRawRead(session, params.resource, query.termCode));
+        }, { query: termCodeQuery }),
+    )
 
     // ── Authenticated — session+adapter injected via resolve() ──
     .group("/api/:universityId", (g) =>
