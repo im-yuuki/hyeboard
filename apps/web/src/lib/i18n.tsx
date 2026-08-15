@@ -22,6 +22,9 @@ function buildDictionary() {
       documents: "Documents",
       trainingPoints: "Training Points",
       lookup: "Lookup",
+      utility: "Utility",
+      expandUtility: "Expand Utility",
+      collapseUtility: "Collapse Utility",
       settings: "Settings",
       groups: {
         overview: "Overview",
@@ -519,6 +522,9 @@ function vi(): typeof en {
       documents: "Tài liệu",
       trainingPoints: "Điểm rèn luyện",
       lookup: "Tra cứu",
+      utility: "Tiện ích",
+      expandUtility: "Mở rộng Tiện ích",
+      collapseUtility: "Thu gọn Tiện ích",
       settings: "Cài đặt",
       groups: {
         overview: "Tổng quan",

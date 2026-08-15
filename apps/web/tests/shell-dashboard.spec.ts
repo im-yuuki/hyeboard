@@ -1,4 +1,5 @@
 import { test, expect, authenticateDemoPage, loginDemoThroughUi, expectNoPageOverflow, REFERENCE_VIEWPORTS } from "./fixtures/base";
+import { openMockedLookup } from "./fixtures/lookup";
 
 for (const viewport of REFERENCE_VIEWPORTS.slice(2)) {
   test(`login, dashboard, timetable, and grades have no horizontal overflow at ${viewport.width}x${viewport.height}`, async ({ page }) => {
@@ -130,6 +131,31 @@ test("sidebar collapses and expands via toggle button", async ({ authenticatedPa
   await expect(page.locator(".app-shell")).toHaveCSS("transition-property", /grid-template-columns/);
   await page.getByRole("button", { name: "Expand sidebar" }).click();
   await expect(page.getByText("Demo", { exact: true }).first()).toBeVisible();
+});
+
+test("Utility accordion expands Lookup and persists on desktop", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop-only sidebar, hidden below the lg breakpoint on mobile");
+  await openMockedLookup(page);
+  await page.goto("/");
+
+  const utility = page.getByRole("button", { name: "Expand Utility" });
+  await utility.click();
+  await expect(utility).toHaveAttribute("aria-expanded", "true");
+  await expect(page.getByRole("link", { name: "Lookup" })).toBeVisible();
+  await page.reload();
+  await expect(page.getByRole("button", { name: "Collapse Utility" })).toHaveAttribute("aria-expanded", "true");
+});
+
+test("Utility accordion opens Lookup in the mobile navigation drawer", async ({ page }) => {
+  await openMockedLookup(page);
+  await page.setViewportSize({ width: 500, height: 900 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open navigation menu" }).click();
+  const drawer = page.getByRole("dialog");
+  await drawer.getByRole("button", { name: /Utility/ }).click();
+  await expect(drawer.getByRole("link", { name: "Lookup" })).toBeVisible();
+  await drawer.getByRole("link", { name: "Lookup" }).click();
+  await expect(page).toHaveURL(/\/lookup$/);
 });
 
 test("mobile nav drawer opens and closes on navigation @webkit", async ({ authenticatedPage: page }) => {
