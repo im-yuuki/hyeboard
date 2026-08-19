@@ -10,7 +10,8 @@
 # Every other Hyeboard feature works without this container.
 services:
   chrome:
-    image: ghcr.io/browserless/chromium:1.61.0
+    # Multi-architecture manifest digest; avoids silently tracking `latest`.
+    image: ghcr.io/browserless/chromium@sha256:13d15859796b8a0f72cf713e86c7dd02f181d23f2efa4a377ba683b3e9a7bbf6
     ports:
       - "3000:3000"
     restart: unless-stopped
