@@ -10,6 +10,8 @@ This package is a Node-only execution boundary for encrypted automation jobs.
 - Provide `createBrowserlessPuppeteerProvider` with `puppeteer.connect` (or a compatible connector). The Browserless token remains in the provider closure and is not present in connection metadata.
 - Call `start()`, install `installProcessSignalHandlers()`, and call `stop()` during application shutdown. `stop()` cancels active work, waits up to the configured drain timeout, and leaves shutdown-interrupted stream entries pending.
 
+The executable host bridge is available through `src/cli.ts` (bundled as `dist/cli.cjs`). It owns the Redis clients and Browserless/Puppeteer provider, creates the UET executor, and starts the worker/control lifecycle. The UET adapter receives the provider-owned Puppeteer session and verifies ownership before browser operations.
+
 ## Message contract
 
 The job stream entry must contain `jobEnvelope`, an encrypted `UetImportJob` envelope using the configured job AAD. The job's `credentialEnvelope` is opened only inside the executor boundary. Successful executor output is encrypted before the `succeeded` event is emitted.
@@ -23,3 +25,5 @@ The event sink is injectable. `StreamAutomationEventSink` writes JSON events to 
 - Fencing is represented in leases and every protocol event. Event/result consumers must reject stale fences atomically with their own state transition.
 - Retryable failures remain pending until reclaim and are not emitted as terminal events. A final failure is acknowledged after `maxDeliveryCount`.
 - Cancellation is cooperative. An executor that ignores `AbortSignal` can outlive the configured drain timeout; it will not be acknowledged after shutdown.
+
+The host bridge has not been validated by a real Browserless end-to-end login because no upstream credentials are available and the Browserless image pull may be unavailable. The live PostgreSQL and Redis HA tests pass, but those results do not establish full feature parity or Kubernetes readiness.

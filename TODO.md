@@ -36,7 +36,7 @@ Status: approved and in progress. Kubernetes manifests are intentionally deferre
 - [x] Add authoritative generic session revocation using HMAC-derived opaque IDs.
 - [x] Add migration idempotency, concurrency, rollback, and outage test scaffolding.
 - [x] Keep all PostgreSQL imports unreachable from the Cloudflare bundle.
-- [ ] Run live PostgreSQL integration tests with Docker/Testcontainers.
+- [x] Run live PostgreSQL integration tests with Docker/Testcontainers; latest run passed.
 
 ### Batch 3 — Redis primitives and coordinators
 
@@ -45,7 +45,7 @@ Status: approved and in progress. Kubernetes manifests are intentionally deferre
 - [x] Add Redis VNU probe budget, permit, semaphore, and lease coordinators.
 - [x] Move shared cache and coordination primitives to Redis in distributed mode.
 - [x] Preserve existing Cloudflare coordinators and public error semantics.
-- [ ] Run live Redis integration tests with Docker/Testcontainers.
+- [x] Run live Redis integration tests with Docker/Testcontainers; latest run passed.
 
 ### Batch 4 — Cancellation-aware adapter
 
@@ -60,9 +60,10 @@ Status: approved and in progress. Kubernetes manifests are intentionally deferre
 - [x] Add Redis Streams job/event protocol with replay, cancellation, deadlines, retries, and fencing foundation.
 - [x] Add dedicated automation worker with consumer-group reclaim and graceful drain foundation.
 - [x] Add Browserless provider with reconnect endpoint, lease, and fencing foundation.
-- [ ] Move OCR/browser ownership out of the API process in distributed mode.
+- [x] Move OCR/browser ownership out of the API process in distributed mode through the host CLI bridge and worker-owned Puppeteer session.
 - [x] Wire the API UET login/refresh flow to enqueue jobs and consume events/results.
-- [ ] Supply the real UET executor/Browserless connection bridge and enable it only after end-to-end verification.
+- [x] Supply the real UET executor/Browserless connection bridge through the host CLI and UET adapter.
+- [ ] Run a real Browserless end-to-end login with upstream credentials; credentials are unavailable and the Browserless image pull may be unavailable.
 
 ### Batch 6 — API/startup integration
 
@@ -82,7 +83,7 @@ Status: approved and in progress. Kubernetes manifests are intentionally deferre
 
 - [x] Add opt-in Testcontainers Redis/PostgreSQL integration suite.
 - [x] Add two-process round-robin and worker crash/reclaim harness scaffolding.
-- [ ] Run live two-process/failure-injection tests with Docker images available.
+- [x] Run live two-process/failure-injection tests with Docker images available; PostgreSQL and Redis HA runs passed.
 - [x] Update README, architecture docs, and HA runbook.
 
 ## Parallel subagent execution

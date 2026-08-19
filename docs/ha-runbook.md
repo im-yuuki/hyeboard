@@ -99,9 +99,9 @@ The standalone `apps/automation-worker` and `packages/automation-protocol` found
 - Redis Streams consumer groups, pending-message reclaim, job leases, fencing, heartbeats, retries, cancellation, and bounded shutdown drain.
 - A Browserless/Puppeteer provider with reconnect metadata and no token in exposed connection metadata.
 
-The distributed API now enqueues encrypted UET jobs, consumes validated event/result streams, and exposes signed CAPTCHA answer/cancel controls. The remaining integration is the host bridge that supplies a real UET executor and an already-open Browserless connection to `apps/automation-worker`; the package-level executor and protocol hooks fail closed until that bridge is supplied.
+The distributed API now enqueues encrypted UET jobs, consumes validated event/result streams, and exposes signed CAPTCHA answer/cancel controls. The executable host CLI bridge in `apps/automation-worker` supplies the UET executor and Browserless/Puppeteer provider, and the UET adapter uses the worker-owned Puppeteer session with ownership checks around browser work. `AUTOMATION_EXECUTOR_READY` remains an explicit deployment gate; the bridge does not by itself establish full feature parity.
 
-Therefore do not claim distributed browser-automation feature parity yet. In distributed API mode, inline Google browser automation is rejected with `AUTOMATION_BACKEND_UNCONFIGURED`, and the queue backend remains unavailable unless `AUTOMATION_EXECUTOR_READY=true` is explicitly configured after the external executor bridge is deployed. Manual credential paths that do not need a browser remain governed by their existing adapter behavior.
+In distributed API mode, inline Google browser automation is rejected with `AUTOMATION_BACKEND_UNCONFIGURED`, and the queue backend remains unavailable unless `AUTOMATION_EXECUTOR_READY=true` is explicitly configured. A real Browserless end-to-end login has not run: no upstream credentials are available, and the Browserless image pull may be unavailable. Manual credential paths that do not need a browser remain governed by their existing adapter behavior.
 
 Patchright is prohibited in distributed mode. The API rejects `HYEB_BROWSER_PATCHRIGHT=true` in distributed HA mode, and the automation worker rejects `AUTOMATION_EXECUTION_MODE=distributed` with `AUTOMATION_BROWSER_PROVIDER=patchright`. Patchright is available only for local/single-worker execution. Distributed automation must use Browserless/Puppeteer.
 
@@ -129,6 +129,8 @@ pnpm test:ha
 ```
 
 The PostgreSQL suite checks shared session revocation, refresh serialization, outage behavior, readiness, and SIGTERM drain across two worker processes. The Redis suite checks cross-process refresh coordination, CAPTCHA relay, Redis outage behavior, readiness/liveness separation, and SIGTERM drain. If Docker or an image is unavailable, the suites report a skip rather than a fake passing integration result.
+
+The latest live PostgreSQL and Redis HA runs passed. These results verify the shared-dependency and failure-handling foundation only; they do not verify a real Browserless login or Kubernetes deployment.
 
 ## Kubernetes Gate
 
