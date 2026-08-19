@@ -63,7 +63,7 @@ Status: approved and in progress. Kubernetes manifests are intentionally deferre
 - [x] Move OCR/browser ownership out of the API process in distributed mode through the host CLI bridge and worker-owned Puppeteer session.
 - [x] Wire the API UET login/refresh flow to enqueue jobs and consume events/results.
 - [x] Supply the real UET executor/Browserless connection bridge through the host CLI and UET adapter.
-- [ ] Run a real Browserless end-to-end login with upstream credentials; credentials are unavailable and the Browserless image pull may be unavailable.
+- [ ] Run a real UET/Google login E2E with upstream credentials; credentials are unavailable. The pinned `ghcr.io/browserless/chromium:v2.55.4` image was pulled manually and started successfully, and a live Puppeteer CDP smoke test passed against `ws://127.0.0.1:3000/chromium`, including a token query.
 
 ### Batch 6 — API/startup integration
 

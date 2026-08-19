@@ -26,4 +26,4 @@ The event sink is injectable. `StreamAutomationEventSink` writes JSON events to 
 - Retryable failures remain pending until reclaim and are not emitted as terminal events. A final failure is acknowledged after `maxDeliveryCount`.
 - Cancellation is cooperative. An executor that ignores `AbortSignal` can outlive the configured drain timeout; it will not be acknowledged after shutdown.
 
-The host bridge has not been validated by a real Browserless end-to-end login because no upstream credentials are available and the Browserless image pull may be unavailable. The live PostgreSQL and Redis HA tests pass, but those results do not establish full feature parity or Kubernetes readiness.
+The Browserless image is pinned to `ghcr.io/browserless/chromium:v2.55.4`, was pulled manually, and started successfully; a live Puppeteer CDP smoke test passed against `ws://127.0.0.1:3000/chromium`, including a token query. The host bridge has not been validated by a real UET/Google login E2E because upstream credentials are unavailable. The live PostgreSQL and Redis HA tests pass, but those results do not establish full feature parity or Kubernetes readiness.
