@@ -63,7 +63,7 @@ Status: approved and in progress. Kubernetes manifests are intentionally deferre
 - [x] Move OCR/browser ownership out of the API process in distributed mode through the host CLI bridge and worker-owned Puppeteer session.
 - [x] Wire the API UET login/refresh flow to enqueue jobs and consume events/results.
 - [x] Supply the real UET executor/Browserless connection bridge through the host CLI and UET adapter.
-- [ ] Run a real UET/Google login E2E with upstream credentials; credentials are unavailable. The pinned `ghcr.io/browserless/chromium:v2.55.4` image was pulled manually and started successfully, and a live Puppeteer CDP smoke test passed against `ws://127.0.0.1:3000/chromium`, including a token query.
+- [ ] Make the real distributed Browserless/UET Google login pass. The run used credentials supplied through the local ignored `.env`, local PostgreSQL/Redis, the API, and the automation worker. `/api/ready` reached ready and `pnpm test:ha` passed PostgreSQL 5/5 and Redis 4/4, but login progress `0, 10, 35, 35, 60` ended with HTTP 502 `GOOGLE_SIGNIN_FAILURE`; the worker logged Puppeteer `Attempted to use detached Frame ...` while waiting for Keycloak `#username`. The pinned `ghcr.io/browserless/chromium:v2.55.4` image and CDP smoke test passed. The node-redis stream read-shape fix is committed as `f7c78fd`.
 
 ### Batch 6 — API/startup integration
 
