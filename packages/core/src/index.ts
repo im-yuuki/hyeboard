@@ -72,6 +72,8 @@ export type EncryptedSessionPayload = {
   version: 1;
   universityId: string;
   studentCode?: string;
+  sessionId?: string;
+  sessionEpoch?: number;
   studenthub?: UpstreamCredential;
   canvas?: UpstreamCredential;
   vnu?: UpstreamCredential;
@@ -184,6 +186,8 @@ const VNU_PRINCIPAL_PATTERN = /^[0-9a-f]{64}$/;
 const SESSION_KEYS = [
   "canvas",
   "expiresAt",
+  "sessionEpoch",
+  "sessionId",
   "studentCode",
   "studenthub",
   "uetGoogleCredential",
@@ -395,6 +399,8 @@ function assertGoogleCookie(value: unknown): void {
 
 function parseEncryptedSessionPayload(value: unknown): EncryptedSessionPayload {
   if (!isJsonObject(value) || value.version !== 1) throw invalidSession();
+  if (value.sessionId !== undefined && !isNonemptyString(value.sessionId)) throw invalidSession();
+  if (value.sessionEpoch !== undefined && (typeof value.sessionEpoch !== "number" || !Number.isSafeInteger(value.sessionEpoch) || value.sessionEpoch < 0)) throw invalidSession();
   if (value.vnuRefresh === undefined) return value as EncryptedSessionPayload;
   if (!hasExactKeys(value, SESSION_KEYS, ["version", "universityId", "expiresAt"])) throw invalidSession();
   if (value.version !== 1 || !isNonemptyString(value.universityId) || parseCanonicalIso(value.expiresAt) === null) throw invalidSession();

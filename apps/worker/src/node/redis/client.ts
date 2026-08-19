@@ -1,0 +1,68 @@
+import { createClient, createClientPool, type RedisClientOptions, type RedisClientPoolType, type RedisClientType } from "redis";
+
+export type RedisClient = RedisClientType;
+export type RedisBlockingPool = RedisClientPoolType;
+export type RedisClientConfig = RedisClientOptions;
+
+export type RedisSetOptions = {
+  expiration?: { type: "PX" | "EX"; value: number };
+  condition?: "NX" | "XX";
+};
+
+export interface RedisMultiLike {
+  set(key: string, value: string, options?: RedisSetOptions): RedisMultiLike;
+  del(key: string): RedisMultiLike;
+  exec(): Promise<unknown[] | null>;
+}
+
+export interface RedisCommandClient {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string, options?: RedisSetOptions): Promise<string | null>;
+  del(key: string): Promise<number>;
+  eval(script: string, options: { keys?: string[]; arguments?: string[] }): Promise<unknown>;
+  watch(key: string): Promise<unknown>;
+  unwatch(): Promise<unknown>;
+  multi(): RedisMultiLike;
+}
+
+export interface RedisBlockingClient extends RedisCommandClient {
+  blPop(key: string, timeout: number): Promise<{ key: string; element: string } | null>;
+}
+
+export type RedisClients = {
+  client: RedisClient;
+  blocking: RedisBlockingPool;
+};
+
+export function createRedisClient(config: RedisClientConfig = {}): RedisClient {
+  return createClient(config);
+}
+
+export function createRedisClients(config: RedisClientConfig = {}): RedisClients {
+  const client = createRedisClient(config);
+  return { client, blocking: createClientPool(config) };
+}
+
+export async function connectRedis(clients: RedisClients | RedisClient | RedisBlockingPool): Promise<void> {
+  if ("client" in clients) {
+    try {
+      await Promise.all([clients.client.connect(), clients.blocking.connect()]);
+    } catch (error) {
+      await Promise.allSettled([
+        closeRedis(clients.client),
+        closeRedis(clients.blocking),
+      ]);
+      throw error;
+    }
+    return;
+  }
+  await clients.connect();
+}
+
+export async function closeRedis(clients: RedisClients | RedisClient | RedisBlockingPool): Promise<void> {
+  if ("client" in clients) {
+    await Promise.all([closeRedis(clients.client), closeRedis(clients.blocking)]);
+    return;
+  }
+  if (clients.isOpen) clients.destroy();
+}

@@ -28,6 +28,60 @@ export function isStudenthubMaintenance(url: string): boolean {
 // the budget below covers the full multi-hop flow with headroom.
 export const HARD_TIMEOUT_MS = 90_000;
 
+export type AutomationDeadline = {
+  signal: AbortSignal;
+  callerAborted: () => boolean;
+  dispose: () => void;
+};
+
+export function createAutomationDeadline(signal?: AbortSignal): AutomationDeadline {
+  const controller = new AbortController();
+  const onAbort = () => controller.abort(signal?.reason ?? new DOMException("This operation was aborted", "AbortError"));
+  const timeoutId = setTimeout(() => {
+    controller.abort(new HyeboardError("GOOGLE_AUTOMATION_TIMEOUT", "The automated sign-in took too long and was cancelled.", 504));
+  }, HARD_TIMEOUT_MS);
+  if (signal?.aborted) onAbort();
+  else signal?.addEventListener("abort", onAbort, { once: true });
+  return {
+    signal: controller.signal,
+    callerAborted: () => Boolean(signal?.aborted),
+    dispose: () => {
+      clearTimeout(timeoutId);
+      signal?.removeEventListener("abort", onAbort);
+    },
+  };
+}
+
+export async function awaitAutomationOperation<T>(operation: Promise<T>, signal: AbortSignal, onCancel: () => Promise<void>): Promise<T> {
+  if (signal.aborted) {
+    await onCancel().catch(() => undefined);
+    throw signal.reason ?? new DOMException("This operation was aborted", "AbortError");
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = () => {
+      void onCancel()
+        .catch(() => undefined)
+        .then(() => finish(() => reject(signal.reason ?? new DOMException("This operation was aborted", "AbortError"))));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    );
+  });
+}
+
+export function throwIfAutomationAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw signal.reason ?? new DOMException("This operation was aborted", "AbortError");
+}
+
 export type GoogleLoginResult = {
   studenthub?: { accessToken: string; accountCode?: string };
   canvas?: { cookie: string; csrfToken?: string };
@@ -60,6 +114,7 @@ export type PatchrightLauncher = (
   password: string,
   existingCookies?: GoogleSessionCookie[],
   onProgress?: (message: string) => void,
+  signal?: AbortSignal,
 ) => Promise<GoogleLoginResult>;
 let patchrightLauncher: PatchrightLauncher | undefined;
 export function setPatchrightLauncher(launcher: PatchrightLauncher | undefined): void {
@@ -277,12 +332,14 @@ export async function automateVnuGoogleLogin(
   // the /api/uet/auth/import-session route so the login UI can show what's
   // happening during this otherwise-opaque, potentially 90s+ flow.
   onProgress?: (message: string) => void,
+  signal?: AbortSignal,
 ): Promise<GoogleLoginResult> {
+  throwIfAutomationAborted(signal);
   // "local" + a registered Patchright launcher (see setPatchrightLauncher
   // above) + explicit opt-in via env var — dispatches to a completely
   // separate Playwright-based implementation instead of Puppeteer below.
   if (connection.kind === "local" && process.env.HYEB_BROWSER_PATCHRIGHT === "true" && patchrightLauncher) {
-    return patchrightLauncher(connection.headless ?? true, email, password, existingCookies, onProgress);
+    return patchrightLauncher(connection.headless ?? true, email, password, existingCookies, onProgress, signal);
   }
 
   const key = cacheKeyFor(connection, email);
@@ -305,36 +362,50 @@ export async function automateVnuGoogleLogin(
     const cached = key ? browserSessionCache.get(key) : undefined;
     const reusingCache = Boolean(cached && isBrowserAlive(cached.browser));
     let browser: AnyBrowser | undefined;
+    let flow: Promise<void> | undefined;
+    const deadline = createAutomationDeadline(signal);
     try {
-      browser = reusingCache ? cached!.browser : await acquireBrowser(connection);
+      const acquisition = reusingCache ? Promise.resolve(cached!.browser) : acquireBrowser(connection);
+      acquisition.then((candidate) => {
+        if (deadline.signal.aborted) void candidate.close().catch(() => undefined);
+      }, () => undefined);
+      browser = reusingCache
+        ? cached!.browser
+        : await awaitAutomationOperation(acquisition, deadline.signal, async () => {
+            await browser?.close().catch(() => undefined);
+          });
       log.debug({ reusingCache }, "automateVnuGoogleLogin: browser acquired");
-
-      let timeoutId: ReturnType<typeof setTimeout>;
-      const timeout = new Promise<never>((_, reject) => {
-        timeoutId = setTimeout(() => reject(new HyeboardError("GOOGLE_AUTOMATION_TIMEOUT", "The automated sign-in took too long and was cancelled.", 504)), HARD_TIMEOUT_MS);
+      flow = runFlow(browser, email, password, result, existingCookies, onProgress, deadline.signal);
+      await awaitAutomationOperation(flow, deadline.signal, async () => {
+        await browser?.close().catch(() => undefined);
       });
-      try {
-        await Promise.race([runFlow(browser, email, password, result, existingCookies, onProgress), timeout]);
-      } finally {
-        clearTimeout(timeoutId!);
-      }
+      throwIfAutomationAborted(signal);
 
       // Success: keep the browser alive for the next refresh instead of
       // closing it (self-hosted only — cacheKeyFor() already excludes
       // Cloudflare).
       if (key) browserSessionCache.set(key, { browser, lastUsedAt: Date.now() });
       else await browser.close().catch(() => undefined);
+      deadline.dispose();
       break;
     } catch (error) {
+      await flow?.catch(() => undefined);
+      const callerAborted = deadline.callerAborted();
       if (reusingCache && key) {
         // The cached browser was stale/broken (crashed, revoked session,
         // network drop on a remote CDP endpoint, etc). Evict it and retry
         // once with a freshly launched browser before giving up.
         await evictCachedSession(key);
-        log.debug({ err: error }, "automateVnuGoogleLogin: cached browser session failed, retrying with a fresh browser");
-        continue;
+        if (!callerAborted) {
+          deadline.dispose();
+          log.debug({ err: error }, "automateVnuGoogleLogin: cached browser session failed, retrying with a fresh browser");
+          continue;
+        }
       }
       if (!reusingCache) await browser?.close().catch(() => undefined);
+      deadline.dispose();
+      if (callerAborted) throw signal?.reason ?? error;
+      if (deadline.signal.aborted) throw deadline.signal.reason ?? error;
       if (error instanceof HyeboardError) throw error;
       log.error({ err: error }, "automateVnuGoogleLogin: unexpected error");
       // Carry the real underlying error message through instead of a fully
@@ -416,11 +487,13 @@ async function runFlow(
   result: GoogleLoginResult,
   existingCookies?: GoogleSessionCookie[],
   onProgress?: (message: string) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
+  throwIfAutomationAborted(signal);
   const report = (message: string) => onProgress?.(message);
   const page = await browser.newPage();
   try {
-    await runFlowBody(page, browser, email, password, result, existingCookies, report);
+    await runFlowBody(page, browser, email, password, result, existingCookies, report, signal);
   } finally {
     // Always close this call's page/tab, even on success or a thrown
     // error — the browser itself may be kept alive afterward (see the
@@ -439,7 +512,9 @@ async function runFlowBody(
   result: GoogleLoginResult,
   existingCookies: GoogleSessionCookie[] | undefined,
   report: (message: string) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
+  throwIfAutomationAborted(signal);
   let studenthubToken: string | null = null;
 
   // 0. Rehydrate a previously-captured Google session cookie (if any)

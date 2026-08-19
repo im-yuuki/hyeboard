@@ -85,6 +85,26 @@ describe("uet adapter importSession - Google automation path", () => {
       ),
     ).rejects.toMatchObject({ code: "GOOGLE_2FA_REQUIRED" });
   });
+
+  it("passes the import signal through to Google automation", async () => {
+    vi.mocked(automateVnuGoogleLogin).mockResolvedValue({ studenthub: { accessToken: "fake-student-token" } });
+    const signal = new AbortController().signal;
+    const adapter = createUetAdapter();
+
+    await adapter.importSession(
+      { uetGoogleEmail: "a@vnu.edu.vn", uetGooglePassword: "fake-password", signal },
+      { browserConnection: { kind: "cloudflare", binding: { fetch: vi.fn() } } },
+    );
+
+    expect(automateVnuGoogleLogin).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "cloudflare" }),
+      "a@vnu.edu.vn",
+      "fake-password",
+      undefined,
+      undefined,
+      signal,
+    );
+  });
 });
 
 describe("uet adapter importSession - parent/guardian direct-login path", () => {
@@ -208,6 +228,24 @@ describe("uet adapter importSession - parent/guardian direct-login path", () => 
     });
     expect(clientMocks.getCaptchaChallenge).toHaveBeenCalledTimes(1);
     expect(clientMocks.authenticateDirect).toHaveBeenCalledTimes(1);
+  });
+
+  it("aborts while waiting for a human CAPTCHA answer", async () => {
+    const controller = new AbortController();
+    const reason = new DOMException("login cancelled", "AbortError");
+    setCaptchaOcrSolver(undefined);
+    const onCaptchaNeeded = vi.fn(() => new Promise<string>(() => undefined));
+    const adapter = createUetAdapter();
+    const pending = adapter.importSession(
+      { uetGoogleEmail: "PH00000001", uetGooglePassword: "fake-password", signal: controller.signal },
+      { onCaptchaNeeded },
+    );
+
+    await vi.waitFor(() => expect(onCaptchaNeeded).toHaveBeenCalled());
+    controller.abort(reason);
+
+    await expect(pending).rejects.toBe(reason);
+    expect(clientMocks.authenticateDirect).not.toHaveBeenCalled();
   });
 
   it("does not log sensitive parent values on success or application rejection", async () => {

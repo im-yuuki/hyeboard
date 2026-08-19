@@ -1,5 +1,5 @@
 {
   "extends": "../../tsconfig.base.json",
   "include": ["src", "worker-configuration.d.ts"],
-  "exclude": ["src/serve-static.ts", "src/index.node.ts"]
+  "exclude": ["src/serve-static.ts", "src/index.node.ts", "src/node"]
 }

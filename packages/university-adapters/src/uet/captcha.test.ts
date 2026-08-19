@@ -51,4 +51,16 @@ describe("resolveCaptchaAnswer", () => {
       status: 422,
     });
   });
+
+  it("aborts while waiting for a human CAPTCHA answer", async () => {
+    const controller = new AbortController();
+    const reason = new DOMException("login cancelled", "AbortError");
+    const onCaptchaNeeded = vi.fn(() => new Promise<string>(() => undefined));
+    const pending = resolveCaptchaAnswer(IMAGE, onCaptchaNeeded, { skipOcr: true, signal: controller.signal });
+
+    controller.abort(reason);
+
+    await expect(pending).rejects.toBe(reason);
+    expect(onCaptchaNeeded).toHaveBeenCalledWith(IMAGE, controller.signal);
+  });
 });

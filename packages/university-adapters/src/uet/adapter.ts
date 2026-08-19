@@ -99,6 +99,32 @@ function jwtExpiry(token: string): string | undefined {
   }
 }
 
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw signal.reason ?? new DOMException("This operation was aborted", "AbortError");
+}
+
+async function awaitAbortable<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return operation;
+  throwIfAborted(signal);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason ?? new DOMException("This operation was aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 function todayInVietnam(): string {
   return new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Ho_Chi_Minh",
@@ -114,6 +140,8 @@ export function createUetAdapter(): UniversityAdapter {
   return {
     university,
     async importSession(input: LoginImportInput, context?: ImportSessionContext): Promise<ImportedSession> {
+      const signal = input.signal ?? context?.signal;
+      throwIfAborted(signal);
       if (input.uetGoogleEmail || input.uetGooglePassword) {
         if (!input.uetGoogleEmail || !input.uetGooglePassword) {
           throw new HyeboardError("MISSING_UPSTREAM_CREDENTIAL", "Provide both your username/email and password.", 400);
@@ -132,11 +160,11 @@ export function createUetAdapter(): UniversityAdapter {
           const client = new StudentHubClient();
           let firstAnswerSource: "ocr" | "human" | undefined;
           for (let attempt = 0; attempt < 2; attempt += 1) {
-            const challenge = await client.getCaptchaChallenge();
+            const challenge = await awaitAbortable(client.getCaptchaChallenge(), signal);
             const skipOcr = attempt === 1 && firstAnswerSource === "ocr" && Boolean(context?.onCaptchaNeeded);
-            const answer = await resolveCaptchaAnswer(challenge.image, context?.onCaptchaNeeded, { skipOcr });
+            const answer = await resolveCaptchaAnswer(challenge.image, context?.onCaptchaNeeded, { skipOcr, signal });
             if (attempt === 0) firstAnswerSource = answer.source;
-            const result = await client.authenticateDirect(rawInput, input.uetGooglePassword, challenge.captchaId, answer.answer);
+            const result = await awaitAbortable(client.authenticateDirect(rawInput, input.uetGooglePassword, challenge.captchaId, answer.answer), signal);
             if (result.login) {
               const expiresAt = addDays(30);
               const session: EncryptedSessionPayload = {
@@ -176,7 +204,7 @@ export function createUetAdapter(): UniversityAdapter {
         // a real login against StudentHub/Canvas, so a captured token/cookie
         // is proof-of-working by construction. Re-validating would spend an
         // extra upstream round-trip for no new information.
-        const result = await automateVnuGoogleLogin(context.browserConnection, uetGoogleEmail, input.uetGooglePassword, input.uetGoogleCookies, context.onProgress);
+        const result = await automateVnuGoogleLogin(context.browserConnection, uetGoogleEmail, input.uetGooglePassword, input.uetGoogleCookies, context.onProgress, signal);
         const expiresAt = addDays(30);
         const session: EncryptedSessionPayload = {
           version: 1,
@@ -194,7 +222,7 @@ export function createUetAdapter(): UniversityAdapter {
         throw new HyeboardError("MISSING_UPSTREAM_CREDENTIAL", "Provide a university portal token, portal cookie, learning-platform token, or learning-platform cookie.", 400);
       }
       const googleLogin = input.studenthubGoogleCredential
-        ? await new StudentHubClient().exchangeGoogleCredential(input.studenthubGoogleCredential)
+        ? await awaitAbortable(new StudentHubClient().exchangeGoogleCredential(input.studenthubGoogleCredential), signal)
         : undefined;
       const studenthubToken = googleLogin?.accessToken ?? input.studenthubToken;
       const studenthubExpiresAt = studenthubToken ? jwtExpiry(studenthubToken) : undefined;
@@ -212,14 +240,16 @@ export function createUetAdapter(): UniversityAdapter {
       // would silently "succeed" and only fail later on the dashboard.
       if (session.studenthub) {
         try {
-          await new StudentHubClient(session).getProfile();
+          await awaitAbortable(new StudentHubClient(session).getProfile(), signal);
         } catch {
+          throwIfAborted(signal);
           throw new HyeboardError("INVALID_STUDENTHUB_CREDENTIAL", "The university portal rejected this token or cookie. Copy a fresh token and try again.", 401);
         }
       } else if (session.canvas) {
         try {
-          await new CanvasClient(session).getUnreadConversations();
+          await awaitAbortable(new CanvasClient(session).getUnreadConversations(), signal);
         } catch {
+          throwIfAborted(signal);
           throw new HyeboardError("INVALID_CANVAS_CREDENTIAL", "The learning platform rejected this token or cookie. Copy a fresh token and try again.", 401);
         }
       }

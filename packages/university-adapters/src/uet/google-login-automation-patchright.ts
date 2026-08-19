@@ -6,11 +6,13 @@ import { getLogger, HyeboardError, type GoogleSessionCookie } from "@hyeboard/co
 import {
   CANVAS_SSO_URL,
   detectChallenge,
-  HARD_TIMEOUT_MS,
   isRehydratableGoogleCookie,
   isStudenthubMaintenance,
   serializeCookies,
   STUDENTHUB_LOGIN_URL,
+  awaitAutomationOperation,
+  createAutomationDeadline,
+  throwIfAutomationAborted,
   type GoogleLoginResult,
 } from "./google-login-automation";
 
@@ -132,14 +134,19 @@ async function launchPatchrightContext(headless: boolean): Promise<{ context: Br
   // versus a more general Patchright/environment issue.
   const useBundledChromium = process.env.HYEB_BROWSER_PATCHRIGHT_CHROMIUM === "true";
   const chromePath = process.env.HYEB_CHROME_PATH;
-  const context = await chromium.launchPersistentContext(userDataDir, {
-    ...(useBundledChromium ? {} : chromePath ? { executablePath: chromePath } : { channel: "chrome" }),
-    headless,
-    viewport: null,
-    args: ["--no-sandbox"],
-    timeout: 60_000,
-  });
-  return { context, userDataDir };
+  try {
+    const context = await chromium.launchPersistentContext(userDataDir, {
+      ...(useBundledChromium ? {} : chromePath ? { executablePath: chromePath } : { channel: "chrome" }),
+      headless,
+      viewport: null,
+      args: ["--no-sandbox"],
+      timeout: 60_000,
+    });
+    return { context, userDataDir };
+  } catch (error) {
+    rmSync(userDataDir, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 export async function automateVnuGoogleLoginPatchright(
@@ -148,7 +155,9 @@ export async function automateVnuGoogleLoginPatchright(
   password: string,
   existingCookies?: GoogleSessionCookie[],
   onProgress?: (message: string) => void,
+  signal?: AbortSignal,
 ): Promise<GoogleLoginResult> {
+  throwIfAutomationAborted(signal);
   const log = getLogger();
   const key = cacheKeyFor(email);
   await evictStaleIfIdle(key);
@@ -159,30 +168,35 @@ export async function automateVnuGoogleLoginPatchright(
     const reusingCache = Boolean(cached && !cached.closed);
     log.debug({ connectionKind: "local-patchright", email, reusingCache, attempt }, "automateVnuGoogleLoginPatchright: starting");
 
-    let context: BrowserContext;
-    let userDataDir: string;
-    if (reusingCache && cached) {
-      context = cached.context;
-      userDataDir = cached.userDataDir;
-      log.debug("automateVnuGoogleLoginPatchright: reusing cached browser context");
-    } else {
-      const launched = await launchPatchrightContext(headless);
+    let context: BrowserContext | undefined;
+    let userDataDir: string | undefined;
+    let flow: Promise<void> | undefined;
+    const deadline = createAutomationDeadline(signal);
+    try {
+      const acquisition = reusingCache && cached
+        ? Promise.resolve({ context: cached.context, userDataDir: cached.userDataDir })
+        : launchPatchrightContext(headless);
+      acquisition.then((launched) => {
+        if (deadline.signal.aborted) {
+          void launched.context.close().catch(() => undefined);
+          rmSync(launched.userDataDir, { recursive: true, force: true });
+        }
+      }, () => undefined);
+      const launched = await awaitAutomationOperation(acquisition, deadline.signal, async () => {
+        await context?.close().catch(() => undefined);
+        if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });
+      });
       context = launched.context;
       userDataDir = launched.userDataDir;
-      log.debug("automateVnuGoogleLoginPatchright: browser context acquired");
-    }
-
-    let timeoutId: ReturnType<typeof setTimeout>;
-    const timeout = new Promise<never>((_, reject) => {
-      timeoutId = setTimeout(() => reject(new HyeboardError("GOOGLE_AUTOMATION_TIMEOUT", "The automated sign-in took too long and was cancelled.", 504)), HARD_TIMEOUT_MS);
-    });
-    try {
-      try {
-        await Promise.race([runFlow(context, email, password, result, existingCookies, onProgress), timeout]);
-      } finally {
-        clearTimeout(timeoutId!);
-      }
+      log.debug({ reusingCache }, "automateVnuGoogleLoginPatchright: browser context acquired");
+      flow = runFlow(context, email, password, result, existingCookies, onProgress, deadline.signal);
+      await awaitAutomationOperation(flow, deadline.signal, async () => {
+        await context?.close().catch(() => undefined);
+      });
+      throwIfAutomationAborted(signal);
     } catch (error) {
+      await flow?.catch(() => undefined);
+      const callerAborted = deadline.callerAborted();
       // Hard failures whose cause has nothing to do with a stale/broken
       // cached context — a fresh context will hit the exact same failure,
       // so retrying just wastes another ~90s HARD_TIMEOUT_MS window (this
@@ -190,19 +204,23 @@ export async function automateVnuGoogleLoginPatchright(
       // which could double the wall-clock time of a doomed refresh call
       // before finally surfacing an error).
       const isNonRetryableFailure = error instanceof HyeboardError && NON_STALE_CACHE_ERROR_CODES.has(error.code);
-      if (reusingCache && !isNonRetryableFailure) {
+      if (reusingCache && !isNonRetryableFailure && !callerAborted) {
         // The cached context is stale/broken — evict it and retry once
         // with a freshly launched context, so a broken cached session
         // never surfaces as a caller-visible error.
         log.debug({ err: error }, "automateVnuGoogleLoginPatchright: cached context failed, evicting and retrying fresh");
         await evictCachedSession(key);
+        deadline.dispose();
         continue;
       }
       if (reusingCache) await evictCachedSession(key);
       else {
-        await context.close().catch(() => undefined);
-        rmSync(userDataDir, { recursive: true, force: true });
+        await context?.close().catch(() => undefined);
+        if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });
       }
+      deadline.dispose();
+      if (callerAborted) throw signal?.reason ?? error;
+      if (deadline.signal.aborted) throw deadline.signal.reason ?? error;
       if (error instanceof HyeboardError) throw error;
       log.error({ err: error }, "automateVnuGoogleLoginPatchright: unexpected error");
       // Carry the real underlying error message through instead of a fully
@@ -224,6 +242,7 @@ export async function automateVnuGoogleLoginPatchright(
       }
       await context.close().catch(() => undefined);
       rmSync(userDataDir, { recursive: true, force: true });
+      deadline.dispose();
       throw new HyeboardError("GOOGLE_SIGNIN_FAILURE", "Google did not complete the sign-in. Check your email and password, or use the manual token option below.", 502);
     }
 
@@ -242,6 +261,7 @@ export async function automateVnuGoogleLoginPatchright(
       });
     }
     patchrightSessionCache.set(key, entry);
+    deadline.dispose();
     return result;
   }
 
@@ -277,7 +297,9 @@ async function runFlow(
   result: GoogleLoginResult,
   existingCookies?: GoogleSessionCookie[],
   onProgress?: (message: string) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
+  throwIfAutomationAborted(signal);
   // launchPersistentContext opens with one blank tab already visible
   // (headless: false shows this immediately) — reuse it instead of opening
   // a second tab that context.newPage() would create, which is why the
@@ -290,7 +312,7 @@ async function runFlow(
   // (cache-reuse) calls.
   const page = context.pages()[0] ?? (await context.newPage());
   try {
-    await runFlowBody(context, page, email, password, result, existingCookies, onProgress);
+    await runFlowBody(context, page, email, password, result, existingCookies, onProgress, signal);
   } finally {
     await page.close().catch(() => undefined);
   }
@@ -304,7 +326,9 @@ async function runFlowBody(
   result: GoogleLoginResult,
   existingCookies: GoogleSessionCookie[] | undefined,
   onProgress?: (message: string) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
+  throwIfAutomationAborted(signal);
   const report = (message: string) => onProgress?.(message);
   const log = getLogger();
   await page.bringToFront().catch(() => undefined);

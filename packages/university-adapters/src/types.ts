@@ -77,6 +77,9 @@ export type BrowserConnection =
   | { kind: "local"; headless?: boolean };
 
 export type ImportSessionContext = {
+  // Cancellation for the complete import operation. LoginImportInput.signal
+  // takes precedence when both are supplied by a caller.
+  signal?: AbortSignal;
   browserConnection?: BrowserConnection;
   // Optional progress reporter for slow, multi-step logins (currently only
   // the uet adapter's automated Google-login flow calls this). Callers that
@@ -91,7 +94,7 @@ export type ImportSessionContext = {
   // outright (STUDENTHUB_CAPTCHA_REQUIRED) instead of prompting a human —
   // appropriate for e.g. resolveSession()'s silent background refresh,
   // which has no interactive user to ask.
-  onCaptchaNeeded?: (imageDataUrl: string) => Promise<string>;
+  onCaptchaNeeded?: (imageDataUrl: string, signal?: AbortSignal) => Promise<string>;
 };
 
 export interface UniversityAdapter {

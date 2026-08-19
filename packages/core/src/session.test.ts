@@ -143,6 +143,29 @@ describe("encryptSession / decryptSession", () => {
     expect(decrypted.studenthub?.value).toBe("SYNTHETIC-SH-TOKEN");
   });
 
+  it("roundtrips optional HA session metadata without changing the V1 payload shape", async () => {
+    const payload: EncryptedSessionPayload = {
+      version: 1,
+      universityId: "uet",
+      sessionId: "SYNTHETIC-SESSION-ID",
+      sessionEpoch: 3,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    const token = await encryptSession(payload, SECRET);
+    await expect(decryptSession(token, SECRET)).resolves.toEqual(payload);
+  });
+
+  it("rejects malformed optional HA session metadata", async () => {
+    const malformed = {
+      version: 1,
+      universityId: "uet",
+      sessionId: "",
+      sessionEpoch: -1,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    } as unknown as EncryptedSessionPayload;
+    await expect(encryptSession(malformed, SECRET)).rejects.toMatchObject({ code: "INVALID_SESSION", status: 401 });
+  });
+
   it("omits uetGoogleCredential when not set", async () => {
     const payload: EncryptedSessionPayload = {
       version: 1,
