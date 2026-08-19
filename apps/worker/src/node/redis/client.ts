@@ -40,7 +40,13 @@ export function createRedisClient(config: RedisClientConfig = {}): RedisClient {
 
 export function createRedisClients(config: RedisClientConfig = {}): RedisClients {
   const client = createRedisClient(config);
-  return { client, blocking: createClientPool(config) };
+  const blocking = createClientPool(config);
+  // Redis clients emit asynchronous connection errors. Always attach a
+  // listener so an outage is converted at the request/readiness boundary
+  // instead of becoming an uncaught process exception.
+  client.on("error", () => undefined);
+  blocking.on("error", () => undefined);
+  return { client, blocking };
 }
 
 export async function connectRedis(clients: RedisClients | RedisClient | RedisBlockingPool): Promise<void> {

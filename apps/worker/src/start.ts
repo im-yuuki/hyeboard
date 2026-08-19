@@ -231,7 +231,7 @@ export async function start(): Promise<unknown> {
 
     const dependencyNames = [
       "postgres", "postgresMigrations", "sessionRevocation", "vnuRefreshCoordinator",
-      "redis", "cache", "captchaRelayCoordinator", "probeBudgetCoordinator", "automation",
+      "redis", "cache", "captchaRelayCoordinator", "probeBudgetCoordinator",
     ];
     const dependencies = haConfig.mode === "distributed"
       ? Object.fromEntries(dependencyNames.map((name) => [name, "unavailable" as const]))
@@ -309,26 +309,24 @@ export async function start(): Promise<unknown> {
               cache: "ready",
               captchaRelayCoordinator: "ready",
               probeBudgetCoordinator: "ready",
-              automation: backend.isAvailable() ? "ready" : "unavailable",
             });
           } catch (error) {
             setDistributedAutomationBackend(undefined);
             getLogger().error({ dependency: "automation", errorName: error instanceof Error ? error.name : typeof error }, "Distributed automation initialization failed");
-            lifecycle.setDependencyStatuses({ redis: "ready", cache: "ready", captchaRelayCoordinator: "ready", probeBudgetCoordinator: "ready", automation: "unavailable" });
+            lifecycle.setDependencyStatuses({ redis: "ready", cache: "ready", captchaRelayCoordinator: "ready", probeBudgetCoordinator: "ready" });
           }
         } catch (error) {
           setRateLimitCoordinator(undefined);
           setVnuImportSingleFlight(undefined);
           setDistributedAutomationBackend(undefined);
           getLogger().error({ dependency: "redis", errorName: error instanceof Error ? error.name : typeof error }, "Redis HA initialization failed");
-          lifecycle.setDependencyStatuses({ redis: "unavailable", cache: "unavailable", captchaRelayCoordinator: "unavailable", probeBudgetCoordinator: "unavailable", automation: "unavailable" });
+          lifecycle.setDependencyStatuses({ redis: "unavailable", cache: "unavailable", captchaRelayCoordinator: "unavailable", probeBudgetCoordinator: "unavailable" });
           await closeRedisResources?.().catch(() => undefined);
           closeRedisResources = undefined;
         }
       }
       else {
         setDistributedAutomationBackend(undefined);
-        lifecycle.setDependencyStatus("automation", "unavailable");
       }
     }
 

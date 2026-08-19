@@ -1,4 +1,4 @@
-import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { createServer } from "node:net";
 import { dirname, join } from "node:path";
@@ -11,6 +11,17 @@ export const repositoryRoot = join(scriptDirectory, "../..");
 export const workerDirectory = join(repositoryRoot, "apps/worker");
 export const probeScript = join(scriptDirectory, "node-probe.ts");
 export const sessionSecret = "ha-verification-secret-with-at-least-32-bytes";
+
+function resolveTsxLoader(): string {
+  const value = execFileSync(process.env.PNPM_BIN ?? "pnpm", ["--filter", "@hyeboard/worker", "exec", "node", "-p", "require.resolve('tsx/esm')"], {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+  }).trim();
+  if (!value) throw new Error("Could not resolve the workspace tsx loader");
+  return value;
+}
+
+const tsxLoader = resolveTsxLoader();
 
 export async function dockerIsAvailable(): Promise<boolean> {
   try {
@@ -68,7 +79,7 @@ export class WorkerProcess {
     const output = { stdout: "", stderr: "" };
     const child = spawn(
       process.execPath,
-      ["--import", "tsx/esm", "src/index.node.ts"],
+      ["--import", tsxLoader, "src/index.node.ts"],
       {
         cwd: workerDirectory,
         env: {
@@ -105,8 +116,8 @@ export class WorkerProcess {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       try {
-        const response = await fetch(`http://127.0.0.1:${this.port}/api/live`);
-        if (response.status === 200 || response.status === 503) return;
+        const response = await fetch(`http://127.0.0.1:${this.port}/api/ready`);
+        if (response.status === 200) return;
       } catch {
         // The child may still be importing dependencies or binding its port.
       }
@@ -154,8 +165,8 @@ export async function runProbe(
   dependencies: { postgresUrl?: string; redisUrl?: string },
 ): Promise<any> {
   const child = spawn(
-    process.execPath,
-    ["--import", "tsx/esm", probeScript, operation, JSON.stringify(input)],
+    process.env.PNPM_BIN ?? "pnpm",
+    ["--filter", "@hyeboard/worker", "exec", "tsx", probeScript, operation, JSON.stringify(input)],
     {
       cwd: repositoryRoot,
       env: {

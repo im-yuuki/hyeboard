@@ -40,19 +40,28 @@ export class RedisVnuRefreshControlCoordinator implements VnuRefreshControlCoord
     return this.serialize(key, async () => {
       try {
         for (let attempt = 0; attempt < attempts; attempt += 1) {
-          await this.options.client.watch(key);
-          const stored = parseVnuRefreshControlState((await this.options.client.get(key)) ?? undefined);
-          const output = transition(stored, Date.now());
-          if (!output.changed) { await this.options.client.unwatch(); return output.result; }
-          const multi = this.options.client.multi();
-          if (isQuiescentVnuRefreshState(output.state)) {
-            multi.del(key);
-          } else {
-            const alarm = nextVnuRefreshAlarm(output.state);
-            const ttl = Math.max(1, (alarm ?? Date.now() + 86_400_000) - Date.now());
-            multi.set(key, JSON.stringify(output.state), { expiration: { type: "PX", value: ttl } });
+          try {
+            await this.options.client.watch(key);
+            const raw = await this.options.client.get(key);
+            const stored = raw === null ? undefined : parseVnuRefreshControlState(JSON.parse(raw));
+            const output = transition(stored, Date.now());
+            if (!output.changed) { await this.options.client.unwatch(); return output.result; }
+            const multi = this.options.client.multi();
+            if (isQuiescentVnuRefreshState(output.state)) {
+              multi.del(key);
+            } else {
+              const alarm = nextVnuRefreshAlarm(output.state);
+              const ttl = Math.max(1, (alarm ?? Date.now() + 86_400_000) - Date.now());
+              multi.set(key, JSON.stringify(output.state), { expiration: { type: "PX", value: ttl } });
+            }
+            if (await multi.exec() !== null) return output.result;
+          } catch (error) {
+            // A concurrent refresh on another replica legitimately aborts a
+            // WATCH transaction. Retry the pure transition against the new
+            // state instead of converting normal contention into a 503.
+            if (error instanceof Error && (error.name === "WatchError" || error.constructor.name === "WatchError")) continue;
+            throw error;
           }
-          if (await multi.exec() !== null) return output.result;
         }
         throw new Error("Redis refresh transaction contention");
       } catch {

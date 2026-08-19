@@ -23,6 +23,11 @@ export class PostgresPool implements PostgresPoolLike {
 
   constructor(config?: PostgresPoolConfig) {
     this.pool = typeof config === "string" ? new pg.Pool({ connectionString: config }) : new pg.Pool(config);
+    // `pg.Pool` emits idle-client errors asynchronously. Without a listener a
+    // database outage can become an uncaught process exception, taking every
+    // API replica down instead of letting the request boundary return the
+    // sanitized HA dependency error.
+    this.pool.on("error", () => undefined);
   }
 
   async query<Row extends QueryResultRow = Record<string, unknown>>(text: string, values?: readonly unknown[]): Promise<QueryResult<Row>> {
