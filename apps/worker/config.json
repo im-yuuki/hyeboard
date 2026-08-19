@@ -21,6 +21,12 @@
     "cross_detail_permit_ttl_seconds": 60,
     "cross_detail_export_mode": "selected"
   },
+  "ha": {
+    "mode": "memory",
+    "node_id": "",
+    "session_epoch": 0,
+    "enforce_session_epoch": false
+  },
   "log_level": "info",
   "host": "127.0.0.1",
   "port": 8787,

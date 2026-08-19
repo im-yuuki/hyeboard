@@ -7,6 +7,106 @@ import { fileURLToPath } from "node:url";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SHIP = join(ROOT, "dist");
 
+const VNU_CONFIG_KEYS = [
+  "code_lookup_concurrency",
+  "cross_lookup_bulk_max_targets",
+  "cross_lookup_direct_chunk_max_targets",
+  "code_lookup_bulk_target_concurrency",
+  "cross_lookup_request_timeout_ms",
+  "cross_detail_max_targets",
+  "cross_detail_max_rows",
+  "cross_detail_concurrency",
+  "cross_detail_budget",
+  "cross_detail_window_seconds",
+  "cross_detail_permit_ttl_seconds",
+  "cross_detail_export_mode",
+];
+
+const HA_CONFIG_KEYS = ["mode", "node_id", "session_epoch", "enforce_session_epoch"];
+const FORBIDDEN_CONFIG_KEYS = new Set([
+  "HYEB_SESSION_SECRET",
+  "DATABASE_URL",
+  "REDIS_URL",
+  "HYEB_POSTGRES_URL",
+  "HYEB_REDIS_URL",
+  "password",
+  "secret",
+  "token",
+  "cookie",
+]);
+
+function copyRequiredSection(sourceConfig, sectionName, keys) {
+  const source = sourceConfig?.[sectionName];
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    throw new Error(`apps/worker/config.json is missing its ${sectionName} section`);
+  }
+
+  const unexpectedKeys = Object.keys(source).filter((key) => !keys.includes(key));
+  if (unexpectedKeys.length > 0) {
+    throw new Error(`Unsupported ${sectionName} config keys: ${unexpectedKeys.join(", ")}`);
+  }
+
+  return Object.fromEntries(keys.map((key) => {
+    if (!Object.hasOwn(source, key)) throw new Error(`apps/worker/config.json is missing ${sectionName}.${key}`);
+    return [key, source[key]];
+  }));
+}
+
+export function createPackagedConfig(sourceConfig) {
+  const browser = sourceConfig?.browser;
+  if (!browser || typeof browser !== "object" || Array.isArray(browser)) {
+    throw new Error("apps/worker/config.json is missing its browser section");
+  }
+
+  const config = {
+    // Origins and browser endpoints are deployment URLs and stay operator-configured.
+    origins: [],
+    browser: {
+      ws_endpoint: "",
+      local: browser.local,
+      headless: browser.headless,
+      chrome_path: browser.chrome_path,
+      idle_eviction_minutes: browser.idle_eviction_minutes,
+    },
+    vnu: copyRequiredSection(sourceConfig, "vnu", VNU_CONFIG_KEYS),
+    ha: copyRequiredSection(sourceConfig, "ha", HA_CONFIG_KEYS),
+    log_level: sourceConfig.log_level,
+    host: sourceConfig.host,
+    port: sourceConfig.port,
+    static_dir: "./public",
+  };
+
+  for (const key of ["local", "headless", "chrome_path", "idle_eviction_minutes"]) {
+    if (!Object.hasOwn(browser, key)) throw new Error(`apps/worker/config.json is missing browser.${key}`);
+  }
+  for (const key of ["log_level", "host", "port"]) {
+    if (!Object.hasOwn(sourceConfig, key)) throw new Error(`apps/worker/config.json is missing ${key}`);
+  }
+
+  return config;
+}
+
+export function assertPackagedConfig(config) {
+  const visit = (value, path = "config") => {
+    if (!value || typeof value !== "object") return;
+    for (const [key, child] of Object.entries(value)) {
+      if (FORBIDDEN_CONFIG_KEYS.has(key)) throw new Error(`Packaged config contains forbidden field ${path}.${key}`);
+      visit(child, `${path}.${key}`);
+    }
+  };
+  visit(config);
+
+  if (JSON.stringify(config.origins) !== "[]") throw new Error("Packaged config must not contain origins");
+  if (config.browser?.ws_endpoint !== "") throw new Error("Packaged config must not contain a browser URL");
+  for (const key of HA_CONFIG_KEYS) {
+    if (!Object.hasOwn(config.ha ?? {}, key)) throw new Error(`Packaged config is missing ha.${key}`);
+  }
+  for (const key of VNU_CONFIG_KEYS) {
+    if (!Object.hasOwn(config.vnu ?? {}, key)) throw new Error(`Packaged config is missing vnu.${key}`);
+  }
+  return config;
+}
+
 async function main() {
   console.log("[package] Building web…");
   execSync("pnpm build:web", { cwd: ROOT, stdio: "inherit" });
@@ -76,24 +176,8 @@ async function main() {
   await writeFile(pkgJsonPath, JSON.stringify(pkgJson, null, 2));
 
   console.log("[package] Writing config.json…");
-  const config = {
-    origins: [],
-    browser: {
-      ws_endpoint: "",
-      local: false,
-      headless: true,
-      chrome_path: "",
-      idle_eviction_minutes: 20160,
-    },
-    vnu: {
-      code_lookup_concurrency: 16,
-      cross_lookup_bulk_max_targets: 50,
-    },
-    log_level: "info",
-    host: "127.0.0.1",
-    port: 8787,
-    static_dir: "./public",
-  };
+  const workerConfig = JSON.parse(readFileSync(join(ROOT, "apps/worker/config.json"), "utf-8"));
+  const config = assertPackagedConfig(createPackagedConfig(workerConfig));
   await writeFile(join(SHIP, "config.json"), JSON.stringify(config, null, 2) + "\n");
 
   console.log("[package] Writing .env.example…");
@@ -116,7 +200,9 @@ async function main() {
   console.log(`[package] Done → ${SHIP}`);
 }
 
-main().catch((err) => {
-  console.error("[package] Failed:", err);
-  process.exit(1);
-});
+if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
+  main().catch((err) => {
+    console.error("[package] Failed:", err);
+    process.exit(1);
+  });
+}

@@ -10,7 +10,29 @@
 # Every other Hyeboard feature works without this container.
 services:
   chrome:
-    image: ghcr.io/browserless/chromium:latest
+    image: ghcr.io/browserless/chromium:1.61.0
     ports:
       - "3000:3000"
     restart: unless-stopped
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: hyeboard
+      POSTGRES_USER: hyeboard
+      POSTGRES_PASSWORD: hyeboard-local-only
+    ports:
+      - "5432:5432"
+    volumes:
+      - hyeboard-postgres:/var/lib/postgresql/data
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - hyeboard-redis:/data
+    restart: unless-stopped
+
+volumes:
+  hyeboard-postgres:
+  hyeboard-redis:

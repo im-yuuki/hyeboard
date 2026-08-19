@@ -1,6 +1,6 @@
 # Hyeboard Architecture
 
-Cloudflare deployments use one Worker containing the client-heavy dashboard and its API/BFF.
+Hyeboard has one frontend/API contract and three runtime modes. Cloudflare deployments use one Worker containing the client-heavy dashboard and its API/BFF. Self-hosted Node/Bun deployments use the same API code through a separate Node-only entry point.
 
 ```txt
 Cloudflare Worker
@@ -13,7 +13,34 @@ Cloudflare Worker
 
 The frontend never calls university upstream systems directly. University-specific behavior lives in adapters.
 
-Self-hosted Node/Bun deployments run the bundled worker without Cloudflare Durable Objects. They lack Durable Object-backed linked-pair authority and automatic VNU relogin; existing process-local access-token revocation remains available.
+Memory-mode self-hosted Node/Bun deployments run the bundled worker without Cloudflare Durable Objects. They lack durable linked-pair authority and automatic VNU relogin; existing process-local access-token revocation remains available. Distributed self-hosted mode adds PostgreSQL-backed refresh/grant authority and generic session revocation, while Cloudflare retains its Durable Object implementation.
+
+## Runtime Modes
+
+`memory` is the default self-hosted mode. It preserves single-process behavior with process-local cache/relay state and no shared replica authority.
+
+`distributed` is the self-hosted HA mode. Its API replicas share PostgreSQL and Redis:
+
+```txt
+API replica A ─┐
+API replica B ─┼─> PostgreSQL
+API replica N ─┘       └─ VNU refresh/grant authority
+       │               └─ generic session revocation
+       └──────────────> Redis
+                       └─ shared cache
+                       └─ CAPTCHA relay
+                       └─ VNU budgets, permits, leases
+                       └─ shared coordination primitives
+                       └─ automation streams (protocol foundation)
+```
+
+PostgreSQL migrations are ordered, checksum-checked, and protected by an advisory lock. PostgreSQL stores opaque/domain-separated session revocation hashes and VNU refresh-control state; it does not store raw session tokens, upstream credentials, or raw grants. Redis uses versioned, hashed keys and Lua/CAS-style primitives for shared ephemeral coordination. Redis does not replace PostgreSQL as the authority for revocation or durable VNU refresh state.
+
+Redis single-flight/lock and refresh-coordination implementations exist as standalone primitives, but not every primitive is wired into the API. The currently wired distributed API uses PostgreSQL for VNU refresh authority and Redis for the shared cache, CAPTCHA relay, and VNU probe/permit coordination.
+
+`cloudflare` is selected by the Cloudflare entry point and keeps the existing Durable Object implementations for CAPTCHA relay, VNU probe budgets, and VNU refresh control. `config.json` and Node-only PostgreSQL/Redis imports are outside the Cloudflare bundle.
+
+Distributed startup is intentionally fail-closed. If PostgreSQL or Redis is absent or unavailable, `/api/live` can still report the process as alive, while `/api/ready` reports `503` and dependent operations return a typed dependency-unavailable error. There is no hidden fallback from distributed authority to process-local state.
 
 ## UET Sources
 
@@ -30,6 +57,16 @@ University upstream origins make browser-managed third-party cookies fragile. Hy
 4. API decrypts per request and replays credentials upstream.
 
 No upstream cookies, tokens, SAML payloads, or personal data are logged.
+
+When distributed mode is active, newly issued or refreshed sessions carry an opaque `sessionId` and the configured `sessionEpoch`. Enforcement is disabled by default for rollout compatibility. A one-time cutover sets the same new epoch and `HYEB_HA_ENFORCE_SESSION_EPOCH=true` on every replica; pre-cutover tokens, including legacy tokens without metadata, then fail as `SESSION_EXPIRED` and require login again. The session encryption secret is not rotated for this operation.
+
+## Health And Lifecycle
+
+- `/api/health` preserves the existing `{status:"ok",service:"hyeboard"}` health response.
+- `/api/live` reports liveness independently of dependency readiness and returns `503` only after the lifecycle is stopped.
+- `/api/ready` runs the lifecycle dependency checks and returns `503` for starting, degraded, draining, or stopped state. Its safe diagnostics include mode, state, timestamp, and dependency statuses without URLs, reasons, credentials, or tokens.
+
+Node/Bun `SIGINT`/`SIGTERM` handling is idempotent. Shutdown drains the HTTP server first, then closes cached browser sessions, Redis, and the PostgreSQL pool under a bounded timeout. A timeout is recorded rather than allowing cleanup to block the process indefinitely; cleanup handlers remain responsible for their own cancellation.
 
 ## Academic Summaries and Exports
 
@@ -50,3 +87,11 @@ VNU access tokens and reconnect grants are separate AES-GCM protocols. Grant key
 `VnuRefreshControlDurableObject` is addressed by an HMAC-derived normalized-username principal. It stores random access-token IDs, grant IDs, expiry, a two-minute lease, and a five-attempt/fifteen-minute window—never credentials, raw tokens, or student identity. The encrypted access descriptor carries the opaque principal, exact linked IDs, and both expiries, so logout can atomically revoke its exact active pair even when a new tab has no browser grant. Logout validates any optional grant completely before its sole authoritative revoke call. A fully expired authenticated descriptor remains an idempotent access-only removal proof after authority cleanup, while any live-half mismatch fails closed. Every authority transition reports changed/no-op; no-op operations write neither state nor alarms. Active ordinary checks read authority without rewriting state or alarms; stale cleanup enters a transaction once. Refresh cryptographically decodes the outer access token through a refresh-only path, rejects principal/link mismatches without mutation, checks authority, performs one live login, verifies the live profile, and atomically revokes the old pair while activating the new pair before returning. Ordinary descriptor-bearing session resolution also checks this authority and fails closed when unavailable.
 
 The browser coordinates one refresh per local account and failed access token. It replays only explicit side-effect-free VNU reads once. Bulk and charged cross-lookups may refresh but require a manual retry; acknowledged browser results and exports remain intact.
+
+## Automation Boundary
+
+The automation protocol and `apps/automation-worker` provide encrypted job envelopes, Redis Streams interfaces, consumer-group reclaim, fencing, heartbeats, cancellation, result envelopes, and graceful worker drain. The Browserless provider keeps its token in the connector closure and exposes only safe ownership metadata. A host must still supply the Redis client, Puppeteer connector, UET executor, and event/result integration.
+
+The API currently does not produce those jobs or consume their result/event stream. Consequently, the distributed API does not yet provide full browser-automation feature parity and does not claim that Browserless is wired into login. In distributed mode, inline Google browser automation is rejected with an explicit backend-unconfigured error until that queue integration exists. Patchright remains permitted only for local/single-worker execution; distributed API and worker configuration reject it.
+
+Kubernetes manifests are deliberately deferred. They become an implementation target only after two-replica round-robin tests, shared refresh/revocation/CAPTCHA behavior, worker reclaim/fencing, outage fail-closed behavior, readiness, graceful shutdown, session cutover, Patchright rejection, and the normal build/test/browser/package/Wrangler gates all pass.
