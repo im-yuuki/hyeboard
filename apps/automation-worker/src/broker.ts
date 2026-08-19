@@ -80,7 +80,12 @@ export class RedisStreamsBroker implements StreamsBroker {
 
   async readGroup(input: ReadGroupInput): Promise<StreamMessage[]> {
     if (input.signal?.aborted) return [];
-    return normalizeMessages(await this.blockingClient.xReadGroup(input.group, input.consumer, { [input.stream]: ">" }, { COUNT: input.count, BLOCK: input.blockMs }));
+    return normalizeMessages(await this.blockingClient.xReadGroup(
+      input.group,
+      input.consumer,
+      { key: input.stream, id: ">" },
+      { COUNT: input.count, BLOCK: input.blockMs },
+    ));
   }
 
   async reclaimPending(input: ReclaimPendingInput): Promise<StreamMessage[]> {
