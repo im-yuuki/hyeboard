@@ -7,16 +7,21 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "scripts": {
+    "start:node": "node dist/cli.cjs",
+    "build": "tsc -p tsconfig.build.json && esbuild src/cli.ts --bundle --platform=node --format=cjs --outfile=dist/cli.cjs --external:redis --external:puppeteer-core",
     "test": "tsc -p tsconfig.json --noEmit && vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
     "@hyeboard/automation-protocol": "workspace:*",
-    "@hyeboard/university-adapters": "workspace:*"
+    "@hyeboard/university-adapters": "workspace:*",
+    "puppeteer-core": "^24.15.0",
+    "redis": "^6.2.1"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "esbuild": "^0.28.1",
     "typescript": "^6.0.3",
     "vitest": "^4.1.0"
   }

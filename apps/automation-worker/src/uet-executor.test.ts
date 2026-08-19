@@ -4,22 +4,46 @@ import {
   type BrowserConnection,
   type AutomationExecutionContext,
   type UetAutomationCredential,
+  LeaseLostError,
 } from "./index";
 import { createAccountId, createJobId, createUetImportJob } from "@hyeboard/automation-protocol";
 import type { ImportedSession, UniversityAdapter } from "@hyeboard/university-adapters";
 import { describe, expect, it, vi } from "vitest";
 
 const browser: BrowserConnection = {
-  browser: { newPage: async () => ({}), disconnect: async () => undefined },
+  browser: {
+    newPage: async () => ({
+      close: async () => undefined,
+      setCookie: async () => undefined,
+      goto: async () => undefined,
+      url: () => "about:blank",
+      waitForSelector: async () => ({ click: async () => undefined }),
+      click: async () => undefined,
+      type: async () => undefined,
+      waitForNavigation: async () => undefined,
+      bringToFront: async () => undefined,
+      isClosed: () => false,
+      evaluate: async <T>() => null as T,
+      once: () => undefined,
+      cookies: async () => [],
+      waitForNetworkIdle: async () => undefined,
+    }),
+    close: async () => undefined,
+    disconnect: async () => undefined,
+    on: () => undefined,
+    off: () => undefined,
+  },
   metadata: {
     connectionId: "connection-1",
     provider: "browserless",
     endpointOrigin: "wss://browserless.example.test",
     ownership: { browser: "browserless", connection: "automation-worker", reconnectEndpoint: "automation-worker" },
+    adapter: { driver: "puppeteer", connectionId: "connection-1" },
     reconnectable: true,
     connectedAt: "2036-01-02T03:04:05.000Z",
   },
   reconnect: async () => browser,
+  assertOwned: async () => undefined,
   disconnect: async () => undefined,
 };
 
@@ -98,6 +122,30 @@ describe("UET automation executor", () => {
     expect(JSON.stringify(progressEvents)).not.toContain("private-password");
   });
 
+  it("hands the provider-owned Puppeteer driver to the adapter by default", async () => {
+    const importSession = vi.fn(async (_input, importContext) => {
+      expect(importContext?.browserConnection).toMatchObject({ kind: "owned", driver: browser.browser });
+      return imported;
+    });
+    const executor = createUetAutomationExecutor({ adapter: adapter(importSession) });
+
+    await expect(executor.execute(context({ uetGoogleEmail: "student@vnu.edu.vn", uetGooglePassword: "private-password" }, async () => undefined))).resolves.toBe(imported);
+    expect(importSession).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a stale provider-owned browser before the adapter can run", async () => {
+    const staleBrowser: BrowserConnection = {
+      ...browser,
+      assertOwned: async () => { throw new LeaseLostError(); },
+    };
+    const importSession = vi.fn(async () => imported);
+    const executor = createUetAutomationExecutor({ adapter: adapter(importSession) });
+    const staleContext = { ...context({ uetGoogleEmail: "student@vnu.edu.vn", uetGooglePassword: "private-password" }, async () => undefined), browser: staleBrowser };
+
+    await expect(executor.execute(staleContext)).rejects.toMatchObject({ code: "LEASE_LOST" });
+    expect(importSession).not.toHaveBeenCalled();
+  });
+
   it("uses the typed CAPTCHA hook and propagates cancellation", async () => {
     const captcha = vi.fn(async ({ image, signal }: { image: string; signal: AbortSignal }) => {
       expect(image).toBe("data:image/png;base64,FAKE");
@@ -149,11 +197,8 @@ describe("UET automation executor", () => {
     expect(importSession).not.toHaveBeenCalled();
   });
 
-  it("fails closed without a browser bridge and on an identity mismatch", async () => {
+  it("fails closed on an identity mismatch", async () => {
     const baseContext = context({ uetGoogleEmail: "student@vnu.edu.vn", uetGooglePassword: "private-password" }, async () => undefined);
-    await expect(createUetAutomationExecutor({ adapter: adapter(async () => imported) }).execute(baseContext)).rejects.toMatchObject({
-      code: "UET_BROWSER_BRIDGE_UNSUPPORTED",
-    });
 
     const mismatch = { ...imported, studentCode: "STUDENT-2" };
     const executor = createUetAutomationExecutor({

@@ -64,6 +64,50 @@ export type ImportedSession = {
 // (that's exactly what @cloudflare/puppeteer's puppeteer.launch() expects).
 export type BrowserBinding = { fetch: typeof fetch };
 
+// The small Puppeteer surface used by the UET Google flow. This is intentionally
+// structural so a Node-only host can inject its already-owned browser without
+// making this shared contract depend on puppeteer-core at runtime.
+export type UetBrowserCookie = GoogleSessionCookie;
+
+export type UetElementHandle = {
+  click(): Promise<void>;
+};
+
+export type UetNavigationOptions = {
+  waitUntil: "domcontentloaded" | "networkidle0";
+  timeout?: number;
+};
+
+export type UetPageDriver = {
+  close(): Promise<void>;
+  setCookie(...cookies: GoogleSessionCookie[]): Promise<void>;
+  goto(url: string, options: UetNavigationOptions): Promise<unknown>;
+  url(): string;
+  waitForSelector(selector: string, options?: { timeout?: number }): Promise<UetElementHandle>;
+  click(selector: string): Promise<void>;
+  type(selector: string, text: string, options?: { delay?: number }): Promise<void>;
+  waitForNavigation(options: UetNavigationOptions): Promise<unknown>;
+  bringToFront(): Promise<void>;
+  isClosed(): boolean;
+  evaluate<T>(pageFunction: () => T): Promise<T>;
+  once(event: "close", listener: () => void): void;
+  cookies(...urls: string[]): Promise<UetBrowserCookie[]>;
+  waitForNetworkIdle(options: { idleTime: number; timeout: number }): Promise<void>;
+};
+
+export type UetBrowserTarget = {
+  page(): Promise<UetPageDriver | undefined>;
+};
+
+export type UetBrowserDriver = {
+  readonly connected?: boolean;
+  newPage(): Promise<UetPageDriver>;
+  close(): Promise<void>;
+  disconnect(): Promise<void> | void;
+  on(event: "targetcreated", listener: (target: UetBrowserTarget) => void): void;
+  off(event: "targetcreated", listener: (target: UetBrowserTarget) => void): void;
+};
+
 // Two ways to drive the Google-login automation's headless browser:
 // - "cloudflare": Cloudflare's managed Browser Rendering binding (env.BROWSER),
 //   used when deployed to Cloudflare Workers. This is the live-verified,
@@ -74,7 +118,11 @@ export type BrowserBinding = { fetch: typeof fetch };
 export type BrowserConnection =
   | { kind: "cloudflare"; binding: BrowserBinding }
   | { kind: "self-hosted"; browserWSEndpoint: string }
-  | { kind: "local"; headless?: boolean };
+  | { kind: "local"; headless?: boolean }
+  // Node-only bridge for a browser owned by an automation host. The optional
+  // assertion is checked at handoff boundaries so a stale lease cannot keep
+  // driving the shared browser session.
+  | { kind: "owned"; driver: UetBrowserDriver; assertOwned?: () => Promise<void> };
 
 export type ImportSessionContext = {
   // Cancellation for the complete import operation. LoginImportInput.signal

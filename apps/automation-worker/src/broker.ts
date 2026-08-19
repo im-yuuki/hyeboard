@@ -65,7 +65,10 @@ function normalizeMessages(value: unknown): StreamMessage[] {
 }
 
 export class RedisStreamsBroker implements StreamsBroker {
-  constructor(private readonly client: NodeRedisStreamsClient) {}
+  constructor(
+    private readonly client: NodeRedisStreamsClient,
+    private readonly blockingClient: NodeRedisStreamsClient = client,
+  ) {}
 
   async ensureGroup(stream: string, group: string): Promise<void> {
     try {
@@ -77,7 +80,7 @@ export class RedisStreamsBroker implements StreamsBroker {
 
   async readGroup(input: ReadGroupInput): Promise<StreamMessage[]> {
     if (input.signal?.aborted) return [];
-    return normalizeMessages(await this.client.xReadGroup(input.group, input.consumer, { [input.stream]: ">" }, { COUNT: input.count, BLOCK: input.blockMs }));
+    return normalizeMessages(await this.blockingClient.xReadGroup(input.group, input.consumer, { [input.stream]: ">" }, { COUNT: input.count, BLOCK: input.blockMs }));
   }
 
   async reclaimPending(input: ReclaimPendingInput): Promise<StreamMessage[]> {

@@ -1,4 +1,5 @@
 import {
+  createChallengeId,
   parseUetImportJob,
   type UetImportJob,
 } from "@hyeboard/automation-protocol";
@@ -29,10 +30,11 @@ export type AutomationWorkerOptions<TCredential, TResult> = {
   executor: AutomationExecutor<TCredential, TResult>;
   events: AutomationEventSink;
   logger?: AutomationWorkerLogger;
+  onCaptchaNeeded?: (request: { job: UetImportJob; challengeId: string; image: string; signal: AbortSignal; publishChallenge: () => Promise<void> }) => Promise<string>;
   now?: () => number;
 };
 
-type ActiveRun = { token: CancellationToken; lease: JobLease };
+type ActiveRun = { token: CancellationToken; lease: JobLease; accountId: string; fence: number };
 
 export class AutomationWorker<TCredential, TResult> {
   private readonly now: () => number;
@@ -52,7 +54,9 @@ export class AutomationWorker<TCredential, TResult> {
     this.running = true;
     this.draining = false;
     await this.ensureGroup();
-    this.loopPromise = this.consume();
+    this.loopPromise = this.consume().catch((error) => {
+      if (!this.draining) this.options.logger?.error?.("Automation job consumer stopped unexpectedly.", { code: errorCode(error) });
+    });
   }
 
   async stop(reason: CancellationReason = "shutdown"): Promise<void> {
@@ -108,6 +112,13 @@ export class AutomationWorker<TCredential, TResult> {
     return true;
   }
 
+  requestFencedCancel(input: { jobId: string; accountId: string; fence: number; reason?: "requested" }): boolean {
+    const active = this.active.get(input.jobId);
+    if (!active || active.accountId !== input.accountId || active.fence !== input.fence) return false;
+    active.token.cancel(input.reason ?? "requested");
+    return true;
+  }
+
   private async ensureGroup(): Promise<void> {
     if (this.groupReady) return;
     await this.options.broker.ensureGroup(this.options.config.jobStream, this.options.config.consumerGroup);
@@ -146,7 +157,7 @@ export class AutomationWorker<TCredential, TResult> {
     }
 
     const cancellation = new CancellationToken(Date.parse(job.expiresAt), this.shutdown.signal, this.now);
-    this.active.set(job.jobId, { token: cancellation, lease });
+    this.active.set(job.jobId, { token: cancellation, lease, accountId: job.accountId, fence: job.fence });
     const events = new JobEventWriter(job, this.options.events, this.options.config.resultTtlMs, this.now);
     const heartbeat = new JobHeartbeat(
       lease,
@@ -166,6 +177,18 @@ export class AutomationWorker<TCredential, TResult> {
         credential,
         browser: connection,
         cancellation,
+        onCaptchaNeeded: this.options.onCaptchaNeeded
+          ? (image: string, signal?: AbortSignal) => {
+              const challengeId = createChallengeId();
+              return this.options.onCaptchaNeeded!({
+                job,
+                challengeId,
+                image,
+                signal: signal ?? cancellation.signal,
+                publishChallenge: () => events.emit("challenge-required", { challengeId, image }).then(() => undefined),
+              });
+            }
+          : undefined,
         progress: async (phase, percent) => {
           await lease.assertHeld();
           await events.emit("progress", { phase, percent });

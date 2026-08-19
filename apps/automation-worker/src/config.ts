@@ -9,8 +9,11 @@ export type AutomationWorkerConfig = {
   redisUrl: string;
   jobStream: string;
   eventStream: string;
+  controlStream: string;
   consumerGroup: string;
   consumerName: string;
+  controlConsumerGroup: string;
+  controlConsumerName: string;
   executionMode: AutomationExecutionMode;
   browserProvider: AutomationBrowserProvider;
   browserlessEndpoint?: string;
@@ -18,6 +21,7 @@ export type AutomationWorkerConfig = {
   jobEnvelopeAad: string;
   credentialEnvelopeAadPrefix: string;
   resultEnvelopeAadPrefix: string;
+  eventEnvelopeAadPrefix: string;
   leaseTtlMs: number;
   heartbeatIntervalMs: number;
   reclaimIdleMs: number;
@@ -127,8 +131,11 @@ export function parseAutomationWorkerConfig(env: Env): AutomationWorkerConfig {
     redisUrl: url(env, "REDIS_URL", ["redis:", "rediss:"]),
     jobStream: env.AUTOMATION_JOB_STREAM?.trim() || "hyeboard:automation:jobs",
     eventStream: env.AUTOMATION_EVENT_STREAM?.trim() || "hyeboard:automation:events",
+    controlStream: env.AUTOMATION_CONTROL_STREAM?.trim() || "hyeboard:automation:control",
     consumerGroup: env.AUTOMATION_CONSUMER_GROUP?.trim() || "automation-workers",
     consumerName: env.AUTOMATION_CONSUMER_NAME?.trim() || `worker-${process.pid}`,
+    controlConsumerGroup: env.AUTOMATION_CONTROL_CONSUMER_GROUP?.trim() || "automation-control-workers",
+    controlConsumerName: env.AUTOMATION_CONTROL_CONSUMER_NAME?.trim() || `control-${process.pid}`,
     executionMode,
     browserProvider,
     ...(browserlessEndpoint ? { browserlessEndpoint: url({ BROWSERLESS_ENDPOINT: browserlessEndpoint }, "BROWSERLESS_ENDPOINT", ["wss:", "ws:", "https:"]) } : {}),
@@ -136,6 +143,7 @@ export function parseAutomationWorkerConfig(env: Env): AutomationWorkerConfig {
     jobEnvelopeAad: env.AUTOMATION_JOB_ENVELOPE_AAD?.trim() || "hyeboard:automation:job:v1",
     credentialEnvelopeAadPrefix: env.AUTOMATION_CREDENTIAL_AAD_PREFIX?.trim() || "hyeboard:automation:credential:",
     resultEnvelopeAadPrefix: env.AUTOMATION_RESULT_AAD_PREFIX?.trim() || "hyeboard:automation:result:",
+    eventEnvelopeAadPrefix: env.AUTOMATION_EVENT_AAD_PREFIX?.trim() || "hyeboard:automation:event:",
     leaseTtlMs,
     heartbeatIntervalMs,
     reclaimIdleMs: positiveInteger(env, "AUTOMATION_RECLAIM_IDLE_MS", leaseTtlMs),
@@ -152,8 +160,11 @@ export function safeConfigSummary(config: AutomationWorkerConfig): Record<string
     redisUrl: new URL(config.redisUrl).origin,
     jobStream: config.jobStream,
     eventStream: config.eventStream,
+    controlStream: config.controlStream,
     consumerGroup: config.consumerGroup,
     consumerName: config.consumerName,
+    controlConsumerGroup: config.controlConsumerGroup,
+    controlConsumerName: config.controlConsumerName,
     executionMode: config.executionMode,
     browserProvider: config.browserProvider,
     browserlessEndpoint: config.browserlessEndpoint ? new URL(config.browserlessEndpoint).origin : undefined,

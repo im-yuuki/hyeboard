@@ -3,6 +3,7 @@ import {
   AutomationWorker,
   CancellationToken,
   ConfigurationError,
+  createUetAdapterConnection,
   InMemoryAutomationEventSink,
   InMemoryJobLeaseStore,
   InMemoryStreamsBroker,
@@ -27,8 +28,11 @@ const config = {
   redisUrl: "redis://localhost:6379/0",
   jobStream: "jobs",
   eventStream: "events",
+  controlStream: "control",
   consumerGroup: "workers",
   consumerName: "test-worker",
+  controlConsumerGroup: "control-workers",
+  controlConsumerName: "test-control-worker",
   executionMode: "distributed" as const,
   browserProvider: "browserless" as const,
   browserlessEndpoint: "wss://browserless.example.test",
@@ -36,6 +40,7 @@ const config = {
   jobEnvelopeAad: "job-aad",
   credentialEnvelopeAadPrefix: "credential:",
   resultEnvelopeAadPrefix: "result:",
+  eventEnvelopeAadPrefix: "event:",
   leaseTtlMs: 30_000,
   heartbeatIntervalMs: 10_000,
   reclaimIdleMs: 1_000,
@@ -44,6 +49,29 @@ const config = {
   maxDeliveryCount: 2,
   resultTtlMs: 30_000,
   keyring,
+};
+
+const fakeBrowser: PuppeteerBrowser = {
+  newPage: async () => ({
+    close: async () => undefined,
+    setCookie: async () => undefined,
+    goto: async () => undefined,
+    url: () => "about:blank",
+    waitForSelector: async () => ({ click: async () => undefined }),
+    click: async () => undefined,
+    type: async () => undefined,
+    waitForNavigation: async () => undefined,
+    bringToFront: async () => undefined,
+    isClosed: () => false,
+    evaluate: async <T>() => null as T,
+    once: () => undefined,
+    cookies: async () => [],
+    waitForNetworkIdle: async () => undefined,
+  }),
+  close: async () => undefined,
+  disconnect: async () => undefined,
+  on: () => undefined,
+  off: () => undefined,
 };
 
 function env(overrides: Record<string, string> = {}): Record<string, string> {
@@ -89,13 +117,12 @@ describe("automation worker configuration", () => {
 describe("Browserless provider", () => {
   it("keeps the token inside the connector and exposes ownership metadata only", async () => {
     const endpoints: string[] = [];
-    const browser: PuppeteerBrowser = { newPage: async () => ({}), disconnect: async () => undefined };
     const provider = createBrowserlessPuppeteerProvider({
       endpoint: "wss://browserless.example.test/session",
       token: "private-browserless-token",
       connect: async ({ browserWSEndpoint }) => {
         endpoints.push(browserWSEndpoint);
-        return browser;
+        return fakeBrowser;
       },
       id: () => "connection-1",
       now: () => now,
@@ -104,7 +131,11 @@ describe("Browserless provider", () => {
     expect(endpoints[0]).toContain("private-browserless-token");
     expect(connection.metadata).toEqual(expect.objectContaining({ provider: "browserless", endpointOrigin: "wss://browserless.example.test", reconnectable: true }));
     expect(JSON.stringify(connection.metadata)).not.toContain("private-browserless-token");
+    const adapterConnection = createUetAdapterConnection(connection);
+    expect(adapterConnection).toMatchObject({ kind: "owned", driver: fakeBrowser });
+    if (adapterConnection.kind === "owned") await adapterConnection.assertOwned?.();
     await connection.disconnect();
+    await expect(connection.assertOwned()).rejects.toThrow(/no longer active/);
   });
 });
 
@@ -117,13 +148,12 @@ describe("in-memory automation worker", () => {
     const credentials = await encryptEnvelope({ bearer: "private-upstream-token" }, { keyring, aad: `credential:${value.jobId}`, issuedAt: "2036-01-02T03:00:00.000Z", expiresAt: "2036-01-02T04:00:00.000Z", randomBytes: () => new Uint8Array(12).fill(8) });
     const encryptedJob = await codec.close({ ...value, credentialEnvelope: credentials }, "job-aad", "2036-01-02T04:00:00.000Z");
     await broker.add("jobs", { jobEnvelope: encryptedJob });
-    const browser: PuppeteerBrowser = { newPage: async () => ({}), disconnect: async () => undefined };
     const worker = new AutomationWorker({
       config,
       broker,
       leaseStore: new InMemoryJobLeaseStore(() => now),
       envelopeCodec: codec,
-      browserProvider: createBrowserlessPuppeteerProvider({ endpoint: config.browserlessEndpoint, token: config.browserlessToken, connect: async () => browser, now: () => now }),
+       browserProvider: createBrowserlessPuppeteerProvider({ endpoint: config.browserlessEndpoint, token: config.browserlessToken, connect: async () => fakeBrowser, now: () => now }),
       executor: { execute: async ({ credential, progress }) => { expect(credential).toEqual({ bearer: "private-upstream-token" }); await progress("import", 75); return { imported: true }; } },
       events,
       now: () => now,
@@ -157,13 +187,12 @@ describe("in-memory automation worker", () => {
     await broker.add("jobs", { jobEnvelope: await codec.close({ ...value, credentialEnvelope: credentials }, "job-aad", "2036-01-02T04:00:00.000Z") });
     let release: (() => void) | undefined;
     const blocked = new Promise<void>((resolve) => { release = resolve; });
-    const browser: PuppeteerBrowser = { newPage: async () => ({}), disconnect: async () => undefined };
     const worker = new AutomationWorker({
       config: { ...config, shutdownTimeoutMs: 20 },
       broker,
       leaseStore: new InMemoryJobLeaseStore(() => now),
       envelopeCodec: codec,
-      browserProvider: createBrowserlessPuppeteerProvider({ endpoint: config.browserlessEndpoint, token: config.browserlessToken, connect: async () => browser, now: () => now }),
+       browserProvider: createBrowserlessPuppeteerProvider({ endpoint: config.browserlessEndpoint, token: config.browserlessToken, connect: async () => fakeBrowser, now: () => now }),
       executor: { execute: async ({ cancellation }) => { await Promise.race([blocked, cancellation.sleep(10_000)]); cancellation.throwIfCancelled(); return { imported: true }; } },
       events,
       now: () => now,

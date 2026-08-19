@@ -9,7 +9,7 @@ import type {
 } from "@hyeboard/university-adapters";
 import { AutomationWorkerError } from "./errors";
 import type { AutomationExecutionContext, AutomationExecutor, AutomationProgressPhase } from "./executor";
-import type { BrowserConnection } from "./provider";
+import { createUetAdapterConnection, type BrowserConnection } from "./provider";
 
 export type UetAutomationCredential = Pick<LoginImportInput, "uetGoogleEmail" | "uetGooglePassword" | "uetGoogleCookies"> & {
   uetGoogleEmail: string;
@@ -28,7 +28,7 @@ export type UetCaptchaRequest = {
  */
 export type UetCaptchaAnswerHandler = (request: UetCaptchaRequest) => Promise<string>;
 
-export type UetAdapterConnectionFactory = (connection: BrowserConnection) => AdapterBrowserConnection;
+export type UetAdapterConnectionFactory = (connection: BrowserConnection, assertOwned: () => Promise<void>) => AdapterBrowserConnection;
 
 export type UetAutomationExecutorOptions = {
   adapter?: UniversityAdapter;
@@ -82,14 +82,16 @@ export function createUetAutomationExecutor(options: UetAutomationExecutorOption
       assertCredential(context.credential);
       context.cancellation.throwIfCancelled();
 
-      if (!options.adapterConnection) {
-        throw unsupported("The automation worker has no adapter connection bridge for the supplied browser session.");
-      }
-
-      const adapterConnection = options.adapterConnection(context.browser);
+      const assertOwned = async (): Promise<void> => {
+        context.cancellation.throwIfCancelled();
+        await context.browser.assertOwned();
+        context.cancellation.throwIfCancelled();
+      };
+      const adapterConnection = (options.adapterConnection ?? createUetAdapterConnection)(context.browser, assertOwned);
       if (adapterConnection.kind === "cloudflare") {
         throw unsupported("Cloudflare browser connections are not supported by the self-hosted automation worker.");
       }
+      await assertOwned();
 
       let progressTail = Promise.resolve();
       const reportProgress = (message: string): void => {
@@ -104,18 +106,21 @@ export function createUetAutomationExecutor(options: UetAutomationExecutorOption
       await context.progress("queue", 0);
       await context.progress("login", 10);
 
+      const captchaHandler = options.onCaptchaNeeded
+        ? async (image: string, signal?: AbortSignal) => options.onCaptchaNeeded!({
+            job: context.job,
+            image,
+            signal: signal ?? context.cancellation.signal,
+          })
+        : context.onCaptchaNeeded;
       const importContext: ImportSessionContext = {
         browserConnection: adapterConnection,
         signal: context.cancellation.signal,
         onProgress: reportProgress,
-        onCaptchaNeeded: options.onCaptchaNeeded
+        onCaptchaNeeded: captchaHandler
           ? async (image, signal) => {
               context.cancellation.throwIfCancelled();
-              const answer = await options.onCaptchaNeeded!({
-                job: context.job,
-                image,
-                signal: signal ?? context.cancellation.signal,
-              });
+              const answer = await captchaHandler(image, signal);
               context.cancellation.throwIfCancelled();
               if (typeof answer !== "string" || answer.trim() === "") {
                 throw new AutomationWorkerError("The CAPTCHA answer was empty.", "UET_CAPTCHA_ANSWER_INVALID");

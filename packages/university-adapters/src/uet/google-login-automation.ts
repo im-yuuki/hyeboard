@@ -1,13 +1,13 @@
 import puppeteer from "@cloudflare/puppeteer";
 import puppeteerCore from "puppeteer-core";
 import { getLogger, HyeboardError, type GoogleSessionCookie } from "@hyeboard/core";
-import type { BrowserConnection } from "../types";
+import type { BrowserConnection, UetBrowserDriver, UetBrowserTarget, UetPageDriver } from "../types";
 
 // Structural type covering whichever of @cloudflare/puppeteer's or
 // puppeteer-core's Browser we got — both packages implement the same
 // Puppeteer API surface (newPage/close/on/off) that runFlow() relies on, so
 // the rest of this file doesn't need to know which one produced the browser.
-type AnyBrowser = Awaited<ReturnType<typeof puppeteer.launch>>;
+type AnyBrowser = UetBrowserDriver;
 
 export const STUDENTHUB_LOGIN_URL = "https://studenthub.uet.edu.vn/login";
 export const CANVAS_SSO_URL = "https://portal.uet.vnu.edu.vn/login/saml";
@@ -298,9 +298,11 @@ export async function closeCachedBrowserSessions(): Promise<void> {
 
 async function acquireBrowser(connection: BrowserConnection): Promise<AnyBrowser> {
   if (connection.kind === "cloudflare") {
-    return await puppeteer.launch(connection.binding as never);
+    return (await puppeteer.launch(connection.binding as never)) as unknown as AnyBrowser;
   } else if (connection.kind === "self-hosted") {
     return (await puppeteerCore.connect({ browserWSEndpoint: connection.browserWSEndpoint })) as unknown as AnyBrowser;
+  } else if (connection.kind === "owned") {
+    return connection.driver;
   } else {
     const chromePath = process.env.HYEB_CHROME_PATH ?? await findChromeExecutable();
     if (!chromePath) {
@@ -335,6 +337,7 @@ export async function automateVnuGoogleLogin(
   signal?: AbortSignal,
 ): Promise<GoogleLoginResult> {
   throwIfAutomationAborted(signal);
+  await assertConnectionOwned(connection);
   // "local" + a registered Patchright launcher (see setPatchrightLauncher
   // above) + explicit opt-in via env var — dispatches to a completely
   // separate Playwright-based implementation instead of Puppeteer below.
@@ -372,13 +375,15 @@ export async function automateVnuGoogleLogin(
       browser = reusingCache
         ? cached!.browser
         : await awaitAutomationOperation(acquisition, deadline.signal, async () => {
-            await browser?.close().catch(() => undefined);
+            await interruptBrowser(browser, connection);
           });
       log.debug({ reusingCache }, "automateVnuGoogleLogin: browser acquired");
+      await assertConnectionOwned(connection);
       flow = runFlow(browser, email, password, result, existingCookies, onProgress, deadline.signal);
       await awaitAutomationOperation(flow, deadline.signal, async () => {
-        await browser?.close().catch(() => undefined);
+        await interruptBrowser(browser, connection);
       });
+      await assertConnectionOwned(connection);
       throwIfAutomationAborted(signal);
 
       // Success: keep the browser alive for the next refresh instead of
@@ -402,7 +407,7 @@ export async function automateVnuGoogleLogin(
           continue;
         }
       }
-      if (!reusingCache) await browser?.close().catch(() => undefined);
+      if (!reusingCache && connection.kind !== "owned") await browser?.close().catch(() => undefined);
       deadline.dispose();
       if (callerAborted) throw signal?.reason ?? error;
       if (deadline.signal.aborted) throw deadline.signal.reason ?? error;
@@ -432,6 +437,19 @@ export async function automateVnuGoogleLogin(
   return result;
 }
 
+async function assertConnectionOwned(connection: BrowserConnection): Promise<void> {
+  if (connection.kind === "owned") await connection.assertOwned?.();
+}
+
+async function interruptBrowser(browser: AnyBrowser | undefined, connection: BrowserConnection): Promise<void> {
+  if (!browser) return;
+  if (connection.kind === "owned") {
+    await browser.disconnect();
+    return;
+  }
+  await browser.close().catch(() => undefined);
+}
+
 async function evictStaleIfIdle(key: string): Promise<void> {
   const cached = browserSessionCache.get(key);
   if (cached && Date.now() - cached.lastUsedAt > IDLE_EVICTION_MS) {
@@ -452,11 +470,11 @@ async function evictStaleIfIdle(key: string): Promise<void> {
 // helper because the Keycloak-federation recovery path below needs to
 // invoke this same click-and-wait sequence a second time.
 async function clickGoogleButtonAndWaitForPopup(
-  page: import("@cloudflare/puppeteer").Page,
+  page: UetPageDriver,
   browser: AnyBrowser,
-): Promise<import("@cloudflare/puppeteer").Page> {
-  const popupPromise = new Promise<import("@cloudflare/puppeteer").Page>((resolve, reject) => {
-    const onTarget = async (target: import("@cloudflare/puppeteer").Target) => {
+): Promise<UetPageDriver> {
+  const popupPromise = new Promise<UetPageDriver>((resolve, reject) => {
+    const onTarget = async (target: UetBrowserTarget) => {
       const popupPage = await target.page();
       if (popupPage) {
         browser.off("targetcreated", onTarget);
@@ -505,7 +523,7 @@ async function runFlow(
 }
 
 async function runFlowBody(
-  page: import("@cloudflare/puppeteer").Page,
+  page: UetPageDriver,
   browser: AnyBrowser,
   email: string,
   password: string,
@@ -540,7 +558,7 @@ async function runFlowBody(
   report("Signing in with Google...");
   let popup = await clickGoogleButtonAndWaitForPopup(page, browser);
 
-  const checkPopupChallenge = async (p: import("@cloudflare/puppeteer").Page) => {
+  const checkPopupChallenge = async (p: UetPageDriver) => {
     const challenge = detectChallenge(p.url(), await p.evaluate(() => document.body.innerText).catch(() => ""));
     if (challenge) throw new HyeboardError(challenge, "Google requires additional verification that cannot be completed automatically.", 401);
   };

@@ -1,5 +1,6 @@
 export * from "./broker";
 export * from "./cancellation";
+export * from "./control";
 export * from "./config";
 export * from "./envelope";
 export * from "./errors";
@@ -8,6 +9,7 @@ export * from "./executor";
 export * from "./heartbeat";
 export * from "./lease";
 export * from "./lifecycle";
+export * from "./main";
 export * from "./provider";
 export * from "./uet-executor";
 export * from "./worker";

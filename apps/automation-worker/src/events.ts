@@ -4,6 +4,7 @@ import {
   type UetImportJob,
 } from "@hyeboard/automation-protocol";
 import type { StreamsBroker } from "./broker";
+import type { AutomationEnvelopeCodec } from "./envelope";
 
 export interface AutomationEventSink {
   publish(event: AutomationEvent): Promise<void>;
@@ -14,6 +15,20 @@ export class StreamAutomationEventSink implements AutomationEventSink {
 
   async publish(event: AutomationEvent): Promise<void> {
     await this.broker.add(this.stream, { jobId: event.jobId, event: JSON.stringify(event) });
+  }
+}
+
+export class EncryptedStreamAutomationEventSink implements AutomationEventSink {
+  constructor(
+    private readonly broker: StreamsBroker,
+    private readonly stream: string,
+    private readonly codec: AutomationEnvelopeCodec,
+    private readonly aadPrefix: string,
+  ) {}
+
+  async publish(event: AutomationEvent): Promise<void> {
+    const eventEnvelope = await this.codec.close(event, `${this.aadPrefix}${event.jobId}`, event.expiresAt);
+    await this.broker.add(this.stream, { jobId: event.jobId, eventEnvelope });
   }
 }
 

@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
+import type { BrowserConnection as AdapterBrowserConnection, UetBrowserDriver } from "@hyeboard/university-adapters";
 import { ConfigurationError } from "./errors";
 
-export type PuppeteerBrowser = {
-  newPage(): Promise<unknown>;
+export type PuppeteerBrowser = UetBrowserDriver & {
   disconnect(): Promise<void> | void;
 };
 
@@ -15,6 +15,10 @@ export type BrowserConnectionMetadata = {
     connection: "automation-worker";
     reconnectEndpoint: "automation-worker";
   };
+  adapter: {
+    driver: "puppeteer";
+    connectionId: string;
+  };
   reconnectable: true;
   connectedAt: string;
 };
@@ -23,12 +27,37 @@ export type BrowserConnection = {
   browser: PuppeteerBrowser;
   metadata: BrowserConnectionMetadata;
   reconnect(): Promise<BrowserConnection>;
+  assertOwned(): Promise<void>;
   disconnect(): Promise<void>;
 };
 
 export type BrowserProvider = {
   open(signal?: AbortSignal): Promise<BrowserConnection>;
 };
+
+// Converts an owned worker connection into the adapter's Node-only bridge.
+// The driver object is intentionally kept outside metadata; metadata is safe
+// to inspect and contains no endpoint, token, or browser protocol handle.
+export function createUetAdapterConnection(
+  connection: BrowserConnection,
+  assertOwned?: () => Promise<void>,
+): AdapterBrowserConnection {
+  if (
+    connection.metadata.provider !== "browserless"
+    || connection.metadata.adapter.driver !== "puppeteer"
+    || connection.metadata.adapter.connectionId !== connection.metadata.connectionId
+  ) {
+    throw new ConfigurationError("The browser connection is not a supported Puppeteer adapter bridge.");
+  }
+  return {
+    kind: "owned",
+    driver: connection.browser,
+    assertOwned: async () => {
+      await connection.assertOwned();
+      await assertOwned?.();
+    },
+  };
+}
 
 export type PuppeteerConnector = (options: { browserWSEndpoint: string }) => Promise<PuppeteerBrowser>;
 
@@ -56,11 +85,14 @@ export function createBrowserlessPuppeteerProvider(options: BrowserlessProviderO
   const open = async (signal?: AbortSignal): Promise<BrowserConnection> => {
     if (signal?.aborted) throw new Error("Browser connection was cancelled.");
     const browser = await options.connect({ browserWSEndpoint: reconnectEndpoint });
+    let disconnected = false;
+    const connectionId = id();
     const metadata: BrowserConnectionMetadata = {
-      connectionId: id(),
+      connectionId,
       provider: "browserless",
       endpointOrigin: endpoint.origin,
       ownership: { browser: "browserless", connection: "automation-worker", reconnectEndpoint: "automation-worker" },
+      adapter: { driver: "puppeteer", connectionId },
       reconnectable: true,
       connectedAt: new Date(now()).toISOString(),
     };
@@ -68,7 +100,12 @@ export function createBrowserlessPuppeteerProvider(options: BrowserlessProviderO
       browser,
       metadata,
       reconnect: () => open(signal),
+      assertOwned: async () => {
+        if (disconnected || browser.connected === false) throw new ConfigurationError("The owned browser connection is no longer active.");
+      },
       disconnect: async () => {
+        if (disconnected) return;
+        disconnected = true;
         await browser.disconnect();
       },
     };

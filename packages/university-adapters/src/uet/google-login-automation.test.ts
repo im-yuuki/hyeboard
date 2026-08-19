@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
+import type { UetPageDriver } from "../types";
 import { awaitAutomationOperation, detectChallenge, serializeCookies } from "./google-login-automation";
 
-const browserMocks = vi.hoisted(() => ({ launch: vi.fn() }));
+const browserMocks = vi.hoisted(() => ({ launch: vi.fn(), connect: vi.fn() }));
 vi.mock("@cloudflare/puppeteer", () => ({ default: { launch: browserMocks.launch } }));
-vi.mock("puppeteer-core", () => ({ default: { connect: vi.fn(), launch: vi.fn() } }));
+vi.mock("puppeteer-core", () => ({ default: { connect: browserMocks.connect, launch: vi.fn() } }));
 
 describe("detectChallenge", () => {
   it("returns GOOGLE_2FA_REQUIRED for a totp challenge URL", () => {
@@ -110,6 +111,49 @@ describe("automateVnuGoogleLogin cancellation", () => {
 
     await expect(pending).rejects.toBe(reason);
     expect(browser.close).toHaveBeenCalled();
+    expect(page.close).toHaveBeenCalled();
+  });
+
+  it("uses and disconnects an owned driver without opening a second Puppeteer connection", async () => {
+    const { automateVnuGoogleLogin } = await import("./google-login-automation");
+    const controller = new AbortController();
+    const reason = new DOMException("login cancelled", "AbortError");
+    let rejectNavigation: ((error: Error) => void) | undefined;
+    let navigationStarted: () => void = () => undefined;
+    const started = new Promise<void>((resolve) => { navigationStarted = resolve; });
+    const page = {
+      close: vi.fn(async () => undefined),
+      goto: vi.fn(() => {
+        navigationStarted();
+        return new Promise<never>((_, reject) => { rejectNavigation = reject; });
+      }),
+    } as unknown as UetPageDriver;
+    const driver = {
+      connected: true,
+      close: vi.fn(async () => undefined),
+      disconnect: vi.fn(async () => { rejectNavigation?.(new Error("driver disconnected")); }),
+      newPage: vi.fn(async () => page),
+      on: vi.fn(),
+      off: vi.fn(),
+    };
+    browserMocks.connect.mockClear();
+
+    const pending = automateVnuGoogleLogin(
+      { kind: "owned", driver },
+      "20200001@vnu.edu.vn",
+      "password",
+      undefined,
+      undefined,
+      controller.signal,
+    );
+    await started;
+    controller.abort(reason);
+
+    await expect(pending).rejects.toBe(reason);
+    expect(driver.newPage).toHaveBeenCalledOnce();
+    expect(driver.disconnect).toHaveBeenCalledOnce();
+    expect(driver.close).not.toHaveBeenCalled();
+    expect(browserMocks.connect).not.toHaveBeenCalled();
     expect(page.close).toHaveBeenCalled();
   });
 });
