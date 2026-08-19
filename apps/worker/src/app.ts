@@ -8,12 +8,14 @@ import { LocalCaptchaRelayCoordinator, captchaRelayCancelled, captchaRelayNotFou
 import { probeBudgetUnavailable, VNU_BRC1_PERMIT_LIMIT, type VnuProbeBudgetCoordinator } from "./vnu-probe-budget";
 import { vnuRefreshUnavailable, type BeginRefreshResult, type LinkedPair, type VnuRefreshControlCoordinator } from "./vnu-refresh-control";
 import { resolveVnuStudentId, VNU_STUDENT_ID_RESOLVER_MAX_PROBES } from "./vnu-student-id-resolver";
-import { normalizeSelfHostedInteger, parseVnuRuntimeConfig, type EffectiveVnuRuntimeConfig } from "./vnu-runtime-config";
+import { parseVnuRuntimeConfig, type EffectiveVnuRuntimeConfig } from "./vnu-runtime-config";
 import { buildVnuCrossDetailConsumeInput, createVnuCrossDetailMinter, crossDetailUnavailable, parseVnuCrossDetailPermitString, readVnuCrossDetailBody } from "./vnu-cross-detail";
+import { checkSessionEpoch, parseHaConfig, type HaConfig } from "./ha-contracts";
+import { createHaLifecycle, safeHaDiagnostics, type HaLifecycleController } from "./ha-lifecycle";
 
 // ─── Runtime config ───────────────────────────────────────────
 // Self-hosted (Node/Bun) loads config from config.json + env var overrides
-// (see loadConfigFile below). Cloudflare Workers doesn't use config.json
+// (see loadConfigFile in start.ts). Cloudflare Workers doesn't use config.json
 // (no filesystem) — index.ts calls setRuntimeConfig directly with env var
 // values from the `cloudflare:workers` binding.
 //
@@ -43,13 +45,93 @@ export interface RuntimeConfig {
   HOST?: string;
   PORT?: string;
   HYEB_STATIC_DIR?: string;
+  HYEB_HA_MODE?: string;
+  HYEB_HA_NODE_ID?: string;
+  HYEB_HA_SESSION_EPOCH?: string;
+  HYEB_HA_ENFORCE_SESSION_EPOCH?: string;
+  DATABASE_URL?: string;
+  REDIS_URL?: string;
+  HYEB_POSTGRES_URL?: string;
+  HYEB_REDIS_URL?: string;
+  HYEB_SHUTDOWN_TIMEOUT_MS?: string;
+  AUTOMATION_JOB_STREAM?: string;
+  AUTOMATION_EVENT_STREAM?: string;
+  AUTOMATION_CONTROL_STREAM?: string;
+  AUTOMATION_JOB_ENVELOPE_AAD?: string;
+  AUTOMATION_CREDENTIAL_AAD_PREFIX?: string;
+  AUTOMATION_RESULT_AAD_PREFIX?: string;
+  AUTOMATION_EVENT_AAD_PREFIX?: string;
+  AUTOMATION_IDEMPOTENCY_TTL_MS?: string;
+  AUTOMATION_DEADLINE_MS?: string;
+  AUTOMATION_EVENT_BLOCK_MS?: string;
+  AUTOMATION_EVENT_BATCH_SIZE?: string;
+  AUTOMATION_KEY_CURRENT_ID?: string;
+  AUTOMATION_KEY_CURRENT_B64?: string;
+  AUTOMATION_KEY_PREVIOUS_ID?: string;
+  AUTOMATION_KEY_PREVIOUS_B64?: string;
+  AUTOMATION_EXECUTOR_READY?: string;
+  HYEB_AUTOMATION_EXECUTOR_READY?: string;
+}
+
+export type DistributedAutomationEvent = {
+  type: string;
+  jobId: string;
+  accountId: string;
+  fence: number;
+  sequence: number;
+  challengeId?: string;
+  image?: string;
+  phase?: "queue" | "login" | "captcha" | "import" | "finalize";
+  percent?: number;
+  resultEnvelope?: string;
+  code?: string;
+  retryable?: boolean;
+  reason?: "requested" | "expired" | "superseded" | "shutdown";
+};
+
+export type DistributedImportedSession = {
+  universityId: string;
+  studentCode?: string;
+  expiresAt: string;
+  session: EncryptedSessionPayload;
+};
+
+export type DistributedAutomationImportRequest = {
+  email: string;
+  password: string;
+  googleCookies?: unknown[];
+  expectedStudentCode?: string;
+  idempotencyKey: string;
+};
+
+export interface DistributedAutomationBackend {
+  isAvailable(): boolean;
+  isAutomationChallengeToken(value: string): boolean;
+  importUetGoogle(
+    input: DistributedAutomationImportRequest,
+    options: {
+      signal?: AbortSignal;
+      cursor?: number;
+      onJob?: (ownershipToken: string) => void;
+      onEvent?: (event: DistributedAutomationEvent) => Promise<void> | void;
+    },
+  ): Promise<DistributedImportedSession>;
+  createChallengeToken(event: DistributedAutomationEvent, ownershipToken: string): string;
+  answerCaptcha(token: string, answer: string): Promise<void>;
+  cancelCaptcha(token: string): Promise<void>;
+  cancelAutomation(token: string): Promise<void>;
 }
 
 let runtimeConfig: RuntimeConfig = {};
 let effectiveVnuRuntimeConfig: EffectiveVnuRuntimeConfig = parseVnuRuntimeConfig({});
+let haConfig: HaConfig = parseHaConfig();
+let distributedAutomationBackend: DistributedAutomationBackend | undefined;
 
 export function setRuntimeConfig(config: RuntimeConfig): void {
   runtimeConfig = config;
+  haConfig = parseHaConfig(config as Readonly<Record<string, string | undefined>>, {}, (setting, effectiveFallback) => {
+    getLogger().warn({ setting, effectiveFallback }, "invalid HA runtime setting; using safe fallback");
+  });
   effectiveVnuRuntimeConfig = parseVnuRuntimeConfig({
     codeLookupConcurrency: config.VNU_CODE_LOOKUP_CONCURRENCY,
     crossLookupBulkMaxTargets: config.VNU_CROSS_LOOKUP_BULK_MAX_TARGETS,
@@ -68,78 +150,16 @@ export function setRuntimeConfig(config: RuntimeConfig): void {
   });
 }
 
+export function setDistributedAutomationBackend(backend: DistributedAutomationBackend | undefined): void {
+  distributedAutomationBackend = backend;
+}
+
 export function getEffectiveVnuRuntimeConfig(): EffectiveVnuRuntimeConfig {
   return effectiveVnuRuntimeConfig;
 }
 
-// Read non-secret config from a JSON file (Node/Bun only, no-op on CF Workers).
-// The file path defaults to ./config.json relative to cwd, overridable via
-// CONFIG_PATH env var. Returns a partial RuntimeConfig — callers merge with
-// env vars (which take precedence) before passing to setRuntimeConfig.
-//
-// HYEB_SESSION_SECRET is intentionally never read from this file. It must
-// come from an env var only.
-// Structured config.json schema:
-//   { "origins": [...], "browser": { "ws_endpoint", "local", "headless",
-//     "chrome_path", "idle_eviction_minutes" }, "vnu": {
-//     "code_lookup_concurrency", "cross_lookup_bulk_max_targets",
-//     "cross_lookup_direct_chunk_max_targets", "code_lookup_bulk_target_concurrency",
-//     "cross_lookup_request_timeout_ms", "cross_detail_max_targets",
-//     "cross_detail_max_rows", "cross_detail_concurrency", "cross_detail_budget",
-//     "cross_detail_window_seconds", "cross_detail_permit_ttl_seconds",
-//     "cross_detail_export_mode" },
-//     "log_level", "host", "port", "static_dir" }
-// See apps/worker/config.json for the full default file.
-export async function loadConfigFile(): Promise<RuntimeConfig> {
-  const isNode = typeof process !== "undefined" && typeof process.cwd === "function";
-  if (!isNode) return {};
-  try {
-    const configPath = process.env.CONFIG_PATH;
-    const { join } = await import("node:path");
-    const path = configPath || join(process.cwd(), "config.json");
-    const { readFileSync, existsSync } = await import("node:fs");
-    if (!existsSync(path)) return {};
-    const raw = readFileSync(path, "utf-8");
-    const cfg = JSON.parse(raw);
-    const r: RuntimeConfig = {};
-    if (Array.isArray(cfg.origins)) r.HYEB_ALLOWED_ORIGINS = cfg.origins.join(", ");
-    if (cfg.browser && typeof cfg.browser === "object") {
-      if (typeof cfg.browser.ws_endpoint === "string") r.HYEB_BROWSER_WS_ENDPOINT = cfg.browser.ws_endpoint;
-      if (typeof cfg.browser.local === "boolean") r.HYEB_BROWSER_LOCAL = String(cfg.browser.local);
-      if (typeof cfg.browser.headless === "boolean") r.HYEB_BROWSER_HEADLESS = String(cfg.browser.headless);
-      if (typeof cfg.browser.chrome_path === "string") r.HYEB_CHROME_PATH = cfg.browser.chrome_path;
-      if (typeof cfg.browser.idle_eviction_minutes === "number") r.HYEB_BROWSER_IDLE_EVICTION_MS = String(cfg.browser.idle_eviction_minutes * 60_000);
-    }
-    if (cfg.vnu && typeof cfg.vnu === "object" && !Array.isArray(cfg.vnu)) {
-      r.VNU_CODE_LOOKUP_CONCURRENCY = normalizeSelfHostedInteger(cfg.vnu.code_lookup_concurrency);
-      r.VNU_CROSS_LOOKUP_BULK_MAX_TARGETS = normalizeSelfHostedInteger(cfg.vnu.cross_lookup_bulk_max_targets);
-      r.VNU_CROSS_LOOKUP_DIRECT_CHUNK_MAX_TARGETS = normalizeSelfHostedInteger(cfg.vnu.cross_lookup_direct_chunk_max_targets);
-      r.VNU_CODE_LOOKUP_BULK_TARGET_CONCURRENCY = normalizeSelfHostedInteger(cfg.vnu.code_lookup_bulk_target_concurrency);
-      r.VNU_CROSS_LOOKUP_REQUEST_TIMEOUT_MS = normalizeSelfHostedInteger(cfg.vnu.cross_lookup_request_timeout_ms);
-      r.VNU_CROSS_DETAIL_MAX_TARGETS = normalizeSelfHostedInteger(cfg.vnu.cross_detail_max_targets);
-      r.VNU_CROSS_DETAIL_MAX_ROWS = normalizeSelfHostedInteger(cfg.vnu.cross_detail_max_rows);
-      r.VNU_CROSS_DETAIL_CONCURRENCY = normalizeSelfHostedInteger(cfg.vnu.cross_detail_concurrency);
-      r.VNU_CROSS_DETAIL_BUDGET = normalizeSelfHostedInteger(cfg.vnu.cross_detail_budget);
-      r.VNU_CROSS_DETAIL_WINDOW_SECONDS = normalizeSelfHostedInteger(cfg.vnu.cross_detail_window_seconds);
-      r.VNU_CROSS_DETAIL_PERMIT_TTL_SECONDS = normalizeSelfHostedInteger(cfg.vnu.cross_detail_permit_ttl_seconds);
-      if (typeof cfg.vnu.cross_detail_export_mode === "string") r.VNU_CROSS_DETAIL_EXPORT_MODE = cfg.vnu.cross_detail_export_mode;
-    }
-    if (typeof cfg.log_level === "string") r.HYEB_LOG_LEVEL = cfg.log_level;
-    if (typeof cfg.host === "string") r.HOST = cfg.host;
-    if (typeof cfg.port === "number") r.PORT = String(cfg.port);
-    // Empty string means "use the built-in default" (see config.json's
-    // checked-in default) — only set it when non-empty, since start.ts's
-    // `process.env.HYEB_STATIC_DIR ?? fileConfig.HYEB_STATIC_DIR ?? default`
-    // fallback chain uses `??`, which does NOT treat an empty string as
-    // nullish. Setting it unconditionally here would make config.json's
-    // default "" silently win over the real default path, breaking static
-    // asset serving (confirmed live: registerStaticAssets("") resolves to
-    // the current working directory, not apps/web/dist).
-    if (typeof cfg.static_dir === "string" && cfg.static_dir !== "") r.HYEB_STATIC_DIR = cfg.static_dir;
-    return r;
-  } catch {
-    return {};
-  }
+export function getHaConfig(): HaConfig {
+  return haConfig;
 }
 
 // On Cloudflare, use the managed Browser Rendering binding (env.BROWSER),
@@ -153,6 +173,9 @@ let cloudflareBrowserBinding: BrowserBinding | undefined;
 
 export function setCloudflareBrowserBinding(binding: BrowserBinding): void {
   cloudflareBrowserBinding = binding;
+  if (runtimeConfig.HYEB_HA_MODE === undefined) {
+    haConfig = { ...haConfig, mode: "cloudflare" };
+  }
 }
 
 // ─── Config ───────────────────────────────────────────────────
@@ -174,12 +197,35 @@ function browserConnection(): BrowserConnection {
   const wsEndpoint = runtimeConfig.HYEB_BROWSER_WS_ENDPOINT;
   if (wsEndpoint) return { kind: "self-hosted", browserWSEndpoint: wsEndpoint };
   // Explicit "true"/"1" check, not a truthy-string check: HYEB_BROWSER_LOCAL is
-  // always a *string* here (from either an env var or loadConfigFile's
+  // always a *string* here (from either an env var or start.ts's config loader
   // String(boolean) conversion of config.json's browser.local), so a naive
   // `if (runtimeConfig.HYEB_BROWSER_LOCAL)` would treat the string "false" as
   // truthy and force "local" mode even when the config explicitly disables it.
   if (runtimeConfig.HYEB_BROWSER_LOCAL === "true" || runtimeConfig.HYEB_BROWSER_LOCAL === "1") return { kind: "local", headless: browserHeadless() };
   return { kind: "cloudflare", binding: cloudflareBrowserBinding as BrowserBinding };
+}
+
+function distributedDependencyUnavailable(dependency: string): HyeboardError {
+  return new HyeboardError("HA_DEPENDENCY_UNAVAILABLE", `The distributed ${dependency} dependency is unavailable.`, 503, { dependency });
+}
+
+function ensureInlineAutomationAllowed(): void {
+  if (haConfig.mode === "distributed" && (!distributedAutomationBackend || !distributedAutomationBackend.isAvailable())) {
+    throw new HyeboardError(
+      "AUTOMATION_BACKEND_UNCONFIGURED",
+      "Distributed browser automation is not configured; use the manual credential flow or configure an automation backend.",
+      503,
+    );
+  }
+}
+
+function requireDistributedAutomationBackend(): DistributedAutomationBackend {
+  if (!distributedAutomationBackend || !distributedAutomationBackend.isAvailable()) throw new HyeboardError(
+    "AUTOMATION_BACKEND_UNCONFIGURED",
+    "Distributed browser automation is not configured; configure a worker executor before using Google sign-in.",
+    503,
+  );
+  return distributedAutomationBackend;
 }
 
 // ─── Auth ─────────────────────────────────────────────────────
@@ -212,7 +258,7 @@ function incompleteVnuProfile(): HyeboardError {
 // login (uetParentCredential) carry a refreshable credential; every other
 // session (manual paste, vnu, mock) passes straight through the plain
 // decrypt path with the shortcut check below being a cheap no-op.
-export async function resolveSession(headers: Headers | Record<string, string | undefined>): Promise<ResolvedSession> {
+export async function resolveSession(headers: Headers | Record<string, string | undefined>, signal?: AbortSignal): Promise<ResolvedSession> {
   const h = headers instanceof Headers ? headers : new Headers(headers as Record<string, string>);
   const token = parseBearerToken(h.get("Authorization"));
   if (!token) throw new HyeboardError("MISSING_SESSION", "Missing Authorization bearer token", 401);
@@ -226,20 +272,34 @@ export async function resolveSession(headers: Headers | Record<string, string | 
     const adapter = getAdapter("uet");
     // Parent/guardian accounts refresh through StudentHub's direct CAPTCHA
     // APIs. Google accounts still need browser automation below.
+    if (!session.uetParentCredential) ensureInlineAutomationAllowed();
     const refreshed = session.uetParentCredential
-      ? await adapter.importSession({
-          uetGoogleEmail: session.uetParentCredential.username,
-          uetGooglePassword: session.uetParentCredential.password,
-        })
-      : await adapter.importSession(
-          {
-            uetGoogleEmail: session.uetGoogleCredential!.email,
-            uetGooglePassword: session.uetGoogleCredential!.password,
-            uetGoogleCookies: session.uetGoogleCredential!.googleCookies,
-          },
-          { browserConnection: browserConnection() },
-        );
-    const refreshedToken = await encryptSession(refreshed.session, getSessionSecret());
+      ? signal === undefined
+        ? await adapter.importSession({
+            uetGoogleEmail: session.uetParentCredential.username,
+            uetGooglePassword: session.uetParentCredential.password,
+          })
+        : await adapter.importSession({
+            uetGoogleEmail: session.uetParentCredential.username,
+            uetGooglePassword: session.uetParentCredential.password,
+          }, { signal })
+      : haConfig.mode === "distributed"
+        ? await requireDistributedAutomationBackend().importUetGoogle({
+            email: session.uetGoogleCredential!.email,
+            password: session.uetGoogleCredential!.password,
+            googleCookies: session.uetGoogleCredential!.googleCookies,
+            expectedStudentCode: session.studentCode,
+            idempotencyKey: `refresh:${session.sessionId ?? session.uetGoogleCredential!.email}`,
+          }, signal === undefined ? {} : { signal })
+        : await adapter.importSession(
+            {
+              uetGoogleEmail: session.uetGoogleCredential!.email,
+              uetGooglePassword: session.uetGoogleCredential!.password,
+              uetGoogleCookies: session.uetGoogleCredential!.googleCookies,
+            },
+            { browserConnection: browserConnection(), ...(signal === undefined ? {} : { signal }) },
+          );
+    const refreshedToken = await encryptSession(sessionTokenPayload(refreshed.session, session), getSessionSecret());
     return { session: refreshed.session, refreshedToken };
   } catch (error) {
     // Preserve the real failure code/status instead of collapsing every
@@ -362,6 +422,10 @@ async function decryptAuthenticatedLegacyVnuSession(token: string, secret: strin
 
 async function resolveOrdinaryAccessToken(token: string): Promise<EncryptedSessionPayload> {
   const session = await decryptSession(token, getSessionSecret());
+  const epoch = checkSessionEpoch(session, haConfig);
+  if (!epoch.accepted) throw new HyeboardError("SESSION_EXPIRED", "Session expired", 401);
+  if (haConfig.mode === "distributed" && !sessionRevocationStore) throw distributedDependencyUnavailable("PostgreSQL session revocation");
+  if (session.sessionId && await isSessionRevoked(session.sessionId)) throw new HyeboardError("SESSION_EXPIRED", "Session expired", 401);
   if (session.universityId === "vnu" && !session.vnu?.value) throw missingVnuCredential();
   const descriptor = session.vnuRefresh;
   if (!descriptor) {
@@ -714,12 +778,21 @@ function isIsolatedBulkLookupError(error: unknown): error is HyeboardError {
 // hard security boundary, so an in-memory Map is an equivalent-strength
 // (if anything, more consistent within a single process) substitute.
 
-interface CacheLike {
+export interface AppCache {
   match(request: Request): Promise<Response | undefined>;
   put(request: Request, response: Response): Promise<void>;
 }
 
-function createMemoryCache(): CacheLike {
+export interface RateLimitCoordinator {
+  /** Atomically consumes amount from a fixed window shared by all workers. */
+  consumeFixedWindow(key: string, amount: number, windowMs: number, limit: number): Promise<{ allowed: boolean; retryAfterSeconds: number }>;
+}
+
+export interface VnuImportSingleFlight {
+  run<T>(key: string, work: () => Promise<T>): Promise<T>;
+}
+
+function createMemoryCache(): AppCache {
   const store = new Map<string, { response: Response; expiresAt: number }>();
   return {
     async match(request: Request) {
@@ -740,7 +813,22 @@ function createMemoryCache(): CacheLike {
   };
 }
 
-const memoryCache: CacheLike = createMemoryCache();
+const memoryCache: AppCache = createMemoryCache();
+let injectedCache: AppCache | undefined;
+let rateLimitCoordinator: RateLimitCoordinator | undefined;
+let vnuImportSingleFlight: VnuImportSingleFlight | undefined;
+
+export function setAppCache(cache: AppCache | undefined): void {
+  injectedCache = cache;
+}
+
+export function setRateLimitCoordinator(coordinator: RateLimitCoordinator | undefined): void {
+  rateLimitCoordinator = coordinator;
+}
+
+export function setVnuImportSingleFlight(coordinator: VnuImportSingleFlight | undefined): void {
+  vnuImportSingleFlight = coordinator;
+}
 
 // Safe request-ID generator. crypto.randomUUID() is available on all modern
 // browsers and Node 19+/14.17.0 via the crypto module, but the bundled
@@ -770,6 +858,7 @@ export function requestLogPath(url: string): string {
 // answer. Cloudflare configures a Durable Object coordinator; Node/Bun use
 // an abort-aware process-local coordinator.
 let captchaRelayCoordinator: CaptchaRelayCoordinator = new LocalCaptchaRelayCoordinator();
+let sharedCaptchaRelayCoordinatorInstalled = false;
 
 const CAPTCHA_RELAY_TOKEN_DOMAIN = "hyeboard:captcha-relay:v1\0";
 const CAPTCHA_RELAY_ID_PATTERN = /^[A-Za-z0-9_-]{16,80}$/;
@@ -777,6 +866,7 @@ const CAPTCHA_RELAY_SIGNATURE_PATTERN = /^[0-9a-f]{64}$/;
 
 export function setCaptchaRelayCoordinator(coordinator: CaptchaRelayCoordinator): void {
   captchaRelayCoordinator = coordinator;
+  sharedCaptchaRelayCoordinatorInstalled = !(coordinator instanceof LocalCaptchaRelayCoordinator);
 }
 
 export async function createCaptchaRelayToken(relayId: string): Promise<string> {
@@ -839,6 +929,7 @@ async function cacheGet<T>(key: string): Promise<T | undefined> {
     if (!response) return undefined;
     return (await response.json()) as T;
   } catch {
+    if (haConfig.mode === "distributed") throw distributedDependencyUnavailable("Redis cache");
     return undefined;
   }
 }
@@ -859,10 +950,13 @@ async function cachePut(key: string, value: unknown, maxAgeSeconds: number): Pro
   } catch {
     // Cache is best-effort. Auth must keep working even when cache access
     // fails for any reason (colo rejection, memory pressure, etc.).
+    if (haConfig.mode === "distributed") throw distributedDependencyUnavailable("Redis cache");
   }
 }
 
-async function appCache(): Promise<CacheLike> {
+async function appCache(): Promise<AppCache> {
+  if (injectedCache) return injectedCache;
+  if (haConfig.mode === "distributed") throw distributedDependencyUnavailable("Redis cache");
   const storage = globalThis.caches as (CacheStorage & { default?: Cache }) | undefined;
   if (!storage) return memoryCache;
   if (storage.default) return storage.default;
@@ -897,6 +991,19 @@ let vnuRefreshControlCoordinator: VnuRefreshControlCoordinator | undefined;
 
 export function setVnuRefreshControlCoordinator(coordinator: VnuRefreshControlCoordinator | undefined): void {
   vnuRefreshControlCoordinator = coordinator;
+}
+
+export interface SessionRevocationStore {
+  revokeToken(token: string, expiresAt: string | Date | number): Promise<void>;
+  isTokenRevoked(token: string, now?: number): Promise<boolean>;
+  revokeSession(sessionId: string, expiresAt: string | Date | number): Promise<void>;
+  isSessionRevoked(sessionId: string, now?: number): Promise<boolean>;
+}
+
+let sessionRevocationStore: SessionRevocationStore | undefined;
+
+export function setSessionRevocationStore(store: SessionRevocationStore | undefined): void {
+  sessionRevocationStore = store;
 }
 
 function requireVnuRefreshControlCoordinator(): VnuRefreshControlCoordinator {
@@ -1170,7 +1277,7 @@ async function issueVnuAuthResult(input: {
   secret: string;
 }): Promise<AuthResult> {
   const coordinator = vnuRefreshControlCoordinator;
-  if (!coordinator) return { token: await encryptSession(input.payload, input.secret), session: input.session };
+  if (!coordinator) return { token: await encryptSession(sessionTokenPayload(input.payload), input.secret), session: input.session };
 
   const expectedStudentCode = input.payload.studentCode;
   if (!expectedStudentCode) throw incompleteVnuProfile();
@@ -1200,7 +1307,7 @@ async function issueVnuAuthResult(input: {
     );
   }
   const [token, refreshGrant] = await Promise.all([
-    encryptSession({ ...input.payload, vnuRefresh: descriptor }, input.secret),
+    encryptSession(sessionTokenPayload({ ...input.payload, vnuRefresh: descriptor }), input.secret),
     encryptVnuRefreshGrant(grant, input.secret),
   ]);
   return { token, refreshGrant, session: input.session };
@@ -1215,12 +1322,28 @@ async function googleLoginRateLimitKey(email: string): Promise<string> {
   return `uet/google-login-attempts/${await hmacHex(email.trim().toLowerCase())}`;
 }
 
-// Best-effort fixed-window counter via the cache abstraction (same storage
-// already used for vnu's import dedupe). Not perfectly race-free across
-// concurrent requests in the same window, which is acceptable for an
-// abuse-reduction guardrail, not a hard security boundary.
+function sessionTokenPayload(payload: EncryptedSessionPayload, previous?: EncryptedSessionPayload): EncryptedSessionPayload {
+  if (haConfig.mode !== "distributed") return payload;
+  const sessionId = payload.sessionId ?? previous?.sessionId ?? (typeof crypto.randomUUID === "function" ? crypto.randomUUID() : requestId());
+  return { ...payload, sessionId, sessionEpoch: haConfig.sessionEpoch };
+}
+
 async function checkAndIncrementGoogleLoginAttempts(email: string): Promise<void> {
   const key = await googleLoginRateLimitKey(email);
+  if (haConfig.mode === "distributed") {
+    if (!rateLimitCoordinator) throw distributedDependencyUnavailable("Redis rate limiter");
+    let result: { allowed: boolean; retryAfterSeconds: number };
+    try {
+      result = await rateLimitCoordinator.consumeFixedWindow(key, 1, GOOGLE_LOGIN_RATE_WINDOW_SECONDS * 1000, GOOGLE_LOGIN_RATE_LIMIT);
+    } catch {
+      throw distributedDependencyUnavailable("Redis rate limiter");
+    }
+    if (!result.allowed) {
+      throw new HyeboardError("GOOGLE_LOGIN_RATE_LIMITED", "Too many sign-in attempts for this email. Wait 15 minutes and try again, or use the manual token option below.", 429);
+    }
+    return;
+  }
+
   const existing = await cacheGet<{ count: number }>(key);
   const count = (existing?.count ?? 0) + 1;
   if (count > GOOGLE_LOGIN_RATE_LIMIT) {
@@ -1235,11 +1358,56 @@ async function revokedTokenKey(token: string): Promise<string> {
 
 async function revokeToken(token: string, expiresAt: string): Promise<void> {
   const ttlSeconds = Math.max(0, Math.floor((Date.parse(expiresAt) - Date.now()) / 1000));
+  if (sessionRevocationStore) {
+    try {
+      await sessionRevocationStore.revokeToken(token, expiresAt);
+      return;
+    } catch {
+      if (haConfig.mode === "distributed") throw distributedDependencyUnavailable("PostgreSQL session revocation");
+    }
+  } else if (haConfig.mode === "distributed") {
+    throw distributedDependencyUnavailable("PostgreSQL session revocation");
+  }
   await cachePut(await revokedTokenKey(token), { revoked: true }, ttlSeconds);
 }
 
 async function isTokenRevoked(token: string): Promise<boolean> {
+  if (sessionRevocationStore) {
+    try {
+      return await sessionRevocationStore.isTokenRevoked(token);
+    } catch {
+      if (haConfig.mode === "distributed") throw distributedDependencyUnavailable("PostgreSQL session revocation");
+    }
+  } else if (haConfig.mode === "distributed") {
+    throw distributedDependencyUnavailable("PostgreSQL session revocation");
+  }
   return Boolean(await cacheGet<{ revoked: true }>(await revokedTokenKey(token)));
+}
+
+async function revokeSession(session: EncryptedSessionPayload): Promise<void> {
+  if (!session.sessionId) return;
+  if (!sessionRevocationStore) {
+    if (haConfig.mode === "distributed") throw distributedDependencyUnavailable("PostgreSQL session revocation");
+    return;
+  }
+  try {
+    await sessionRevocationStore.revokeSession(session.sessionId, session.expiresAt);
+  } catch {
+    if (haConfig.mode === "distributed") throw distributedDependencyUnavailable("PostgreSQL session revocation");
+  }
+}
+
+async function isSessionRevoked(sessionId: string): Promise<boolean> {
+  if (!sessionRevocationStore) {
+    if (haConfig.mode === "distributed") throw distributedDependencyUnavailable("PostgreSQL session revocation");
+    return false;
+  }
+  try {
+    return await sessionRevocationStore.isSessionRevoked(sessionId);
+  } catch {
+    if (haConfig.mode === "distributed") throw distributedDependencyUnavailable("PostgreSQL session revocation");
+    return false;
+  }
 }
 
 async function vnuRawCacheKey(session: EncryptedSessionPayload, page: string, params: Record<string, string | undefined>): Promise<string> {
@@ -1469,8 +1637,9 @@ function serializeUniversities() {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function createApp(adapter: any) {
+export function createApp(adapter: any, options: { lifecycle?: HaLifecycleController } = {}) {
   const app = new Elysia({ adapter });
+  const lifecycle = options.lifecycle ?? createHaLifecycle({ config: haConfig });
 
   const plugin = corsPlugin();
   if (plugin) app.use(plugin);
@@ -1495,6 +1664,18 @@ export function createApp(adapter: any) {
 
     // ── Public — no session required ──
     .get("/api/health", () => ok({ status: "ok", service: "hyeboard" }))
+    .get("/api/live", async ({ set }) => {
+      const diagnostics = await lifecycle.diagnostics();
+      set.status = diagnostics.alive ? 200 : 503;
+      return ok({ alive: diagnostics.alive, state: diagnostics.state, mode: diagnostics.mode, checkedAt: diagnostics.checkedAt });
+    })
+    .get("/api/ready", async ({ set }) => {
+      await lifecycle.start();
+      const snapshot = await lifecycle.snapshot();
+      const diagnostics = safeHaDiagnostics(snapshot);
+      set.status = diagnostics.state === "ready" ? 200 : 503;
+      return ok(diagnostics);
+    })
     .get("/api/universities", () => ok(serializeUniversities()))
     .post("/api/:universityId/auth/import-session", async ({ params, body, request }) => {
       const adapterInstance = getAdapter(params.universityId);
@@ -1502,13 +1683,18 @@ export function createApp(adapter: any) {
       // server-side OCR miss can relay the CAPTCHA image to the user. The
       // same rate limit remains shared with Google automation.
       if (params.universityId === "uet" && body.uetGoogleEmail) {
+        if (!/^ph/i.test(body.uetGoogleEmail.trim())) ensureInlineAutomationAllowed();
         await checkAndIncrementGoogleLoginAttempts(body.uetGoogleEmail);
+        const uetGoogleEmail = body.uetGoogleEmail;
+        const uetGooglePassword = body.uetGooglePassword;
         // Google automation can take 90s+; parent direct login may pause for
         // a human CAPTCHA answer. Stream both as Server-Sent Events. Every
         // other branch below (vnu, manual-token/cookie paste, mock)
         // resolves almost instantly and keeps the plain JSON response.
         const encoder = new TextEncoder();
         let activeRelay: PreparedCaptchaRelay | undefined;
+        let activeAutomationCancel: (() => Promise<void>) | undefined;
+        let activeAutomationOwnershipToken: string | undefined;
         let cancelled = false;
         let closed = false;
         const cancelRelay = async () => {
@@ -1517,13 +1703,14 @@ export function createApp(adapter: any) {
           const relay = activeRelay;
           activeRelay = undefined;
           await relay?.cancel().catch(() => undefined);
+          await activeAutomationCancel?.().catch(() => undefined);
         };
         const stream = new ReadableStream({
           async start(controller) {
-            const send = (event: string, data: unknown) => {
+            const send = (event: string, data: unknown, sequence?: number) => {
               if (cancelled || closed) return;
               try {
-                controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+                controller.enqueue(encoder.encode(`${sequence === undefined ? "" : `id: ${sequence}\n`}event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
               } catch {
                 void cancelRelay();
               }
@@ -1536,26 +1723,59 @@ export function createApp(adapter: any) {
             const onAbort = () => void cancelRelay();
             request.signal.addEventListener("abort", onAbort, { once: true });
             try {
-              const imported = await adapterInstance.importSession(body, {
-                browserConnection: browserConnection(),
-                onProgress: (message) => send("progress", { message }),
-                onCaptchaNeeded: async (image) => {
-                  const relay = await captchaRelayCoordinator.prepare(image);
-                  activeRelay = relay;
-                  try {
-                    const relayToken = await createCaptchaRelayToken(relay.challengeId);
-                    if (cancelled || request.signal.aborted) throw captchaRelayCancelled();
-                    send("captcha_required", { challengeId: relayToken, image: relay.image });
-                    return await relay.wait(request.signal);
-                  } catch (error) {
-                    if (activeRelay === relay) await relay.cancel().catch(() => undefined);
-                    throw error;
-                  } finally {
-                    if (activeRelay === relay) activeRelay = undefined;
-                  }
-                },
-              });
-              const token = await encryptSession(imported.session, getSessionSecret());
+              const distributedGoogle = haConfig.mode === "distributed" && !/^ph/i.test(uetGoogleEmail.trim());
+              const cursorValue = new URL(request.url).searchParams.get("cursor") ?? request.headers.get("Last-Event-ID");
+              const cursor = cursorValue === null || cursorValue === "" ? undefined : Number(cursorValue);
+              if (cursor !== undefined && (!Number.isSafeInteger(cursor) || cursor < -1)) throw new HyeboardError("VALIDATION", "The automation replay cursor is invalid.", 400);
+              const imported = distributedGoogle
+                ? await requireDistributedAutomationBackend().importUetGoogle({
+                    email: uetGoogleEmail,
+                    password: uetGooglePassword ?? "",
+                    idempotencyKey: request.headers.get("Idempotency-Key") ?? `login:${uetGoogleEmail.trim().toLowerCase()}:${uetGooglePassword ?? ""}`,
+                    expectedStudentCode: uetGoogleEmail.trim().split("@")[0],
+                  }, {
+                    signal: request.signal,
+                    cursor,
+                    onJob: (ownershipToken) => {
+                      activeAutomationOwnershipToken = ownershipToken;
+                      activeAutomationCancel = () => requireDistributedAutomationBackend().cancelAutomation(ownershipToken);
+                    },
+                    onEvent: async (event) => {
+                      if (event.type === "progress" && event.phase !== undefined && event.percent !== undefined) {
+                        send("progress", { message: event.phase, phase: event.phase, percent: event.percent }, event.sequence);
+                      } else if (event.type === "challenge-required" && event.challengeId && event.image) {
+                        const backend = requireDistributedAutomationBackend();
+                        if (!activeAutomationOwnershipToken) throw new HyeboardError("AUTOMATION_BACKEND_UNCONFIGURED", "Distributed browser automation ownership was not established.", 503);
+                        send("captcha_required", { challengeId: backend.createChallengeToken(event, activeAutomationOwnershipToken), image: event.image }, event.sequence);
+                      } else if (event.type === "succeeded") {
+                        send("result", { sequence: event.sequence }, event.sequence);
+                      }
+                    },
+                  })
+                : await adapterInstance.importSession(body, {
+                    signal: request.signal,
+                    browserConnection: browserConnection(),
+                    onProgress: (message) => send("progress", { message }),
+                    onCaptchaNeeded: async (image) => {
+                      if (haConfig.mode === "distributed" && !sharedCaptchaRelayCoordinatorInstalled) {
+                        throw distributedDependencyUnavailable("Redis CAPTCHA relay");
+                      }
+                      const relay = await captchaRelayCoordinator.prepare(image);
+                      activeRelay = relay;
+                      try {
+                        const relayToken = await createCaptchaRelayToken(relay.challengeId);
+                        if (cancelled || request.signal.aborted) throw captchaRelayCancelled();
+                        send("captcha_required", { challengeId: relayToken, image: relay.image });
+                        return await relay.wait(request.signal);
+                      } catch (error) {
+                        if (activeRelay === relay) await relay.cancel().catch(() => undefined);
+                        throw error;
+                      } finally {
+                        if (activeRelay === relay) activeRelay = undefined;
+                      }
+                    },
+                  });
+              const token = await encryptSession(sessionTokenPayload(imported.session), getSessionSecret());
               send("done", { token, session: { universityId: imported.universityId, studentCode: imported.studentCode, expiresAt: imported.expiresAt, authenticated: true } });
             } catch (error) {
               if (!cancelled) {
@@ -1589,8 +1809,8 @@ export function createApp(adapter: any) {
         const normalizedBody = { ...body, vnuUsername: username, vnuPassword: password };
         const cacheKey = await vnuImportCacheKey(username, password);
         const secret = getSessionSecret();
-        const loginAndCache = async () => {
-          const imported = await adapterInstance.importSession(normalizedBody);
+        const loginAndCache = async (): Promise<AuthResult> => {
+          const imported = await adapterInstance.importSession(normalizedBody, { signal: request.signal });
           const normalizedSession: EncryptedSessionPayload = {
             ...imported.session,
             studentCode: imported.studentCode ?? imported.session.studentCode,
@@ -1598,28 +1818,50 @@ export function createApp(adapter: any) {
           if (!normalizedSession.studentCode) throw incompleteVnuProfile();
           const session = { universityId: normalizedSession.universityId, studentCode: normalizedSession.studentCode, expiresAt: normalizedSession.expiresAt, authenticated: true as const };
           const authResult = await issueVnuAuthResult({ username, password, payload: normalizedSession, session, secret });
-          const seed = await encryptSession(normalizedSession, secret);
+          const seed = await encryptSession(sessionTokenPayload(normalizedSession), secret);
           await cachePut(cacheKey, { seed, session }, Math.floor((Date.parse(normalizedSession.expiresAt) - Date.now()) / 1000));
-          return ok(authResult);
+          return authResult;
+        };
+
+        const loginAfterCacheMiss = async (): Promise<AuthResult> => {
+          if (haConfig.mode !== "distributed") return loginAndCache();
+          if (!vnuImportSingleFlight) throw distributedDependencyUnavailable("Redis VNU import single-flight");
+
+          // RedisSingleFlight also stores the result for its bounded TTL. Keep
+          // upstream failures distinct so only coordinator/Redis failures map
+          // to the distributed dependency error.
+          const workFailure = Symbol("vnu-import-work-failure");
+          try {
+            return await vnuImportSingleFlight.run(cacheKey, async () => {
+              try {
+                return await loginAndCache();
+              } catch (error) {
+                throw { workFailure, error };
+              }
+            });
+          } catch (error) {
+            if (isRecord(error) && error.workFailure === workFailure) throw error.error;
+            throw distributedDependencyUnavailable("Redis VNU import single-flight");
+          }
         };
 
         const cached = await restoreCachedVnuImport(await cacheGet<unknown>(cacheKey), secret);
-        if (!cached) return loginAndCache();
+        if (!cached) return ok(await loginAfterCacheMiss());
 
         let liveStudentCode: string | undefined;
         try {
           liveStudentCode = parseProfileHtml(await new DaotaoClient(cached.payload).getProfileHtml()).studentCode;
         } catch (error) {
-          if (error instanceof HyeboardError && error.code === "VNU_SESSION_EXPIRED") return loginAndCache();
+          if (error instanceof HyeboardError && error.code === "VNU_SESSION_EXPIRED") return ok(await loginAfterCacheMiss());
           throw error;
         }
 
-        if (!liveStudentCode || liveStudentCode !== cached.payload.studentCode || liveStudentCode !== cached.session.studentCode) return loginAndCache();
+        if (!liveStudentCode || liveStudentCode !== cached.payload.studentCode || liveStudentCode !== cached.session.studentCode) return ok(await loginAfterCacheMiss());
 
         return ok(await issueVnuAuthResult({ username, password, payload: cached.payload, session: cached.session, secret }));
       }
-      const imported = await adapterInstance.importSession(body);
-      const token = await encryptSession(imported.session, getSessionSecret());
+      const imported = await adapterInstance.importSession(body, { signal: request.signal });
+      const token = await encryptSession(sessionTokenPayload(imported.session), getSessionSecret());
       return ok({ token, session: { universityId: imported.universityId, studentCode: imported.studentCode, expiresAt: imported.expiresAt, authenticated: true } });
     }, { body: importSessionBody })
     // Answers a CAPTCHA challenge raised mid-login by the "captcha_required"
@@ -1628,6 +1870,10 @@ export function createApp(adapter: any) {
     // in), so this is deliberately unauthenticated. Verify the signed relay
     // token before coordinator access so forged IDs cannot instantiate DOs.
     .post("/api/uet/auth/solve-captcha", async ({ body }) => {
+      if (haConfig.mode === "distributed" && distributedAutomationBackend?.isAutomationChallengeToken(body.challengeId)) {
+        await requireDistributedAutomationBackend().answerCaptcha(body.challengeId, body.answer);
+        return ok({ accepted: true });
+      }
       const relayId = await verifyCaptchaRelayToken(body.challengeId);
       if (!relayId) throw captchaRelayNotFound();
       await captchaRelayCoordinator.answer(relayId, body.answer);
@@ -1637,6 +1883,21 @@ export function createApp(adapter: any) {
         challengeId: t.String({ minLength: 1, maxLength: 160 }),
         answer: t.String({ minLength: 1, maxLength: 64 }),
       }),
+    })
+    .post("/api/uet/auth/cancel-captcha", async ({ body }) => {
+      if (haConfig.mode === "distributed" && distributedAutomationBackend?.isAutomationChallengeToken(body.challengeId)) {
+        await requireDistributedAutomationBackend().cancelCaptcha(body.challengeId);
+        return ok({ accepted: true });
+      }
+      throw captchaRelayNotFound();
+    }, {
+      body: t.Object({ challengeId: t.String({ minLength: 1, maxLength: 512 }) }),
+    })
+    .post("/api/uet/auth/cancel-automation", async ({ body }) => {
+      await requireDistributedAutomationBackend().cancelAutomation(body.jobToken);
+      return ok({ accepted: true });
+    }, {
+      body: t.Object({ jobToken: t.String({ minLength: 1, maxLength: 512 }) }),
     })
     .post("/api/vnu/auth/refresh", async ({ headers, request }) => {
       const token = parseBearerToken(new Headers(headers as Record<string, string>).get("Authorization"));
@@ -1678,7 +1939,10 @@ export function createApp(adapter: any) {
 
       let completionSettled = false;
       try {
-        const imported = await getAdapter("vnu").importSession({ vnuUsername: grant.username, vnuPassword: grant.password, signal: request.signal });
+        const imported = await getAdapter("vnu").importSession(
+          { vnuUsername: grant.username, vnuPassword: grant.password, signal: request.signal },
+          { signal: request.signal },
+        );
         if (imported.universityId !== "vnu" || imported.studentCode !== grant.expectedStudentCode) throw vnuRefreshIdentityMismatch();
         const refreshedSession: EncryptedSessionPayload = {
           ...imported.session,
@@ -1697,7 +1961,7 @@ export function createApp(adapter: any) {
         const nextPair = descriptorPair(nextDescriptor);
         const nextPayload = { ...refreshedSession, vnuRefresh: nextDescriptor };
         const [nextToken, nextGrant] = await Promise.all([
-          encryptSession(nextPayload, secret),
+          encryptSession(sessionTokenPayload(nextPayload, session), secret),
           encryptVnuRefreshGrant(rotatedGrant, secret),
         ]);
 
@@ -1777,6 +2041,7 @@ export function createApp(adapter: any) {
       if (result === "expired" && (suppliedLinkedGrantIsLive || grantlessPairHasLiveArtifact)) {
         throw new HyeboardError("VNU_REFRESH_GRANT_REVOKED", "The VNU reconnect grant has been revoked.", 401);
       }
+      await revokeSession(session!);
       return ok({ authenticated: false });
     })
     .post("/api/:universityId/auth/logout", async ({ headers }) => {
@@ -1792,6 +2057,7 @@ export function createApp(adapter: any) {
         return ok({ authenticated: false });
       }
 
+      await revokeSession(session);
       await revokeToken(token, session.expiresAt);
       return ok({ authenticated: false });
     })
@@ -2079,8 +2345,8 @@ export function createApp(adapter: any) {
 
     .group("/api/uet", (g) =>
       g
-        .resolve(async ({ headers }) => {
-          const { session, refreshedToken } = await resolveSession(headers);
+        .resolve(async ({ headers, request }) => {
+          const { session, refreshedToken } = await resolveSession(headers, request.signal);
           if (session.universityId !== "uet") throw new HyeboardError("SESSION_UNIVERSITY_MISMATCH", "Session university does not match route", 403);
           return { session, refreshedToken };
         })
@@ -2099,8 +2365,8 @@ export function createApp(adapter: any) {
     // ── Authenticated — session+adapter injected via resolve() ──
     .group("/api/:universityId", (g) =>
       g
-        .resolve(async ({ headers, params }) => {
-          const { session, refreshedToken } = await resolveSession(headers);
+        .resolve(async ({ headers, params, request }) => {
+          const { session, refreshedToken } = await resolveSession(headers, request.signal);
           if (session.universityId !== params.universityId)
             throw new HyeboardError("SESSION_UNIVERSITY_MISMATCH", "Session university does not match route", 403);
           return { session, refreshedToken, adapter: getAdapter(params.universityId) };

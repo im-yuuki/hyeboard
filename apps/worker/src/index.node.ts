@@ -1,5 +1,5 @@
 import { setCaptchaOcrSolver, setPatchrightCloseHandler, setPatchrightLauncher } from "@hyeboard/university-adapters";
-import { start } from "./start";
+import { loadConfigFile, selfHostedHaConfig, start } from "./start";
 
 // Node/Bun-only entry point. Identical to index.ts except it additionally
 // registers the Patchright (github.com/Kaliiiiiiiiii-Vinyzu/patchright-nodejs)
@@ -19,6 +19,12 @@ import { start } from "./start";
 // index.ts to opt into Patchright support for self-hosted deployments.
 
 declare const process: { env: Record<string, string | undefined> };
+
+const nodeHaMode = selfHostedHaConfig(process.env, await loadConfigFile()).mode;
+
+if (process.env.HYEB_BROWSER_PATCHRIGHT === "true" && nodeHaMode === "distributed") {
+  throw new Error("HYEB_BROWSER_PATCHRIGHT cannot be enabled in distributed HA mode");
+}
 
 if (process.env.HYEB_BROWSER_PATCHRIGHT === "true") {
   // Dynamic, not static: patchright is only an optional dependency of

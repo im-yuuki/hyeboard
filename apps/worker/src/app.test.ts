@@ -14,7 +14,7 @@ vi.mock("@hyeboard/university-adapters", async (importOriginal) => {
   return { ...actual, getAdapter: adapterMocks.getAdapter };
 });
 
-import { createApp, createCaptchaRelayToken, requestLogPath, resolveSession, setCaptchaRelayCoordinator, setRuntimeConfig, setVnuProbeBudgetCoordinator, setVnuRefreshControlCoordinator, type RuntimeConfig } from "./app";
+import { createApp, createCaptchaRelayToken, requestLogPath, resolveSession, setAppCache, setCaptchaRelayCoordinator, setDistributedAutomationBackend, setRateLimitCoordinator, setRuntimeConfig, setVnuImportSingleFlight, setVnuProbeBudgetCoordinator, setVnuRefreshControlCoordinator, type RuntimeConfig } from "./app";
 import { LocalCaptchaRelayCoordinator, type CaptchaRelayCoordinator } from "./captcha-relay";
 import { selfHostedRuntimeConfig } from "./start";
 import type { VnuProbeBudgetCoordinator } from "./vnu-probe-budget";
@@ -1347,6 +1347,97 @@ describe("UET CAPTCHA SSE cancellation", () => {
   });
 });
 
+describe("distributed Google login rate limiting", () => {
+  const cache = {
+    match: vi.fn(async () => undefined),
+    put: vi.fn(async () => undefined),
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET, HYEB_HA_MODE: "distributed" });
+    setAppCache(cache);
+    adapterMocks.getAdapter.mockReturnValue({});
+    setDistributedAutomationBackend({
+      isAvailable: () => true,
+      isAutomationChallengeToken: () => false,
+      createChallengeToken: () => "unused",
+      answerCaptcha: async () => undefined,
+      cancelCaptcha: async () => undefined,
+      cancelAutomation: async () => undefined,
+      importUetGoogle: async () => ({
+        universityId: "uet",
+        studentCode: "STUDENT_SENTINEL",
+        expiresAt: "2099-01-01T00:00:00.000Z",
+        session: {
+          version: 1,
+          universityId: "uet",
+          studentCode: "STUDENT_SENTINEL",
+          expiresAt: "2099-01-01T00:00:00.000Z",
+          uetGoogleCredential: { email: "student@example.test", password: "PRIVATE_PASSWORD" },
+        },
+      }),
+    });
+  });
+
+  afterEach(() => {
+    setDistributedAutomationBackend(undefined);
+    setRateLimitCoordinator(undefined);
+    setAppCache(undefined);
+    setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET });
+  });
+
+  function request(): Promise<Response> {
+    return createApp(undefined).handle(new Request("http://localhost/api/uet/auth/import-session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ uetGoogleEmail: "student@example.test", uetGooglePassword: "PRIVATE_PASSWORD" }),
+    }));
+  }
+
+  it("uses the injected atomic coordinator without reading or writing the JSON cache", async () => {
+    const consumeFixedWindow = vi.fn(async () => ({ allowed: true, retryAfterSeconds: 0 }));
+    setRateLimitCoordinator({ consumeFixedWindow });
+
+    const response = await request();
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(consumeFixedWindow).toHaveBeenCalledWith(expect.stringMatching(/^uet\/google-login-attempts\/[0-9a-f]{64}$/), 1, 15 * 60 * 1000, 5);
+    expect(cache.match).not.toHaveBeenCalled();
+    expect(cache.put).not.toHaveBeenCalled();
+  });
+
+  it("preserves the public rate-limit error code", async () => {
+    setRateLimitCoordinator({ consumeFixedWindow: async () => ({ allowed: false, retryAfterSeconds: 42 }) });
+
+    const response = await request();
+    expect(response.status).toBe(429);
+    await expect(response.json()).resolves.toEqual({
+      data: null,
+      error: {
+        code: "GOOGLE_LOGIN_RATE_LIMITED",
+        message: "Too many sign-in attempts for this email. Wait 15 minutes and try again, or use the manual token option below.",
+      },
+    });
+  });
+
+  it("maps a Redis coordinator failure to a sanitized 503", async () => {
+    setRateLimitCoordinator({ consumeFixedWindow: async () => { throw new Error("PRIVATE_REDIS_FAILURE"); } });
+
+    const response = await request();
+    const text = await response.text();
+    expect(response.status).toBe(503);
+    expect(text).not.toContain("PRIVATE_REDIS_FAILURE");
+    expect(JSON.parse(text)).toEqual({
+      data: null,
+      error: {
+        code: "HA_DEPENDENCY_UNAVAILABLE",
+        message: "The distributed Redis rate limiter dependency is unavailable.",
+      },
+    });
+  });
+});
+
 describe("VNU import session cache", () => {
   let cache: TestCache;
   let app: ReturnType<typeof createApp>;
@@ -1379,6 +1470,8 @@ describe("VNU import session cache", () => {
     profileSpy.mockRestore();
     dateNowSpy.mockRestore();
     vi.unstubAllGlobals();
+    setVnuImportSingleFlight(undefined);
+    setAppCache(undefined);
     setVnuRefreshControlCoordinator(undefined);
     configureLogger({ level: "silent", mode: "node" });
   });
@@ -1392,10 +1485,13 @@ describe("VNU import session cache", () => {
     const body = await response.json() as { data: CoordinatorVnuImportResponse; error: null };
 
     expect(response.status).toBe(200);
-    expect(adapterMocks.importSession).toHaveBeenCalledWith({
-      vnuUsername: "synthetic-vnu-user",
-      vnuPassword: "SYNTHETIC-PASSWORD-BYTES",
-    });
+    expect(adapterMocks.importSession).toHaveBeenCalledWith(
+      {
+        vnuUsername: "synthetic-vnu-user",
+        vnuPassword: "SYNTHETIC-PASSWORD-BYTES",
+      },
+      { signal: expect.any(AbortSignal) },
+    );
     const access = await decryptSession(body.data.token, SESSION_SECRET);
     const grant = await decryptVnuRefreshGrant(body.data.refreshGrant!, SESSION_SECRET, syntheticTime);
     expect(grant).toMatchObject({
@@ -1414,6 +1510,41 @@ describe("VNU import session cache", () => {
         grantExpiresAt: Date.parse(grant.expiresAt),
       },
     }]);
+  });
+
+  it("deduplicates concurrent distributed imports through the injected single-flight", async () => {
+    setRuntimeConfig({ HYEB_SESSION_SECRET: SESSION_SECRET, HYEB_HA_MODE: "distributed" });
+    setAppCache(cache);
+    let releaseImport!: () => void;
+    const importGate = new Promise<void>((resolve) => { releaseImport = resolve; });
+    adapterMocks.importSession.mockImplementation(async () => {
+      await importGate;
+      return importedVnu();
+    });
+    let shared: Promise<unknown> | undefined;
+    let runCalls = 0;
+    const run = async <T>(_key: string, work: () => Promise<T>): Promise<T> => {
+      runCalls += 1;
+      shared ??= work();
+      return await shared as T;
+    };
+    setVnuImportSingleFlight({ run });
+
+    const requestImport = () => app.handle(new Request("http://localhost/api/vnu/auth/import-session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ vnuUsername: "SYNTHETIC-VNU-USER", vnuPassword: "SYNTHETIC-PASSWORD-BYTES" }),
+    }));
+    const first = requestImport();
+    await vi.waitFor(() => expect(adapterMocks.importSession).toHaveBeenCalledOnce());
+    const second = requestImport();
+    releaseImport();
+    const responses = await Promise.all([first, second]);
+
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    expect(runCalls).toBe(2);
+    expect(adapterMocks.importSession).toHaveBeenCalledOnce();
+    expect(await responses[0]!.clone().json()).toEqual(await responses[1]!.clone().json());
   });
 
   it("returns sanitized 429 without artifacts on the sixth manual activation and succeeds after reset", async () => {
@@ -4035,6 +4166,7 @@ describe("VNU cross-transcript route", () => {
       const targetCodes = [SYNTHETIC_VNU_CODE + 100, SYNTHETIC_VNU_CODE + 200];
       const projectedIds = targetCodes.map((code) => SYNTHETIC_VNU_STD_ID + code - SYNTHETIC_VNU_CODE);
       const pendingWork = new Map<number, { resolve: (html: string) => void; reject: (reason: unknown) => void }>();
+      const enteredIds = new Set<number>();
       const startedWork = new Map(projectedIds.flatMap((stdId) => [
         [stdId - 1, enteredOperation<void>()],
         [stdId + 1, enteredOperation<void>()],
@@ -4052,9 +4184,10 @@ describe("VNU cross-transcript route", () => {
       };
       transcriptSpy.mockImplementation(async (stdIdText: string, signal?: AbortSignal) => {
         const stdId = Number(stdIdText);
-        if (projectedIds.includes(stdId)) return "<html>headerless</html>";
+        if (projectedIds.includes(stdId) || !startedWork.has(stdId)) return "<html>headerless</html>";
         return new Promise<string>((resolve, reject) => {
           pendingWork.set(stdId, { resolve, reject });
+          enteredIds.add(stdId);
           startedWork.get(stdId)?.markEntered();
           signal?.addEventListener("abort", () => {
             pendingWork.delete(stdId);
@@ -4064,13 +4197,20 @@ describe("VNU cross-transcript route", () => {
       });
 
       const responsePromise = bulkRequest({ mode: "code-to-stdid", targets: targetCodes.map(String), allowCrossLookup: true });
-      await waitForWork(projectedIds[0] - 1);
-      await waitForWork(projectedIds[0] + 1);
+      await vi.waitFor(() => expect([...enteredIds].filter((stdId) => startedWork.has(stdId)).length).toBe(2));
       expect(probeBudget.activeLeaseCount).toBe(2);
-      completeWork(projectedIds[0] - 1, `<table><tr><td>Mã số: ${targetCodes[0]}</td></tr></table>`);
-      await waitForWork(projectedIds[1] - 1);
+
+      // Either target can win the shared permit race. Release any +1 probes
+      // that acquired a permit so both exact-priority -1 probes can enter.
+      projectedIds.forEach((projectedId, index) => {
+        if (pendingWork.has(projectedId + 1)) completeWork(projectedId + 1, "<html>headerless</html>");
+        if (pendingWork.has(projectedId - 1)) completeWork(projectedId - 1, `<table><tr><td>Mã số: ${targetCodes[index]}</td></tr></table>`);
+      });
+      await Promise.all(projectedIds.map((projectedId) => waitForWork(projectedId - 1)));
       expect(probeBudget.activeLeaseCount).toBeLessThanOrEqual(2);
-      completeWork(projectedIds[1] - 1, `<table><tr><td>Mã số: ${targetCodes[1]}</td></tr></table>`);
+      projectedIds.forEach((projectedId, index) => {
+        if (pendingWork.has(projectedId - 1)) completeWork(projectedId - 1, `<table><tr><td>Mã số: ${targetCodes[index]}</td></tr></table>`);
+      });
 
       const response = await responsePromise;
       const payload = await response.json() as { data: { items: Array<{ target: string; status: string }> } };
