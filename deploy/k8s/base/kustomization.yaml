@@ -7,6 +7,7 @@ resources:
   - api-pdb.yaml
   - api-hpa.yaml
   - automation-deployment.yaml
+  - automation-hpa.yaml
   - automation-pdb.yaml
   - network-policy.yaml
 images:

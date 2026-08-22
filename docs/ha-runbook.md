@@ -134,7 +134,7 @@ The latest `pnpm test:ha` run passed PostgreSQL 5/5 and Redis 4/4, and `/api/rea
 
 ## Kubernetes deployment
 
-The manifests in [`deploy/k8s`](../deploy/k8s) run two API replicas and two automation workers by default. The API Deployment uses `/api/live` for liveness, `/api/ready` for dependency-backed readiness, rolling updates with no unavailable replicas, pod anti-affinity, resource requests, an HPA, and a PDB. Worker pods expose `/healthz` and `/readyz` after Redis and Browserless startup checks pass.
+The manifests in [`deploy/k8s`](../deploy/k8s) run two API replicas and two automation workers by default. The API Deployment uses `/api/live` for liveness, `/api/ready` for dependency-backed readiness, rolling updates with no unavailable replicas, pod anti-affinity, resource requests, an HPA, and a PDB. Worker pods expose `/healthz` and `/readyz` after Redis and Browserless startup checks pass. The worker Deployment has a CPU/memory HPA from 2 to 8 replicas; it is a conservative fallback because native Kubernetes metrics do not measure Redis queue depth.
 
 Before applying the example overlay:
 
@@ -163,7 +163,7 @@ kubectl rollout status deployment/hyeboard-automation-worker -n hyeboard
 
 The example NetworkPolicy restricts API and worker egress to DNS, HTTPS, and the configured PostgreSQL, Redis, and Browserless ports. It leaves ingress open so managed ingress controllers and kubelet probes work across CNI implementations; add an ingress allowlist matching the target cluster before production exposure.
 
-The Kubernetes resources do not remove the runtime gates below. Run them against the target cluster and dependencies before exposing the service to production:
+The Kubernetes resources do not remove the runtime gates below. The example overlay starts with `HYEB_AUTOMATION_EXECUTOR_READY=false`; enable it only after the real Browserless/UET executor gate passes. Run the resources against the target cluster and dependencies before exposing the service to production:
 
 - Two API replicas work under round-robin traffic without sticky sessions.
 - VNU refresh, cross-lookup authority, and generic revocation are shared and survive replica restart.
