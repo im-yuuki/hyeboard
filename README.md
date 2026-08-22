@@ -263,7 +263,7 @@ HYEB_K8S_NAMESPACE=hyeboard-staging \
   node scripts/validate-k8s-cluster.mjs --failover
 ```
 
-The validator needs `kubectl`, a working cluster context, two nodes, active HPA metrics, the rendered Service/Deployments, and permission to create a temporary `node:22-alpine` probe pod. It exercises rollouts, endpoint spread, readiness, a mock session, and API pod failover; it does not establish Browserless/UET parity.
+The validator needs `kubectl`, a working cluster context, active HPA metrics, the rendered Service/Deployments, and permission to create a temporary `node:22-alpine` probe pod. It accepts single-node and multi-node clusters; topology spread remains a soft preference. It exercises rollouts, endpoint spread, readiness, a mock session, and API pod failover; it does not establish Browserless/UET parity.
 
 CI coverage is split across two workflows:
 

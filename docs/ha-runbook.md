@@ -12,7 +12,7 @@ docker compose version
 docker buildx version
 ```
 
-For Kubernetes, install `kubectl` with a Kustomize-capable version, select the intended context, and confirm access with `kubectl cluster-info`. Applying an overlay additionally requires an ingress controller with class `nginx`, a metrics API for HPA, TLS Secrets, permissions to create/update resources in the target namespace, and enough capacity for the selected replica count. Staging and production validation require two nodes because the validator checks node spread.
+For Kubernetes, install `kubectl` with a Kustomize-capable version, select the intended context, and confirm access with `kubectl cluster-info`. Applying an overlay additionally requires an ingress controller with class `nginx`, a metrics API for HPA, TLS Secrets, permissions to create/update resources in the target namespace, and enough capacity for the selected replica count. The manifests use soft topology spreading, so both single-node test clusters and multi-node production clusters are supported; replicas may co-locate when capacity is limited.
 
 PostgreSQL, Redis, and Browserless must be reachable from the API/worker in distributed mode. Compose starts local instances for its `distributed` profile. Kubernetes staging may use managed/external Redis and Browserless; the production overlay runs RedisReplication and Browserless in-cluster. Browserless is represented by the pinned image `ghcr.io/browserless/chromium:v2.55.4`; this pin is not a claim of Browserless/UET parity.
 
@@ -286,7 +286,7 @@ For real operations, replace shell variables with an external secret manager or 
 
 Generate the session secret and automation key with a cryptographically secure generator, and use a unique key ID. Generate a PostgreSQL password separately when the managed database is provisioned. Keep values out of manifests, shell history where practical, logs, and source control. If no secret manager is available, create the Secret out of band with `kubectl` from environment variables; never apply `secret.example.yaml` unchanged.
 
-Staging requires reachable PostgreSQL, Redis, and Browserless endpoints. Production requires PostgreSQL, the OT-CONTAINER-KIT Redis Operator and its `redis.redis.opstreelabs.in/v1beta2` CRD, a `hyeboard-redis-auth` Secret with key `password`, a StorageClass that can provision three Redis PVCs, and enough nodes for Redis/Sentinel anti-affinity. Production Browserless is exposed only through the in-cluster `hyeboard-browserless` ClusterIP and uses `BROWSERLESS_ENDPOINT=ws://hyeboard-browserless:3000/chromium`. Production `HYEB_REDIS_URL` must use the operator-managed `hyeboard-redis-master` Service and include the Redis password in the URL. Add destination restrictions appropriate to the cluster CNI. The Ingress resources require an NGINX ingress controller, the named TLS Secret (`hyeboard-tls`, `hyeboard-staging-tls`, or `hyeboard-production-tls`), and DNS for the selected hostname.
+Staging requires reachable PostgreSQL, Redis, and Browserless endpoints. Production requires PostgreSQL, the OT-CONTAINER-KIT Redis Operator and its `redis.redis.opstreelabs.in/v1beta2` CRD, a `hyeboard-redis-auth` Secret with key `password`, and a StorageClass that can provision three Redis PVCs. Redis, Sentinel, application, and Browserless topology spread is a soft preference, so a smaller test cluster can co-locate replicas. Production Browserless is exposed only through the in-cluster `hyeboard-browserless` ClusterIP and uses `BROWSERLESS_ENDPOINT=ws://hyeboard-browserless:3000/chromium`. Production `HYEB_REDIS_URL` must use the operator-managed `hyeboard-redis-master` Service and include the Redis password in the URL. Add destination restrictions appropriate to the cluster CNI. The Ingress resources require an NGINX ingress controller, the named TLS Secret (`hyeboard-tls`, `hyeboard-staging-tls`, or `hyeboard-production-tls`), and DNS for the selected hostname.
 
 ### Render and apply
 
@@ -313,7 +313,7 @@ HYEB_K8S_NAMESPACE=hyeboard-staging \
   node scripts/validate-k8s-cluster.mjs --failover
 ```
 
-The cluster validator needs a working `kubectl` context, at least two nodes, two ready replicas of both application Deployments, two ready API Service endpoints, active HPA metrics, and permission to create a temporary `node:22-alpine` probe pod. It checks rollouts, readiness, endpoint spread, a mock session against each API pod, repeated readiness requests, and API pod replacement during `--failover`. Separately verify Redis Sentinel failover and Browserless session recovery; the validator does not establish Browserless/UET parity.
+The cluster validator needs a working `kubectl` context, two ready replicas of both application Deployments, two ready API Service endpoints, active HPA metrics, and permission to create a temporary `node:22-alpine` probe pod. It accepts a single node; it checks rollouts, readiness, endpoint spread, a mock session against each API pod, repeated readiness requests, and API pod replacement during `--failover`. Separately verify Redis Sentinel failover and Browserless session recovery; the validator does not establish Browserless/UET parity.
 
 ### Apply the production Kustomize overlay
 

@@ -320,17 +320,10 @@ assert.throws(
   /fewer than two ready replicas/,
 );
 const oneNode = structuredClone(clusterSnapshot);
-oneNode.pods.items
-  .filter(
-    (pod) => pod.metadata.labels["app.kubernetes.io/name"] === "hyeboard-api",
-  )
-  .forEach((pod) => {
-    pod.spec.nodeName = "hyeboard-api-node-a";
-  });
-assert.throws(
-  () => validateClusterSnapshot(oneNode),
-  /not spread across two nodes/,
-);
+oneNode.pods.items.forEach((pod) => {
+  pod.spec.nodeName = "single-test-node";
+});
+validateClusterSnapshot(oneNode);
 const oneEndpoint = structuredClone(clusterSnapshot);
 oneEndpoint.endpointSlices.items[0].endpoints.pop();
 assert.throws(
