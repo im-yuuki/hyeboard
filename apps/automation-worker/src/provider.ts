@@ -73,6 +73,11 @@ function endpointWithToken(endpoint: string, token: string): URL {
   const url = new URL(endpoint);
   if (url.searchParams.has("token")) throw new ConfigurationError("Browserless endpoint must not already contain a token.");
   url.searchParams.set("token", token);
+  // StudentHub's current Google Identity Services page opts into FedCM.
+  // FedCM does not expose the popup target that this worker must drive through
+  // the VNU Keycloak hop, so keep the Browserless Chromium session on the
+  // popup-compatible path until the automation uses a FedCM-native API.
+  url.searchParams.set("launch", JSON.stringify({ args: ["--disable-features=FedCm"] }));
   return url;
 }
 
