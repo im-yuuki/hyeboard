@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import type { UetPageDriver } from "../types";
-import { awaitAutomationOperation, detectChallenge, serializeCookies } from "./google-login-automation";
+import {
+  awaitAutomationOperation,
+  detectChallenge,
+  serializeCookies,
+  waitForStableSelector,
+} from "./google-login-automation";
 
 const browserMocks = vi.hoisted(() => ({ launch: vi.fn(), connect: vi.fn() }));
 vi.mock("@cloudflare/puppeteer", () => ({ default: { launch: browserMocks.launch } }));
@@ -52,6 +57,37 @@ describe("serializeCookies", () => {
 
   it("returns an empty string for an empty array", () => {
     expect(serializeCookies([])).toBe("");
+  });
+});
+
+describe("waitForStableSelector", () => {
+  it("retries when Browserless replaces the popup frame during navigation", async () => {
+    const element = { click: vi.fn(async () => undefined) };
+    const page = {
+      isClosed: () => false,
+      waitForSelector: vi
+        .fn()
+        .mockRejectedValueOnce(new Error("Attempted to use detached Frame 'ABC'."))
+        .mockResolvedValueOnce(element),
+    } as unknown as UetPageDriver;
+
+    await expect(waitForStableSelector(page, "#username", 1_000)).resolves.toBe(
+      element,
+    );
+    expect(page.waitForSelector).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry ordinary selector failures", async () => {
+    const error = new Error("Waiting for selector failed");
+    const page = {
+      isClosed: () => false,
+      waitForSelector: vi.fn().mockRejectedValue(error),
+    } as unknown as UetPageDriver;
+
+    await expect(waitForStableSelector(page, "#username", 1_000)).rejects.toBe(
+      error,
+    );
+    expect(page.waitForSelector).toHaveBeenCalledOnce();
   });
 });
 

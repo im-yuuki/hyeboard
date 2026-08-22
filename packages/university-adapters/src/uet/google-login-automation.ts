@@ -82,6 +82,36 @@ export function throwIfAutomationAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw signal.reason ?? new DOMException("This operation was aborted", "AbortError");
 }
 
+function isTransientNavigationError(error: unknown): boolean {
+  return error instanceof Error && /detached Frame|execution context was destroyed|navigating frame/i.test(error.message);
+}
+
+export async function waitForStableSelector(
+  page: UetPageDriver,
+  selector: string,
+  timeoutMs: number,
+): Promise<Awaited<ReturnType<UetPageDriver["waitForSelector"]>>> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await page.waitForSelector(selector, {
+        timeout: Math.max(1, deadline - Date.now()),
+      });
+    } catch (error) {
+      lastError = error;
+      if (
+        !isTransientNavigationError(error) ||
+        page.isClosed() ||
+        Date.now() >= deadline
+      )
+        throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  throw lastError;
+}
+
 export type GoogleLoginResult = {
   studenthub?: { accessToken: string; accountCode?: string };
   canvas?: { cookie: string; csrfToken?: string };
@@ -666,7 +696,7 @@ async function runFlowBody(
       // Confirmed by live testing: Keycloak's #username field expects the
       // bare local-part (before "@"), not the full email address.
       const keycloakUsername = email.includes("@") ? email.slice(0, email.indexOf("@")) : email;
-      await popup.waitForSelector("#username", { timeout: 5_000 });
+      await waitForStableSelector(popup, "#username", 5_000);
       await popup.type("#username", keycloakUsername, { delay: 20 });
       await popup.type("#password", password, { delay: 20 });
       // Tick the "Ghi nhớ" (remember me) checkbox before submitting —
