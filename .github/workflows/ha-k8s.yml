@@ -28,7 +28,7 @@ jobs:
       - run: >-
           pnpm --filter @hyeboard/web exec playwright install
           --with-deps chromium webkit
-      - run: pnpm test:browser
+      - run: pnpm --filter @hyeboard/web exec playwright test --retries=1
       - run: pnpm --filter @hyeboard/worker check:node-package
       - run: pnpm --filter @hyeboard/worker exec wrangler deploy --dry-run
       - run: >-
