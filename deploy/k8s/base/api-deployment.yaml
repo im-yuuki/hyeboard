@@ -39,7 +39,7 @@ spec:
                     app.kubernetes.io/name: hyeboard-api
       containers:
         - name: api
-          image: ghcr.io/teppyboy/hyeboard-api:latest
+          image: ghcr.io/teppyboy/hyeboard-api:replace-with-release-tag
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

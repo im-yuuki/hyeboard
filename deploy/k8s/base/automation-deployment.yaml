@@ -39,7 +39,8 @@ spec:
                     app.kubernetes.io/name: hyeboard-automation-worker
       containers:
         - name: automation-worker
-          image: ghcr.io/teppyboy/hyeboard-automation-worker:latest
+          image: >-
+            ghcr.io/teppyboy/hyeboard-automation-worker:replace-with-release-tag
           imagePullPolicy: IfNotPresent
           ports:
             - name: health
