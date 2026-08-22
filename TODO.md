@@ -18,7 +18,7 @@ Status: approved and in progress. Kubernetes manifests now exist as a deployment
 ### Batch 0 — Baseline
 
 - [x] Run and record `pnpm typecheck`, `pnpm test`, `pnpm build`, Node package checks, and Wrangler dry-run.
-- [ ] Run Playwright after the repository's browser binaries are installed.
+- [x] Run Playwright after the repository's browser binaries are installed.
 - [x] Confirm clean baseline at commit `d40ef77`.
 
 ### Batch 1 — Contracts, configuration, and session cutover

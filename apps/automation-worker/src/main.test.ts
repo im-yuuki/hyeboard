@@ -19,7 +19,9 @@ import { AutomationEnvelopeCodec } from "./envelope";
 import type { AutomationWorkerConfig } from "./config";
 import type { PuppeteerBrowser } from "./provider";
 
-const keyring: AutomationKeyring = { current: { id: "current", material: new Uint8Array(32).fill(3) } };
+const keyring: AutomationKeyring = {
+  current: { id: "current", material: new Uint8Array(32).fill(3) },
+};
 const jobId = createJobId(() => new Uint8Array(16).fill(1));
 const accountId = createAccountId(() => new Uint8Array(16).fill(2));
 const challengeId = createChallengeId(() => new Uint8Array(16).fill(4));
@@ -52,14 +54,27 @@ const config: AutomationWorkerConfig = {
 };
 
 function control(): AutomationControl {
-  return { type: "captcha-answer", jobId, accountId, fence: 1, challengeId, answer: "typed-answer" };
+  return {
+    type: "captcha-answer",
+    jobId,
+    accountId,
+    fence: 1,
+    challengeId,
+    answer: "typed-answer",
+  };
 }
 
 describe("automation worker health", () => {
   it("reports liveness before readiness and readiness after startup", () => {
-    expect(automationHealthResponse("/healthz", false)).toMatchObject({ status: 200 });
-    expect(automationHealthResponse("/readyz", false)).toMatchObject({ status: 503 });
-    expect(automationHealthResponse("/readyz", true)).toMatchObject({ status: 200 });
+    expect(automationHealthResponse("/healthz", false)).toMatchObject({
+      status: 200,
+    });
+    expect(automationHealthResponse("/readyz", false)).toMatchObject({
+      status: 503,
+    });
+    expect(automationHealthResponse("/readyz", true)).toMatchObject({
+      status: 200,
+    });
   });
 });
 
@@ -75,7 +90,9 @@ describe("automation control host bridge", () => {
       envelopeCodec: codec,
       onControl: (value) => {
         handled.push(value);
-        return bridge.applyAnswer(value as Extract<AutomationControl, { type: "captcha-answer" }>);
+        return bridge.applyAnswer(
+          value as Extract<AutomationControl, { type: "captcha-answer" }>,
+        );
       },
     });
     const job = createUetImportJob({
@@ -96,13 +113,26 @@ describe("automation control host bridge", () => {
     });
     expect(publish).toHaveBeenCalledOnce();
     const staleEnvelope = await codec.close(
-      { ...control(), accountId: createAccountId(() => new Uint8Array(16).fill(8)) },
+      {
+        ...control(),
+        accountId: createAccountId(() => new Uint8Array(16).fill(8)),
+      },
       `${config.credentialEnvelopeAadPrefix}${jobId}`,
       "2036-01-02T04:00:00.000Z",
     );
-    await broker.add(config.controlStream, { jobId, controlEnvelope: staleEnvelope });
-    const envelope = await codec.close(control(), `${config.credentialEnvelopeAadPrefix}${jobId}`, "2036-01-02T04:00:00.000Z");
-    await broker.add(config.controlStream, { jobId, controlEnvelope: envelope });
+    await broker.add(config.controlStream, {
+      jobId,
+      controlEnvelope: staleEnvelope,
+    });
+    const envelope = await codec.close(
+      control(),
+      `${config.credentialEnvelopeAadPrefix}${jobId}`,
+      "2036-01-02T04:00:00.000Z",
+    );
+    await broker.add(config.controlStream, {
+      jobId,
+      controlEnvelope: envelope,
+    });
     await consumer.runOnce();
     await expect(waiting).resolves.toBe("typed-answer");
     expect(handled).toHaveLength(2);
@@ -114,8 +144,15 @@ type FakeRedis = NodeRedisStreamsClient & {
   get(key: string): Promise<string | null>;
   connect(): Promise<void>;
   ping(): Promise<string>;
-  set(key: string, value: string, options: { PX: number; NX: boolean }): Promise<unknown>;
-  eval(script: string, options: { keys: string[]; arguments: string[] }): Promise<unknown>;
+  set(
+    key: string,
+    value: string,
+    options: { PX: number; NX: boolean },
+  ): Promise<unknown>;
+  eval(
+    script: string,
+    options: { keys: string[]; arguments: string[] },
+  ): Promise<unknown>;
   isOpen: boolean;
   quit(): Promise<void>;
 };
@@ -136,13 +173,19 @@ function fakeRedis(): FakeRedis {
     xAutoClaim: async () => ["0-0", []],
     xAck: async () => 1,
     xAdd: async () => "1-0",
-    connect: async () => { open = true; },
+    connect: async () => {
+      open = true;
+    },
     ping: async () => {
       if (!open) throw new Error("Redis is not connected.");
       return "PONG";
     },
-    get isOpen() { return open; },
-    quit: async () => { open = false; },
+    get isOpen() {
+      return open;
+    },
+    quit: async () => {
+      open = false;
+    },
   };
 }
 
@@ -182,9 +225,18 @@ describe("executable host readiness", () => {
         BROWSERLESS_ENDPOINT: config.browserlessEndpoint,
         BROWSERLESS_TOKEN: config.browserlessToken,
         AUTOMATION_KEY_CURRENT_ID: "current",
-        AUTOMATION_KEY_CURRENT_B64: Buffer.from(keyring.current.material as Uint8Array).toString("base64"),
+        AUTOMATION_KEY_CURRENT_B64: Buffer.from(
+          keyring.current.material as Uint8Array,
+        ).toString("base64"),
       },
-      redis: { normal, blocking, close: async () => { await normal.quit(); await blocking.quit(); } },
+      redis: {
+        normal,
+        blocking,
+        close: async () => {
+          await normal.quit();
+          await blocking.quit();
+        },
+      },
       connectBrowser: async () => {
         browserConnected = true;
         return browser;

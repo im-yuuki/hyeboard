@@ -1,4 +1,9 @@
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import {
+  createServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from "node:http";
 import { env, once, removeListener } from "node:process";
 import puppeteer from "puppeteer-core";
 import { createClient, createClientPool } from "redis";
@@ -7,21 +12,36 @@ import {
   CaptchaControlBridge,
   type AutomationControl,
 } from "./control";
-import { parseAutomationWorkerConfig, safeConfigSummary, type AutomationWorkerConfig } from "./config";
+import {
+  parseAutomationWorkerConfig,
+  safeConfigSummary,
+  type AutomationWorkerConfig,
+} from "./config";
 import { AutomationEnvelopeCodec } from "./envelope";
 import { EncryptedStreamAutomationEventSink } from "./events";
 import { errorCode } from "./errors";
 import { RedisJobLeaseStore } from "./lease";
 import { RedisStreamsBroker, type NodeRedisStreamsClient } from "./broker";
-import { createBrowserlessPuppeteerProvider, type BrowserProvider, type PuppeteerConnector } from "./provider";
+import {
+  createBrowserlessPuppeteerProvider,
+  type BrowserProvider,
+  type PuppeteerConnector,
+} from "./provider";
 import { createUetAutomationExecutor } from "./uet-executor";
 import type { UetAutomationCredential } from "./uet-executor";
 import type { ImportedSession } from "@hyeboard/university-adapters";
 import { AutomationWorker, type AutomationWorkerLogger } from "./worker";
 
 export type AutomationRedisHostClient = NodeRedisStreamsClient & {
-  set(key: string, value: string, options: { PX: number; NX: boolean }): Promise<unknown>;
-  eval(script: string, options: { keys: string[]; arguments: string[] }): Promise<unknown>;
+  set(
+    key: string,
+    value: string,
+    options: { PX: number; NX: boolean },
+  ): Promise<unknown>;
+  eval(
+    script: string,
+    options: { keys: string[]; arguments: string[] },
+  ): Promise<unknown>;
   connect(): Promise<void>;
   ping(): Promise<string>;
   isOpen?: boolean;
@@ -42,7 +62,11 @@ export type AutomationHealth = {
 
 export type AutomationHostOptions = {
   env?: Record<string, string | undefined>;
-  redis?: { normal: AutomationRedisHostClient; blocking: AutomationRedisHostClient; close?: () => Promise<void> };
+  redis?: {
+    normal: AutomationRedisHostClient;
+    blocking: AutomationRedisHostClient;
+    close?: () => Promise<void>;
+  };
   connectBrowser?: PuppeteerConnector;
   browserProvider?: BrowserProvider;
   logger?: AutomationHostLogger;
@@ -58,22 +82,38 @@ export type AutomationHost = {
   stop(): Promise<void>;
 };
 
-export function automationHealthResponse(path: string | undefined, ready: boolean): { status: number; body: string } {
+export function automationHealthResponse(
+  path: string | undefined,
+  ready: boolean,
+): { status: number; body: string } {
   const status = path === "/readyz" && !ready ? 503 : 200;
-  return { status, body: JSON.stringify({ status: status === 200 ? "ok" : "starting", service: "hyeboard-automation-worker" }) };
+  return {
+    status,
+    body: JSON.stringify({
+      status: status === 200 ? "ok" : "starting",
+      service: "hyeboard-automation-worker",
+    }),
+  };
 }
 
-export function createAutomationHealthServer(port: number, host: string): AutomationHealth {
+export function createAutomationHealthServer(
+  port: number,
+  host: string,
+): AutomationHealth {
   let ready = false;
   let closed = false;
-  const server = createServer((request: IncomingMessage, response: ServerResponse) => {
-    const result = automationHealthResponse(request.url, ready);
-    response.writeHead(result.status, { "content-type": "application/json" });
-    response.end(result.body);
-  }).listen(port, host);
+  const server = createServer(
+    (request: IncomingMessage, response: ServerResponse) => {
+      const result = automationHealthResponse(request.url, ready);
+      response.writeHead(result.status, { "content-type": "application/json" });
+      response.end(result.body);
+    },
+  ).listen(port, host);
   return {
     server,
-    setReady(value) { ready = value; },
+    setReady(value) {
+      ready = value;
+    },
     close: () => {
       if (closed) return Promise.resolve();
       closed = true;
@@ -82,7 +122,9 @@ export function createAutomationHealthServer(port: number, host: string): Automa
   };
 }
 
-async function closeRedisClient(client: AutomationRedisHostClient): Promise<void> {
+async function closeRedisClient(
+  client: AutomationRedisHostClient,
+): Promise<void> {
   if (client.isOpen === false) return;
   try {
     if (client.quit) await client.quit();
@@ -94,12 +136,21 @@ async function closeRedisClient(client: AutomationRedisHostClient): Promise<void
 }
 
 function defaultConnector(): PuppeteerConnector {
-  return async ({ browserWSEndpoint }) => puppeteer.connect({ browserWSEndpoint }) as never;
+  return async ({ browserWSEndpoint }) =>
+    puppeteer.connect({ browserWSEndpoint }) as never;
 }
 
-function createRedisHostClients(redisUrl: string): { normal: AutomationRedisHostClient; blocking: AutomationRedisHostClient; close: () => Promise<void> } {
-  const normal = createClient({ url: redisUrl }) as unknown as AutomationRedisHostClient;
-  const blocking = createClientPool({ url: redisUrl }) as unknown as AutomationRedisHostClient;
+function createRedisHostClients(redisUrl: string): {
+  normal: AutomationRedisHostClient;
+  blocking: AutomationRedisHostClient;
+  close: () => Promise<void>;
+} {
+  const normal = createClient({
+    url: redisUrl,
+  }) as unknown as AutomationRedisHostClient;
+  const blocking = createClientPool({
+    url: redisUrl,
+  }) as unknown as AutomationRedisHostClient;
   return {
     normal,
     blocking,
@@ -109,34 +160,47 @@ function createRedisHostClients(redisUrl: string): { normal: AutomationRedisHost
   };
 }
 
-export function createAutomationHost(options: AutomationHostOptions = {}): AutomationHost {
+export function createAutomationHost(
+  options: AutomationHostOptions = {},
+): AutomationHost {
   const config = parseAutomationWorkerConfig(options.env ?? env);
   if (config.browserProvider !== "browserless") {
-    throw new Error("The executable automation host supports Browserless only; configure BROWSERLESS_ENDPOINT and BROWSERLESS_TOKEN.");
+    throw new Error(
+      "The executable automation host supports Browserless only; configure BROWSERLESS_ENDPOINT and BROWSERLESS_TOKEN.",
+    );
   }
 
   const redis = options.redis ?? createRedisHostClients(config.redisUrl);
   const broker = new RedisStreamsBroker(redis.normal, redis.blocking);
   const codec = new AutomationEnvelopeCodec(config.keyring, options.now);
-  const provider = options.browserProvider ?? createBrowserlessPuppeteerProvider({
-    endpoint: config.browserlessEndpoint!,
-    token: config.browserlessToken!,
-    connect: options.connectBrowser ?? defaultConnector(),
-    now: options.now,
-  });
+  const provider =
+    options.browserProvider ??
+    createBrowserlessPuppeteerProvider({
+      endpoint: config.browserlessEndpoint!,
+      token: config.browserlessToken!,
+      connect: options.connectBrowser ?? defaultConnector(),
+      now: options.now,
+    });
   const captcha = new CaptchaControlBridge();
-  const worker = new AutomationWorker<UetAutomationCredential, ImportedSession>({
-    config,
-    broker,
-    leaseStore: new RedisJobLeaseStore(redis.normal),
-    envelopeCodec: codec,
-    browserProvider: provider,
-    executor: createUetAutomationExecutor(),
-    events: new EncryptedStreamAutomationEventSink(broker, config.eventStream, codec, config.eventEnvelopeAadPrefix),
-    logger: options.logger,
-    now: options.now,
-    onCaptchaNeeded: (request) => captcha.waitForAnswer(request),
-  });
+  const worker = new AutomationWorker<UetAutomationCredential, ImportedSession>(
+    {
+      config,
+      broker,
+      leaseStore: new RedisJobLeaseStore(redis.normal),
+      envelopeCodec: codec,
+      browserProvider: provider,
+      executor: createUetAutomationExecutor(),
+      events: new EncryptedStreamAutomationEventSink(
+        broker,
+        config.eventStream,
+        codec,
+        config.eventEnvelopeAadPrefix,
+      ),
+      logger: options.logger,
+      now: options.now,
+      onCaptchaNeeded: (request) => captcha.waitForAnswer(request),
+    },
+  );
   const controls = new AutomationControlConsumer({
     config,
     broker,
@@ -169,12 +233,18 @@ export function createAutomationHost(options: AutomationHostOptions = {}): Autom
         await controls.start();
         health?.setReady(true);
         started = true;
-        options.logger?.info?.("Automation worker ready.", safeConfigSummary(config));
+        options.logger?.info?.(
+          "Automation worker ready.",
+          safeConfigSummary(config),
+        );
       } catch (error) {
         await controls.stop(config.shutdownTimeoutMs).catch(() => undefined);
         await worker.stop("shutdown").catch(() => undefined);
         if (redis.close) await redis.close().catch(() => undefined);
-        else await Promise.all([...clientsConnected].map((client) => closeRedisClient(client)));
+        else
+          await Promise.all(
+            [...clientsConnected].map((client) => closeRedisClient(client)),
+          );
         health?.setReady(false);
         await health?.close();
         throw error;
@@ -185,7 +255,11 @@ export function createAutomationHost(options: AutomationHostOptions = {}): Autom
         await controls.stop(config.shutdownTimeoutMs);
         await worker.stop("shutdown");
         if (redis.close) await redis.close();
-        else await Promise.all([closeRedisClient(redis.normal), closeRedisClient(redis.blocking)]);
+        else
+          await Promise.all([
+            closeRedisClient(redis.normal),
+            closeRedisClient(redis.blocking),
+          ]);
         health?.setReady(false);
         await health?.close();
         started = false;
@@ -195,19 +269,28 @@ export function createAutomationHost(options: AutomationHostOptions = {}): Autom
   };
 }
 
-function applyControl(control: AutomationControl, worker: AutomationWorker<UetAutomationCredential, ImportedSession>, captcha: CaptchaControlBridge): boolean {
+function applyControl(
+  control: AutomationControl,
+  worker: AutomationWorker<UetAutomationCredential, ImportedSession>,
+  captcha: CaptchaControlBridge,
+): boolean {
   if (control.type === "captcha-answer") return captcha.applyAnswer(control);
   if (control.challengeId && !captcha.matchesChallenge(control)) return false;
   return worker.requestFencedCancel(control);
 }
 
-export async function runAutomationWorker(environment: Record<string, string | undefined> = env): Promise<void> {
+export async function runAutomationWorker(
+  environment: Record<string, string | undefined> = env,
+): Promise<void> {
   const logger: AutomationHostLogger = {
     info: (message, fields) => console.info(message, fields ?? {}),
     warn: (message, fields) => console.warn(message, fields ?? {}),
     error: (message, fields) => console.error(message, fields ?? {}),
   };
-  const health = createAutomationHealthServer(Number(environment.AUTOMATION_HEALTH_PORT ?? 8080), environment.AUTOMATION_HEALTH_HOST ?? "0.0.0.0");
+  const health = createAutomationHealthServer(
+    Number(environment.AUTOMATION_HEALTH_PORT ?? 8080),
+    environment.AUTOMATION_HEALTH_HOST ?? "0.0.0.0",
+  );
   let host: AutomationHost;
   try {
     host = createAutomationHost({ env: environment, logger, health });
@@ -217,7 +300,13 @@ export async function runAutomationWorker(environment: Record<string, string | u
   }
   let stopping: Promise<void> | undefined;
   const stop = () => {
-    stopping ??= host.stop().catch((error) => logger.error?.("Automation worker shutdown failed.", { code: errorCode(error) }));
+    stopping ??= host
+      .stop()
+      .catch((error) =>
+        logger.error?.("Automation worker shutdown failed.", {
+          code: errorCode(error),
+        }),
+      );
   };
   once("SIGTERM", stop);
   once("SIGINT", stop);
@@ -231,7 +320,9 @@ export async function runAutomationWorker(environment: Record<string, string | u
       waitForStop();
     });
   } catch (error) {
-    logger.error?.("Automation worker failed to start.", { code: errorCode(error) });
+    logger.error?.("Automation worker failed to start.", {
+      code: errorCode(error),
+    });
     throw error;
   } finally {
     removeListener("SIGTERM", stop);

@@ -138,7 +138,16 @@ The manifests in [`deploy/k8s`](../deploy/k8s) run two API replicas and two auto
 
 Before applying the example overlay:
 
-1. Build and publish both images, then replace the image tags in `deploy/k8s/overlays/example/kustomization.yaml`.
+1. Build and publish both images, then replace the image tags in `deploy/k8s/overlays/example/kustomization.yaml`. From the repository root:
+
+```bash
+docker build -t ghcr.io/teppyboy/hyeboard-api:<tag> .
+docker build -t ghcr.io/teppyboy/hyeboard-automation-worker:<tag> -f apps/automation-worker/Dockerfile .
+docker push ghcr.io/teppyboy/hyeboard-api:<tag>
+docker push ghcr.io/teppyboy/hyeboard-automation-worker:<tag>
+```
+
+Use immutable release tags, not `latest`, for production.
 2. Provision PostgreSQL, Redis, and Browserless outside this repository. Put their URLs and credentials in a Secret named `hyeboard-runtime`; start from `deploy/k8s/base/secret.example.yaml` without applying it unchanged.
 3. Set the production hostname and TLS Secret in `deploy/k8s/overlays/example/ingress.yaml`.
 4. Set the session epoch and enforcement flag together during the planned session cutover.
@@ -155,7 +164,6 @@ kubectl rollout status deployment/hyeboard-automation-worker -n hyeboard
 The example NetworkPolicy restricts API and worker egress to DNS, HTTPS, and the configured PostgreSQL, Redis, and Browserless ports. It leaves ingress open so managed ingress controllers and kubelet probes work across CNI implementations; add an ingress allowlist matching the target cluster before production exposure.
 
 The Kubernetes resources do not remove the runtime gates below. Run them against the target cluster and dependencies before exposing the service to production:
-
 
 - Two API replicas work under round-robin traffic without sticky sessions.
 - VNU refresh, cross-lookup authority, and generic revocation are shared and survive replica restart.

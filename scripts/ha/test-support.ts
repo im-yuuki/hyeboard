@@ -18,19 +18,32 @@ function resolveTsxLoader(): string {
 }
 
 const tsxLoader = resolveTsxLoader();
+const pnpmCommand = process.env.PNPM_BIN ?? (process.platform === "win32" ? "pnpm.cmd" : "pnpm");
 
 export async function dockerIsAvailable(): Promise<boolean> {
   try {
-    await execFileAsync(process.env.DOCKER_BIN ?? "docker", ["info"], { timeout: 5_000 });
+    await execFileAsync(process.env.DOCKER_BIN ?? "docker", ["info"], {
+      timeout: 5_000,
+    });
     return true;
   } catch {
     return false;
   }
 }
 
-export async function dockerImagesAreAvailable(images: readonly string[]): Promise<boolean> {
+export async function dockerImagesAreAvailable(
+  images: readonly string[],
+): Promise<boolean> {
   try {
-    await Promise.all(images.map((image) => execFileAsync(process.env.DOCKER_BIN ?? "docker", ["image", "inspect", image], { timeout: 5_000 })));
+    await Promise.all(
+      images.map((image) =>
+        execFileAsync(
+          process.env.DOCKER_BIN ?? "docker",
+          ["image", "inspect", image],
+          { timeout: 5_000 },
+        ),
+      ),
+    );
     return true;
   } catch {
     return false;
@@ -48,10 +61,11 @@ export async function freePort(): Promise<number> {
     server.listen(0, "127.0.0.1", () => resolve());
   });
   const address = server.address();
-  if (!address || typeof address === "string") throw new Error("Could not allocate a TCP port");
+  if (!address || typeof address === "string")
+    throw new Error("Could not allocate a TCP port");
   const port = address.port;
   await new Promise<void>((resolve, reject) => {
-    server.close((error) => error ? reject(error) : resolve());
+    server.close((error) => (error ? reject(error) : resolve()));
   });
   return port;
 }
@@ -96,15 +110,21 @@ export class WorkerProcess {
         stdio: ["ignore", "pipe", "pipe"],
       },
     );
-    child.stdout?.on("data", (chunk: Buffer) => { output.stdout += chunk.toString(); });
-    child.stderr?.on("data", (chunk: Buffer) => { output.stderr += chunk.toString(); });
+    child.stdout?.on("data", (chunk: Buffer) => {
+      output.stdout += chunk.toString();
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      output.stderr += chunk.toString();
+    });
     const worker = new WorkerProcess(port, child, output);
     try {
       await worker.waitUntilResponding();
       return worker;
     } catch (error) {
       await worker.stop();
-      throw new Error(`${error instanceof Error ? error.message : String(error)}\n${worker.logs()}`);
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)}\n${worker.logs()}`,
+      );
     }
   }
 
@@ -122,25 +142,34 @@ export class WorkerProcess {
     throw new Error(`Worker on port ${this.port} did not become reachable`);
   }
 
-  async request(path: string, init?: RequestInit): Promise<{ status: number; body: any }> {
+  async request(
+    path: string,
+    init?: RequestInit,
+  ): Promise<{ status: number; body: any }> {
     const response = await fetch(`http://127.0.0.1:${this.port}${path}`, init);
     const body = await response.json().catch(() => undefined);
     return { status: response.status, body };
   }
 
-  async stop(signal: NodeJS.Signals = "SIGTERM"): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  async stop(
+    signal: NodeJS.Signals = "SIGTERM",
+  ): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
     if (this.child.exitCode !== null || this.child.signalCode !== null) {
       return { code: this.child.exitCode, signal: this.child.signalCode };
     }
     this.child.kill(signal);
-    const exited = once(this.child, "exit") as Promise<[number | null, NodeJS.Signals | null]>;
+    const exited = once(this.child, "exit") as Promise<
+      [number | null, NodeJS.Signals | null]
+    >;
     let timeout: ReturnType<typeof setTimeout> | undefined;
-    const timedOut = new Promise<[number | null, NodeJS.Signals | null]>((resolve) => {
-      timeout = setTimeout(() => {
-        this.child.kill("SIGKILL");
-        void exited.then(resolve);
-      }, 15_000);
-    });
+    const timedOut = new Promise<[number | null, NodeJS.Signals | null]>(
+      (resolve) => {
+        timeout = setTimeout(() => {
+          this.child.kill("SIGKILL");
+          void exited.then(resolve);
+        }, 15_000);
+      },
+    );
     try {
       const [code, childSignal] = await Promise.race([exited, timedOut]);
       return { code, signal: childSignal };
@@ -161,8 +190,16 @@ export async function runProbe(
   dependencies: { postgresUrl?: string; redisUrl?: string },
 ): Promise<any> {
   const child = spawn(
-    process.env.PNPM_BIN ?? "pnpm",
-    ["--filter", "@hyeboard/worker", "exec", "tsx", probeScript, operation, JSON.stringify(input)],
+    pnpmCommand,
+    [
+      "--filter",
+      "@hyeboard/worker",
+      "exec",
+      "tsx",
+      probeScript,
+      operation,
+      JSON.stringify(input),
+    ],
     {
       cwd: repositoryRoot,
       env: {
@@ -176,10 +213,18 @@ export async function runProbe(
   );
   let stdout = "";
   let stderr = "";
-  child.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-  child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-  const [code] = await once(child, "exit") as [number | null, NodeJS.Signals | null];
-  if (code !== 0) throw new Error(`HA probe ${operation} failed:\n${stderr}\n${stdout}`);
+  child.stdout?.on("data", (chunk: Buffer) => {
+    stdout += chunk.toString();
+  });
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString();
+  });
+  const [code] = (await once(child, "exit")) as [
+    number | null,
+    NodeJS.Signals | null,
+  ];
+  if (code !== 0)
+    throw new Error(`HA probe ${operation} failed:\n${stderr}\n${stdout}`);
   const line = stdout.trim().split("\n").at(-1);
   if (!line) throw new Error(`HA probe ${operation} returned no result`);
   return JSON.parse(line);
