@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { strict as assert } from "node:assert";
+import { validateClusterSnapshot } from "./validate-k8s-cluster.mjs";
 
 const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
 const api = read("deploy/k8s/base/api-deployment.yaml");
@@ -70,5 +71,58 @@ has(networkPolicy, /name: hyeboard-automation-worker/);
 assert(networkPolicy.includes("policyTypes:\n    - Egress"));
 assert(count(api, "secretKeyRef:") >= 5);
 assert(count(worker, "secretKeyRef:") >= 5);
+
+const readyCondition = [{ type: "Ready", status: "True" }];
+const activeCondition = [{ type: "ScalingActive", status: "True" }];
+const clusterSnapshot = {
+  deployments: {
+    items: ["hyeboard-api", "hyeboard-automation-worker"].map((name) => ({
+      metadata: { name },
+      spec: { replicas: 2 },
+      status: { readyReplicas: 2 },
+    })),
+  },
+  pods: {
+    items: ["hyeboard-api", "hyeboard-automation-worker"].flatMap((name) =>
+      ["a", "b"].map((suffix) => ({
+        metadata: {
+          name: `${name}-${suffix}`,
+          uid: `${name}-${suffix}`,
+          labels: { "app.kubernetes.io/name": name },
+        },
+        status: { conditions: readyCondition },
+      })),
+    ),
+  },
+  endpointSlices: {
+    items: [
+      {
+        endpoints: [
+          { addresses: ["10.0.0.1"], conditions: { ready: true } },
+          { addresses: ["10.0.0.2"], conditions: { ready: true } },
+        ],
+      },
+    ],
+  },
+  hpas: {
+    items: ["hyeboard-api", "hyeboard-automation-worker"].map((name) => ({
+      metadata: { name },
+      status: { currentReplicas: 2, conditions: activeCondition },
+    })),
+  },
+};
+validateClusterSnapshot(clusterSnapshot);
+const oneReplica = structuredClone(clusterSnapshot);
+oneReplica.deployments.items[0].status.readyReplicas = 1;
+assert.throws(() => validateClusterSnapshot(oneReplica), /fewer than two ready replicas/);
+const oneEndpoint = structuredClone(clusterSnapshot);
+oneEndpoint.endpointSlices.items[0].endpoints.pop();
+assert.throws(
+  () => validateClusterSnapshot(oneEndpoint),
+  /fewer than two ready endpoint addresses/,
+);
+const inactiveHpa = structuredClone(clusterSnapshot);
+inactiveHpa.hpas.items[0].status.conditions[0].status = "False";
+assert.throws(() => validateClusterSnapshot(inactiveHpa), /metrics are not active/);
 
 console.log("Kubernetes manifest contract passed.");

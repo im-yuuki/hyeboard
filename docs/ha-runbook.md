@@ -159,9 +159,12 @@ kubectl kustomize deploy/k8s/overlays/example
 kubectl apply -k deploy/k8s/overlays/example
 kubectl rollout status deployment/hyeboard-api -n hyeboard
 kubectl rollout status deployment/hyeboard-automation-worker -n hyeboard
+node scripts/validate-k8s-cluster.mjs --failover
 ```
 
 The example NetworkPolicy restricts API and worker egress to DNS, HTTPS, and the configured PostgreSQL, Redis, and Browserless ports. It leaves ingress open so managed ingress controllers and kubelet probes work across CNI implementations; add an ingress allowlist matching the target cluster before production exposure.
+
+`validate-k8s-cluster.mjs` requires `kubectl` access to the target namespace. It checks both rollouts, two ready replicas per Deployment, two API Service endpoints, active HPA metrics, one Service-minted mock session against every API pod, twenty in-cluster readiness requests, and—in `--failover` mode—service availability while one API pod is deleted and replaced.
 
 The Kubernetes resources do not remove the runtime gates below. The example overlay starts with `HYEB_AUTOMATION_EXECUTOR_READY=false`; enable it only after the real Browserless/UET executor gate passes. Run the resources against the target cluster and dependencies before exposing the service to production:
 
