@@ -1,6 +1,6 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-namespace: hyeboard
+namespace: hyeboard-production
 resources:
   - ../../base
   - namespace.yaml
@@ -13,10 +13,10 @@ configMapGenerator:
     literals:
       - HYEB_ALLOWED_ORIGINS=https://hyeboard.example.com
 images:
-  # Replace the explicit placeholder tags with an immutable release tag.
+  # Replace the registry and explicit placeholder tags with an immutable release tag.
   - name: ghcr.io/im-yuuki/hyeboard-api
-    newName: ghcr.io/im-yuuki/hyeboard-api
+    newName: registry.internal.example/hyeboard-api
     newTag: replace-with-release-tag
   - name: ghcr.io/im-yuuki/hyeboard-automation-worker
-    newName: ghcr.io/im-yuuki/hyeboard-automation-worker
+    newName: registry.internal.example/hyeboard-automation-worker
     newTag: replace-with-release-tag

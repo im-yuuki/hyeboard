@@ -16,7 +16,7 @@ spec:
   tls:
     - hosts:
         - hyeboard.example.com
-      secretName: hyeboard-tls
+      secretName: hyeboard-production-tls
   rules:
     - host: hyeboard.example.com
       http:

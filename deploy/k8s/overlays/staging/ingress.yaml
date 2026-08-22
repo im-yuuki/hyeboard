@@ -15,10 +15,10 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - hyeboard.example.com
-      secretName: hyeboard-tls
+        - staging.hyeboard.example.com
+      secretName: hyeboard-staging-tls
   rules:
-    - host: hyeboard.example.com
+    - host: staging.hyeboard.example.com
       http:
         paths:
           - path: /

@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: hyeboard
+  name: hyeboard-staging
   labels:
     hyeboard.io/monitoring: "true"
     pod-security.kubernetes.io/enforce: restricted
