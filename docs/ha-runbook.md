@@ -130,7 +130,7 @@ pnpm test:ha
 
 The PostgreSQL suite checks shared session revocation, refresh serialization, outage behavior, readiness, and SIGTERM drain across two worker processes. The Redis suite checks cross-process refresh coordination, CAPTCHA relay, Redis outage behavior, readiness/liveness separation, and SIGTERM drain. If Docker or an image is unavailable, the suites report a skip rather than a fake passing integration result.
 
-The latest `pnpm test:ha` run passed PostgreSQL 5/5 and Redis 4/4, and `/api/ready` reached ready during the distributed run. These tests cover the shared-dependency and failure-handling foundation. Browserless/UET login remains deployment-specific and must be validated with the target provider before enabling automated sign-in.
+The latest CI `pnpm test:ha` run passed PostgreSQL 5/5 and Redis 5/5, including automation crash reclaim with a replacement fencing lease; `/api/ready` reached ready during the distributed run. These tests cover the shared-dependency and failure-handling foundation. Browserless/UET login remains deployment-specific and must be validated with the target provider before enabling automated sign-in.
 
 ## Kubernetes deployment
 
