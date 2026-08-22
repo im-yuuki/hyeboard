@@ -12,7 +12,7 @@ resources:
 images:
   - name: ghcr.io/teppyboy/hyeboard-api
     newName: ghcr.io/teppyboy/hyeboard-api
-    newTag: latest
+    newTag: replace-with-release-tag
   - name: ghcr.io/teppyboy/hyeboard-automation-worker
     newName: ghcr.io/teppyboy/hyeboard-automation-worker
-    newTag: latest
+    newTag: replace-with-release-tag

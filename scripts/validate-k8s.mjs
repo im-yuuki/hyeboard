@@ -47,6 +47,8 @@ has(config, /AUTOMATION_EXECUTION_MODE: distributed/);
 has(config, /AUTOMATION_BROWSER_PROVIDER: browserless/);
 assert(kustomization.includes("api-deployment.yaml"));
 assert(kustomization.includes("automation-deployment.yaml"));
+assert(!kustomization.includes("newTag: latest"));
+assert(config.includes('HYEB_AUTOMATION_EXECUTOR_READY: "false"'));
 assert(secret.includes("replace-with"));
 assert(!/eyJ[A-Za-z0-9_-]{20,}/.test(secret));
 has(networkPolicy, /name: hyeboard-automation-worker/);
