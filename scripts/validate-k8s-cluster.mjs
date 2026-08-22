@@ -7,17 +7,33 @@ const failover = process.argv.includes("--failover");
 const kubectl = process.env.KUBECTL_BIN ?? "kubectl";
 
 function run(args, options = {}) {
-  return execFileSync(kubectl, args, {
-    encoding: "utf8",
-    stdio: options.capture ? ["ignore", "pipe", "inherit"] : "inherit",
-  });
+  try {
+    return execFileSync(kubectl, args, {
+      encoding: "utf8",
+      stdio: options.capture ? ["ignore", "pipe", "inherit"] : "inherit",
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`kubectl ${args.join(" ")} failed: ${reason}`);
+  }
 }
 
 function readJson(args) {
-  return JSON.parse(run([...args, "-o", "json"], { capture: true }));
+  const output = run([...args, "-o", "json"], { capture: true });
+  try {
+    return JSON.parse(output);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`kubectl ${args.join(" ")} returned invalid JSON: ${reason}`);
+  }
 }
 
-export function validateClusterSnapshot({ deployments, pods, endpointSlices, hpas }) {
+export function validateClusterSnapshot({
+  deployments,
+  pods,
+  endpointSlices,
+  hpas,
+}) {
   const deploymentByName = new Map(
     deployments.items.map((item) => [item.metadata.name, item]),
   );
@@ -37,14 +53,23 @@ export function validateClusterSnapshot({ deployments, pods, endpointSlices, hpa
       (pod) =>
         pod.metadata.labels?.["app.kubernetes.io/name"] === name &&
         pod.status.conditions?.some(
-          (condition) => condition.type === "Ready" && condition.status === "True",
+          (condition) =>
+            condition.type === "Ready" && condition.status === "True",
         ),
     );
   for (const name of ["hyeboard-api", "hyeboard-automation-worker"]) {
     const replicas = readyPods(name);
-    if (replicas.length < 2) throw new Error(`${name} has fewer than two ready pods`);
-    if (new Set(replicas.map((pod) => pod.metadata.uid)).size !== replicas.length)
+    if (replicas.length < 2)
+      throw new Error(`${name} has fewer than two ready pods`);
+    if (
+      new Set(replicas.map((pod) => pod.metadata.uid)).size !== replicas.length
+    )
       throw new Error(`${name} pod identities are not unique`);
+    const nodes = new Set(
+      replicas.map((pod) => pod.spec?.nodeName).filter(Boolean),
+    );
+    if (nodes.size < 2)
+      throw new Error(`${name} ready replicas are not spread across two nodes`);
   }
 
   const endpointAddresses = endpointSlices.items
@@ -52,16 +77,21 @@ export function validateClusterSnapshot({ deployments, pods, endpointSlices, hpa
     .filter((endpoint) => endpoint.conditions?.ready !== false)
     .flatMap((endpoint) => endpoint.addresses ?? []);
   if (new Set(endpointAddresses).size < 2)
-    throw new Error("hyeboard-api Service has fewer than two ready endpoint addresses");
+    throw new Error(
+      "hyeboard-api Service has fewer than two ready endpoint addresses",
+    );
 
-  const hpaByName = new Map(hpas.items.map((item) => [item.metadata.name, item]));
+  const hpaByName = new Map(
+    hpas.items.map((item) => [item.metadata.name, item]),
+  );
   for (const name of ["hyeboard-api", "hyeboard-automation-worker"]) {
     const hpa = hpaByName.get(name);
     if (!hpa) throw new Error(`Missing HorizontalPodAutoscaler ${name}`);
     if ((hpa.status.currentReplicas ?? 0) < 2)
       throw new Error(`${name} HPA reports fewer than two current replicas`);
     const active = hpa.status.conditions?.some(
-      (condition) => condition.type === "ScalingActive" && condition.status === "True",
+      (condition) =>
+        condition.type === "ScalingActive" && condition.status === "True",
     );
     if (!active) throw new Error(`${name} HPA metrics are not active`);
   }
@@ -117,7 +147,9 @@ function readyEndpointAddresses(clusterSnapshot) {
 
 function probeService(clusterSnapshot, verifyEndpoints = true) {
   const name = `hyeboard-smoke-${Date.now()}`;
-  const endpoints = verifyEndpoints ? readyEndpointAddresses(clusterSnapshot) : [];
+  const endpoints = verifyEndpoints
+    ? readyEndpointAddresses(clusterSnapshot)
+    : [];
   run([
     "run",
     name,
@@ -162,11 +194,20 @@ function main() {
       (pod) =>
         pod.metadata.labels?.["app.kubernetes.io/name"] === "hyeboard-api" &&
         pod.status.conditions?.some(
-          (condition) => condition.type === "Ready" && condition.status === "True",
+          (condition) =>
+            condition.type === "Ready" && condition.status === "True",
         ),
     );
-    if (!pods[0]) throw new Error("No ready API pod is available for failover test");
-    run(["delete", "pod", pods[0].metadata.name, "-n", namespace, "--wait=false"]);
+    if (!pods[0])
+      throw new Error("No ready API pod is available for failover test");
+    run([
+      "delete",
+      "pod",
+      pods[0].metadata.name,
+      "-n",
+      namespace,
+      "--wait=false",
+    ]);
     probeService(currentSnapshot, false);
     waitForRollouts();
     currentSnapshot = snapshot();

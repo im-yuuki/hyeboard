@@ -2,7 +2,8 @@ import { readFileSync } from "node:fs";
 import { strict as assert } from "node:assert";
 import { validateClusterSnapshot } from "./validate-k8s-cluster.mjs";
 
-const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
+const read = (path) =>
+  readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
 const api = read("deploy/k8s/base/api-deployment.yaml");
 const worker = read("deploy/k8s/base/automation-deployment.yaml");
 const config = read("deploy/k8s/base/configmap.yaml");
@@ -13,6 +14,7 @@ const hpa = read("deploy/k8s/base/api-hpa.yaml");
 const workerHpa = read("deploy/k8s/base/automation-hpa.yaml");
 const apiPdb = read("deploy/k8s/base/api-pdb.yaml");
 const workerPdb = read("deploy/k8s/base/automation-pdb.yaml");
+const ingress = read("deploy/k8s/overlays/example/ingress.yaml");
 const dockerfile = read("Dockerfile");
 const workerDockerfile = read("apps/automation-worker/Dockerfile");
 const count = (text, value) => text.split(value).length - 1;
@@ -34,7 +36,7 @@ assert(!api.includes(":latest"));
 assert(!worker.includes(":latest"));
 assert(api.includes("replace-with-release-tag"));
 assert(worker.includes("replace-with-release-tag"));
-assert(config.includes("HYEB_SHUTDOWN_TIMEOUT_MS: \"30000\""));
+assert(config.includes('HYEB_SHUTDOWN_TIMEOUT_MS: "30000"'));
 has(hpa, /minReplicas: 2/);
 has(hpa, /maxReplicas: 12/);
 has(hpa, /averageUtilization: 70/);
@@ -67,6 +69,8 @@ assert(!kustomization.includes("newTag: latest"));
 assert(config.includes('HYEB_AUTOMATION_EXECUTOR_READY: "false"'));
 assert(secret.includes("replace-with"));
 assert(!/eyJ[A-Za-z0-9_-]{20,}/.test(secret));
+has(ingress, /nginx.ingress.kubernetes.io\/proxy-buffering: "off"/);
+has(ingress, /nginx.ingress.kubernetes.io\/proxy-request-buffering: "off"/);
 has(networkPolicy, /name: hyeboard-automation-worker/);
 assert(networkPolicy.includes("policyTypes:\n    - Egress"));
 assert(count(api, "secretKeyRef:") >= 5);
@@ -90,6 +94,7 @@ const clusterSnapshot = {
           uid: `${name}-${suffix}`,
           labels: { "app.kubernetes.io/name": name },
         },
+        spec: { nodeName: `${name}-node-${suffix}` },
         status: { conditions: readyCondition },
       })),
     ),
@@ -114,7 +119,20 @@ const clusterSnapshot = {
 validateClusterSnapshot(clusterSnapshot);
 const oneReplica = structuredClone(clusterSnapshot);
 oneReplica.deployments.items[0].status.readyReplicas = 1;
-assert.throws(() => validateClusterSnapshot(oneReplica), /fewer than two ready replicas/);
+assert.throws(
+  () => validateClusterSnapshot(oneReplica),
+  /fewer than two ready replicas/,
+);
+const oneNode = structuredClone(clusterSnapshot);
+oneNode.pods.items
+  .filter((pod) => pod.metadata.labels["app.kubernetes.io/name"] === "hyeboard-api")
+  .forEach((pod) => {
+    pod.spec.nodeName = "hyeboard-api-node-a";
+  });
+assert.throws(
+  () => validateClusterSnapshot(oneNode),
+  /not spread across two nodes/,
+);
 const oneEndpoint = structuredClone(clusterSnapshot);
 oneEndpoint.endpointSlices.items[0].endpoints.pop();
 assert.throws(
@@ -123,6 +141,9 @@ assert.throws(
 );
 const inactiveHpa = structuredClone(clusterSnapshot);
 inactiveHpa.hpas.items[0].status.conditions[0].status = "False";
-assert.throws(() => validateClusterSnapshot(inactiveHpa), /metrics are not active/);
+assert.throws(
+  () => validateClusterSnapshot(inactiveHpa),
+  /metrics are not active/,
+);
 
 console.log("Kubernetes manifest contract passed.");

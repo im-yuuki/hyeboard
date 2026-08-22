@@ -134,7 +134,7 @@ The latest CI `pnpm test:ha` run passed PostgreSQL 5/5 and Redis 5/5, including 
 
 ## Kubernetes deployment
 
-The manifests in [`deploy/k8s`](../deploy/k8s) run two API replicas and two automation workers by default. The API Deployment uses `/api/live` for liveness, `/api/ready` for dependency-backed readiness, rolling updates with no unavailable replicas, resource requests, an HPA, and a PDB. Both Deployments prefer different nodes and use best-effort hostname topology spreading; this distributes replicas when nodes are available without blocking HPA overflow on smaller clusters. Their disruption budgets permit at most one unavailable replica, including after scale-up. Worker pods expose `/healthz` and `/readyz` after Redis and Browserless startup checks pass. The worker Deployment has a CPU/memory HPA from 2 to 8 replicas; it is a conservative fallback because native Kubernetes metrics do not measure Redis queue depth.
+The manifests in [`deploy/k8s`](../deploy/k8s) run two API replicas and two automation workers by default. The API Deployment uses `/api/live` for liveness, `/api/ready` for dependency-backed readiness, rolling updates with no unavailable replicas, resource requests, an HPA, and a PDB. Both Deployments prefer different nodes and use best-effort hostname topology spreading; this distributes replicas when nodes are available without blocking HPA overflow on smaller clusters. Cluster validation additionally requires the two ready replicas of each Deployment to occupy two distinct nodes. The example Ingress disables proxy buffering for the long-lived automation SSE route. Their disruption budgets permit at most one unavailable replica, including after scale-up. Worker pods expose `/healthz` and `/readyz` after Redis and Browserless startup checks pass. The worker Deployment has a CPU/memory HPA from 2 to 8 replicas; it is a conservative fallback because native Kubernetes metrics do not measure Redis queue depth.
 
 Before applying the example overlay:
 
@@ -164,7 +164,7 @@ node scripts/validate-k8s-cluster.mjs --failover
 
 The example NetworkPolicy restricts API and worker egress to DNS, HTTPS, and the configured PostgreSQL, Redis, and Browserless ports. It leaves ingress open so managed ingress controllers and kubelet probes work across CNI implementations; add an ingress allowlist matching the target cluster before production exposure.
 
-`validate-k8s-cluster.mjs` requires `kubectl` access to the target namespace. It checks both rollouts, two ready replicas per Deployment, two API Service endpoints, active HPA metrics, one Service-minted mock session against every API pod, twenty in-cluster readiness requests, and—in `--failover` mode—service availability while one API pod is deleted and replaced.
+`validate-k8s-cluster.mjs` requires `kubectl` access to the target namespace. It checks both rollouts, two ready replicas per Deployment on distinct nodes, two API Service endpoints, active HPA metrics, one Service-minted mock session against every API pod, twenty in-cluster readiness requests, and—in `--failover` mode—service availability while one API pod is deleted and replaced.
 
 The Kubernetes resources do not remove the runtime gates below. The example overlay starts with `HYEB_AUTOMATION_EXECUTOR_READY=false`; enable it only after the real Browserless/UET executor gate passes. Run the resources against the target cluster and dependencies before exposing the service to production:
 
