@@ -172,7 +172,7 @@ The repository contains two production container definitions:
 - `Dockerfile` builds the self-hosted API image and starts `node dist/index.js` on port `8787`.
 - `apps/automation-worker/Dockerfile` builds the Node-only automation worker image and starts `node dist/cli.cjs` on port `8080`.
 
-The images use Node `22.14.0-bookworm-slim`, BuildKit cache mounts, lockfile-resolved production dependencies, and a non-root runtime user. BuildKit/buildx and a running Docker daemon are required:
+The images use Node `22.22.0-bookworm-slim`, refresh Debian security packages in the runtime stage, remove the unused runtime npm toolchain, use BuildKit cache mounts, lockfile-resolved production dependencies, and a non-root runtime user. BuildKit/buildx and a running Docker daemon are required:
 
 ```bash
 docker info

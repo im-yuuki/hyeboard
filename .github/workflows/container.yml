@@ -65,4 +65,6 @@ jobs:
           format: table
           exit-code: "1"
           ignore-unfixed: true
+          scanners: vuln
+          vuln-type: os,library
           severity: HIGH,CRITICAL

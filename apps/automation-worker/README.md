@@ -28,7 +28,7 @@ The event sink is injectable. `StreamAutomationEventSink` writes JSON events to 
 
 ## Containers
 
-`apps/automation-worker/Dockerfile` builds the executable bridge as a non-root Node `22.14.0-bookworm-slim` image. It starts `node dist/cli.cjs`, listens on port `8080`, and exposes `/healthz` and `/readyz` for container probes.
+`apps/automation-worker/Dockerfile` builds the executable bridge as a non-root Node `22.22.0-bookworm-slim` image. It starts `node dist/cli.cjs`, listens on port `8080`, and exposes `/healthz` and `/readyz` for container probes.
 
 Build the image from the repository root and publish it with an immutable SHA tag:
 
