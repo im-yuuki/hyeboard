@@ -99,13 +99,13 @@ export function createVnuAdapter(): UniversityAdapter {
       return mapTerms(await loadGrades(request));
     },
     async getDashboard(request) {
-      const [student, terms, grades, progress, tuition] = await Promise.all([
+      const [student, grades, progress, tuition] = await Promise.all([
         this.getStudentProfile(request),
-        this.getTerms(request),
         loadGrades(request),
         loadProgress(request),
         Promise.resolve(undefined),
       ]);
+      const terms = mapTerms(grades);
       return {
         student,
         currentTerm: terms[0],

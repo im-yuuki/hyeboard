@@ -28,7 +28,9 @@
     "test:benchmark-lifecycle": "node scripts/run-benchmark-process-runner-tests.mjs",
     "test:browser": "pnpm --filter @hyeboard/web exec playwright test --retries=0",
     "test:fast": "node scripts/benchmark-test-runtime.mjs --runs=1 --label=fast",
-    "benchmark:test-runtime": "node scripts/benchmark-test-runtime.mjs --runs=3 --label=acceptance"
+    "benchmark:test-runtime": "node scripts/benchmark-test-runtime.mjs --runs=3 --label=acceptance",
+    "audit:web-performance": "node scripts/audit-web-performance.mjs apps/web/dist",
+    "audit:performance": "pnpm build:web && pnpm audit:web-performance"
   },
   "devDependencies": {
     "concurrently": "^10.0.3",

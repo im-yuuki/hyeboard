@@ -26,9 +26,12 @@ export function SessionReauthGate() {
   // Refs keep the event listener stable across locale changes - re-running
   // the effect mid-attempt must never abort an in-flight re-auth.
   const translationsRef = useRef(t);
-  translationsRef.current = t;
   const relayCaptchaRef = useRef(captcha.relayCaptcha);
-  relayCaptchaRef.current = captcha.relayCaptcha;
+
+  useEffect(() => {
+    translationsRef.current = t;
+    relayCaptchaRef.current = captcha.relayCaptcha;
+  }, [captcha.relayCaptcha, t]);
 
   useEffect(() => {
     const signBackIn = async () => {

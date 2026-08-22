@@ -891,7 +891,9 @@ function BulkLookupSection({ maximum, modeMaximums, directChunkMaximum, freshnes
   const progressSnapshot = useRef<BulkLookupProgress>({ processed: 0, total: 0, items: [] });
   const exportItems = useRef<ExportBulkItem[]>([]);
   const termDictionary = useRef(t.terms);
-  termDictionary.current = t.terms;
+  useEffect(() => {
+    termDictionary.current = t.terms;
+  }, [t.terms]);
   const activeMaximum = modeMaximums?.[mode] ?? maximum;
   const parsed = useMemo(() => parseBulkTargets(rawTargets, activeMaximum), [rawTargets, activeMaximum]);
   const viewState = deriveBulkLookupViewState(parsed, active, progress.processed);

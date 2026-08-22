@@ -1,5 +1,5 @@
 import { addHours, assertSupported, HyeboardError, type EncryptedSessionPayload } from "@hyeboard/core";
-import type { ClassSession, DashboardSummary, University } from "@hyeboard/schemas";
+import type { ClassSession, DashboardSummary, Student, University } from "@hyeboard/schemas";
 import { CanvasClient } from "./canvas-client";
 import { resolveCaptchaAnswer } from "./captcha";
 import { mapCanvasCourse, mapCanvasMissingSubmission, mapCanvasPlannerItem, mapStudent, mapStudentHubBill, mapStudentHubClass, mapStudentHubExam, mapStudentHubGpa, mapStudentHubGrade, mapStudentHubNews, mapStudentHubNotifications, mapStudentHubRequest, mapStudentHubScheduleAlert, mapTerm, mapTrainingPoints, mapTuition } from "./mapper";
@@ -37,6 +37,19 @@ const university: University = {
 
 function studenthub(request: AdapterRequest) { return new StudentHubClient(request.session); }
 function canvas(request: AdapterRequest) { return new CanvasClient(request.session); }
+
+async function loadNotifications(request: AdapterRequest, profilePromise: Promise<Student | undefined> = Promise.resolve(undefined)) {
+  const [profile, page, unread] = await Promise.all([
+    fallback(profilePromise, undefined),
+    fallback(studenthub(request).getNotifications(request.session?.studentCode), { content: [] }),
+    fallback(canvas(request).getUnreadConversations(), { unread_count: 0 }),
+  ]);
+  const studentCode = profile?.studentCode ?? request.session?.studentCode;
+  return [
+    ...mapStudentHubNotifications(page),
+    { id: "canvas-unread", title: `${unread.unread_count} unread learning-platform messages`, createdAt: new Date().toISOString(), unread: Number(unread.unread_count) > 0, source: "canvas" as const, body: studentCode ? `Learning-platform inbox for ${studentCode}` : undefined },
+  ];
+}
 
 // Canvas is an optional credential - most StudentHub-backed features work
 // without it. Only the handful of features that genuinely depend on Canvas
@@ -259,8 +272,9 @@ export function createUetAdapter(): UniversityAdapter {
     async getTerms(request) { return (await studenthub(request).getTerms()).map(mapTerm); },
     async getDashboard(request): Promise<DashboardSummary> {
       const today = todayInVietnam();
+      const studentPromise = this.getStudentProfile(request);
       const [studentR, termsR, timetableR, todayScheduleR, courseCountR, coursesR, assignmentsR, gradesR, gpaR, examsR, tuitionR, notificationsR] = await Promise.allSettled([
-        this.getStudentProfile(request),
+        studentPromise,
         this.getTerms(request),
         this.getTimetable(request),
         studenthub(request).getScheduleAlert(today),
@@ -271,7 +285,7 @@ export function createUetAdapter(): UniversityAdapter {
         this.getGpaSummary(request),
         this.getExams(request),
         this.getTuition(request),
-        this.getNotifications(request),
+        loadNotifications(request, studentPromise),
       ]);
       const allResults = [studentR, termsR, timetableR, todayScheduleR, courseCountR, coursesR, assignmentsR, gradesR, gpaR, examsR, tuitionR, notificationsR];
       // If every single upstream call failed, the session itself is broken
@@ -353,18 +367,7 @@ export function createUetAdapter(): UniversityAdapter {
     async getGpaSummary(request) { return mapStudentHubGpa(await studenthub(request).getGpa()); },
     async getExams(request) { return (await studenthub(request).getExams(request.termCode)).map(mapStudentHubExam); },
     async getAttendance() { assertSupported(false, "Attendance"); return []; },
-    async getNotifications(request) {
-      const [profile, page, unread] = await Promise.all([
-        fallback(this.getStudentProfile(request), undefined),
-        fallback(studenthub(request).getNotifications(request.session?.studentCode), { content: [] }),
-        fallback(canvas(request).getUnreadConversations(), { unread_count: 0 }),
-      ]);
-      const studentCode = profile?.studentCode ?? request.session?.studentCode;
-      return [
-        ...mapStudentHubNotifications(page),
-        { id: "canvas-unread", title: `${unread.unread_count} unread learning-platform messages`, createdAt: new Date().toISOString(), unread: Number(unread.unread_count) > 0, source: "canvas" as const, body: studentCode ? `Learning-platform inbox for ${studentCode}` : undefined },
-      ];
-    },
+    async getNotifications(request) { return loadNotifications(request, this.getStudentProfile(request)); },
     async getNews(request) { return (await studenthub(request).getNews()).map(mapStudentHubNews); },
     async getDocuments() { assertSupported(false, "Documents"); return []; },
     async getTuition(request) { return mapTuition(await studenthub(request).getBills()); },

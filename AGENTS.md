@@ -1,95 +1,199 @@
-# AGENTS.md — Hyeboard
+# Agent Development Guide
 
-Multi-university student dashboard. UET (VNU-UET) first, StudentHub + Canvas adapter backend, Mock adapter for demo/dev/testing. pnpm monorepo with a git repository at the project root.
+Repository-specific instructions for coding agents working on Hyeboard. User instructions override this file. Prefer the smallest correct change; do not preserve or introduce complexity without evidence.
 
-## Stack
+## Product invariants
 
-- `apps/web`: React 19, Vite, TanStack Router (code-based routes, no file-based codegen), TanStack Query, Tailwind CSS v4, shadcn-style local UI primitives (`apps/web/src/components/ui/*`, not the shadcn CLI). `apps/web/src/routes/` is an empty placeholder — the entire app (root layout, all feature pages, all shared components) lives in the single `apps/web/src/main.tsx` file. Keep this in mind when searching for a component/page; it's not spread across files.
-- `apps/worker`: Elysia on Cloudflare Workers (via `wrangler`), thin BFF/proxy serving the React app as static assets and API under `/api/*`. Single deployment target.
-- `packages/schemas`: zod schemas + inferred TS types, shared by web/api/adapters.
-- `packages/core`: Worker-safe helpers — `ok`/`fail` envelopes, `HyeboardError`, AES-GCM encrypted session token helpers (`encryptSession`/`decryptSession`), `assertSupported`.
-- `packages/university-adapters`: `UniversityAdapter` interface + registry (`mock`, `uet`). All university-specific logic (StudentHub/Canvas clients, response mapping) lives here, isolated from the API layer.
+Hyeboard is a multi-university dashboard. The browser talks to Hyeboard's API, never directly to StudentHub, Canvas, or VNU. University-specific behavior belongs in adapters.
+
+Never compromise these rules:
+
+1. **Credentials stay behind the API boundary.** The browser receives Hyeboard's opaque encrypted Bearer token, not raw upstream cookies, tokens, passwords, SAML payloads, or reconnect grants.
+2. **Capabilities are evidence-backed.** A `University.capabilities.*` flag is `true` only when the adapter implements a verified upstream shape. Unsupported features fail explicitly; never fabricate data.
+3. **Session errors are scoped.** Only `MISSING_SESSION`, `SESSION_EXPIRED`, and `INVALID_SESSION` kill a Hyeboard session. Feature-specific errors such as `CANVAS_LOGIN_REQUIRED` render inline and must not sign the user out.
+4. **Runtime modes fail honestly.** Distributed mode requires PostgreSQL and Redis and must not silently fall back to process-local authority. Cloudflare-only bindings stay out of Node/Bun paths; Node-only imports stay out of the Worker bundle.
+5. **Every visible collection has loading, error, and empty states.** Never render raw JSON as feature UI.
+
+## Repository map
+
+- `apps/web` — React 19, Vite, code-based TanStack Router, TanStack Query, Tailwind CSS v4, local UI primitives.
+  - Entry: `src/main.tsx`
+  - Route tree: `src/router.tsx`
+  - Global state/query ownership: `src/state.tsx`
+  - Pages: `src/pages/*.tsx`, loaded lazily from the router
+  - Shared UI: `src/components/`
+  - Browser API/session logic: `src/lib/api.ts`
+  - Translations: `src/lib/i18n.tsx`
+- `apps/worker` — Elysia API and BFF.
+  - Shared routes/runtime: `src/app.ts`
+  - Cloudflare entry: `src/index.ts`
+  - Node/Bun entry: `src/index.node.ts`, `src/start.ts`
+  - Durable Object and HA coordination live beside their focused tests.
+- `apps/automation-worker` — Node-only Redis Streams and Browserless/Puppeteer executor.
+- `packages/schemas` — shared Zod schemas and inferred TypeScript types.
+- `packages/core` — envelopes, `HyeboardError`, AES-GCM session/grant helpers, logging, Worker-safe helpers.
+- `packages/university-adapters` — `UniversityAdapter`, registry, upstream clients, parsers, mappers. Registered adapters: `mock`, `uet`, `vnu`.
+- `packages/automation-protocol` — encrypted automation jobs, events, results, and keyring contracts.
+- `deploy/k8s` — distributed deployment templates; external PostgreSQL, Redis, Browserless assumed.
+- `docs` — durable architecture/security/runbooks. Do not store temporary plans or investigation notes here.
 
 ## Commands
 
-Run from repo root unless noted. Always use `pnpm` directly — do not wrap `pnpm`/`wrangler` in PowerShell `Start-Job`/`Start-Process`/background-script blocks; it produces misleading/missing output for long-running dev servers.
+Run commands from the repository root. Use `pnpm` directly; do not wrap `pnpm` or Wrangler in PowerShell jobs/process wrappers because they hide or distort long-running output.
 
 ```bash
 pnpm install
-pnpm dev                 # runs web (Vite, :5173) + worker (wrangler dev, :8787) in parallel; Vite proxies /api/* to wrangler
-pnpm --filter @hyeboard/web dev
-pnpm --filter @hyeboard/worker dev
-pnpm build:web            # Vite build into apps/web/dist
-pnpm build                # build:web + build:worker (tsc)
-pnpm test                 # tsc --noEmit across all packages
-pnpm --filter @hyeboard/web exec playwright test   # Playwright e2e (spins up worker+web itself)
-pnpm deploy               # wrangler deploy — single Worker with static assets
-pnpm --filter @hyeboard/worker exec wrangler deploy --dry-run   # verify without real deploy
+pnpm dev                         # Vite :5173 + Wrangler :8787
+pnpm dev:web
+pnpm dev:worker
+pnpm dev:node                    # self-hosted Node API + Vite
+pnpm dev:bun                     # self-hosted Bun API + Vite
+
+pnpm --filter @hyeboard/web test
+pnpm --filter @hyeboard/worker test:workers
+pnpm --filter @hyeboard/university-adapters test
+
+pnpm build
+pnpm test
+pnpm test:browser
+pnpm test:k8s
+pnpm test:ha                     # opt-in; Docker required
+pnpm audit:performance
 ```
 
-`apps/worker`'s `dev` script must keep the `--show-interactive-dev-session=false --log-level info` flags — wrangler's default interactive session redraws the terminal and hides log output when run under `pnpm --parallel`.
+`lint` and `typecheck` are TypeScript checks; there is no separate repository-wide lint implementation. Use focused tests during iteration. Before release or a completion claim, run the checks appropriate to the full changed surface.
 
-**`pnpm deploy` does NOT rebuild the frontend.** It only runs `wrangler deploy`, which uploads whatever is already in `apps/web/dist`. Always run `pnpm build:web` immediately before `pnpm deploy` when frontend source changed — otherwise wrangler reports "No updated asset files to upload" and silently ships a stale build. This has caused a real production incident (i18n launch initially deployed with no visible language changes because `dist` was stale).
+### Dev-server safety
 
-There is no separate lint tool wired up; `lint`/`typecheck`/`test` all alias to `tsc -p tsconfig.json --noEmit` per package. Treat a clean `pnpm build` + `pnpm test` + Playwright pass as the bar for "done," not just a green typecheck.
+- `apps/worker`'s `dev` script must keep `--show-interactive-dev-session=false --log-level info`.
+- Playwright starts fresh Wrangler and Vite servers with `reuseExistingServer: false`.
+- Do not kill processes by name or pattern. If a port is occupied, identify and confirm the exact owner before stopping it.
+- Stop only servers you started.
 
-## Git hygiene
+### Deployment safety
 
-- This workspace is a git repo. Check `git status --short` before staging or committing.
-- Never commit raw HAR captures, secrets, env files, Playwright reports, or test artifacts. `.gitignore` excludes `*.har`, `.env*`, `.dev.vars`, `node_modules/`, build output, `.wrangler/`, and Playwright result/report folders.
-- Stage only intentional files. If unrelated user/agent changes are present, leave them alone unless explicitly asked.
-- Do not amend, force-push, or rewrite history unless explicitly requested.
-- Use concise commit messages. The initial repo commit is `Initial commit: Hyeboard monorepo` on `master`.
+`pnpm deploy` uploads the existing `apps/web/dist`; it does not build the frontend. When web source changed:
 
-## Required env
+```bash
+pnpm build:web
+pnpm deploy
+```
 
-- `apps/worker/.dev.vars` (gitignored): `HYEB_SESSION_SECRET` (32+ random bytes, base64 is fine), `HYEB_ALLOWED_ORIGINS` (comma-separated origins, default `http://localhost:5173,http://127.0.0.1:5173`).
-- `apps/web/.env.local` (optional): `VITE_API_BASE_URL` (defaults to empty string = same-origin).
+Use `pnpm --filter @hyeboard/worker exec wrangler deploy --dry-run` for Cloudflare packaging validation without publishing.
 
-## Session/auth model
+## Change workflow
 
-Hyeboard issues its own opaque encrypted Bearer token (AES-GCM via `HYEB_SESSION_SECRET`), never forwards raw upstream cookies to the browser. The token wraps an `EncryptedSessionPayload` containing optional `studenthub` and `canvas` upstream credentials (`bearer` or `cookie` kind). StudentHub and Canvas are independent, optional credentials — a session can have one, the other, or both. `importSession` validates whichever credential(s) are present against the real upstream before declaring success (no silent "success" on garbage tokens).
+1. Read the files and tests that own the behavior. Trace callers before fixing a shared function.
+2. Check `git status --short`. Preserve unrelated user/agent changes.
+3. Make the smallest coherent change. Reuse existing helpers, schemas, and patterns.
+4. Add or update the smallest regression test that would fail without the fix.
+5. Run focused diagnostics/tests, then the broader gate required by the changed surface.
+6. Check `git diff --check` and review the exact diff before reporting completion.
 
-Frontend session lifecycle lives in `apps/web/src/lib/api.ts`: only clear the local session token on genuine session-death error codes (`MISSING_SESSION`, `SESSION_EXPIRED`, `INVALID_SESSION`). Feature-specific errors (e.g. `CANVAS_LOGIN_REQUIRED` when a Canvas-only feature is hit without a Canvas credential) must NOT clear the session or force a re-login redirect — show an inline error instead (see `CanvasRequired`/`QueryErrorPanel` in `apps/web/src/main.tsx`).
+Do not create commits, branches, issues, pull requests, or deployments unless the user asks. Do not amend, force-push, or rewrite history unless explicitly instructed.
 
-## University adapters
+## Testing matrix
 
-- Adding a university = implementing `UniversityAdapter` (see `packages/university-adapters/src/types.ts`) and registering it in `packages/university-adapters/src/registry.ts`.
-- Never claim a capability (`University.capabilities.*`) is `true` unless the adapter genuinely implements it against a real, verified upstream response shape. If unverified, set the capability `false` and call `assertSupported(false, "Feature name")` — do not ship hardcoded placeholder/stub data as if it were real (see `getTrainingPoints`/`getRequests` in the UET adapter for the pattern of "not implemented" vs faking it).
-- StudentHub's `sessionStart`/`sessionEnd` in timetable data are period ("tiết học") ordinals, not clock hours — do not treat them as raw hours. There is no verified period→clock-time lookup table for VNU-UET; render period numbers honestly (`periodStart`/`periodEnd` on `ClassSession`) instead of fabricating times.
-- `weekday` on `ClassSession` is 1=Monday..7=Sunday (ISO convention), confirmed against real captured StudentHub timetable data with weekday values 1/2/3 across a normal week spread.
+- Web logic/component change: `pnpm --filter @hyeboard/web test`
+- Worker/API change: `pnpm --filter @hyeboard/worker test`
+- Cloudflare Durable Object change: include `pnpm --filter @hyeboard/worker test:workers`
+- Adapter/parser/mapper change: `pnpm --filter @hyeboard/university-adapters test`
+- Browser-visible flow or DOM/ARIA change: run the relevant `apps/web/tests/*.spec.ts`; use `pnpm test:browser` for the release gate
+- Packaging/config change: `pnpm build`, package tests, and appropriate dry-run
+- Kubernetes change: `pnpm test:k8s`
+- Distributed PostgreSQL/Redis behavior: `pnpm test:ha` when Docker is available
+- Performance change: measure before and after; `pnpm audit:performance` for web bundle work
 
-## HAR handling (critical)
+A green typecheck alone is not completion evidence.
 
-Raw `.har` files may be present in the repo root during investigation (currently: `studenthub.uet.edu.vn.har`, `portal.uet.vnu.edu.vn.har`, `2studenthub.uet.edu.vn.har`) — these contain real cookies, bearer/JWT tokens, SAML assertions, and PII.
+## Web conventions
 
-- **Never commit raw `.har` files.** `.gitignore` excludes `*.har` except `samples/har-redacted/*.har`.
-- Never paste raw header values, cookies, SAML payloads, tokens, or PII-bearing response bodies into docs, commit messages, or chat output — summarize field names/shapes only.
-- To inspect a HAR programmatically, `rg`/grep frequently fails on large HAR JSON (quantifier/size limits); write small Python scripts instead (HAR is just JSON, response bodies are often base64-encoded).
-- Chrome DevTools strips `Cookie`/`Authorization` request headers from HAR exports by default — most captures will not contain literal secrets unless "Allow to generate HAR with sensitive data" was explicitly enabled at capture time.
+### Data and state
 
-## Testing conventions
+- TanStack Query owns server state. Query keys include the feature and active university/session scope.
+- `useFeatureQuery`/`FeatureFrame` are the default feature-page path.
+- Keep static queries such as universities cached; do not globally invalidate every query without a verified reason.
+- Account switch and refresh logic must not display data from the previous account.
+- Only clear local session state for genuine session-death codes.
 
-- E2e coverage lives in `apps/web/tests/smoke.spec.ts` (Playwright). It exercises: login-gate redirect, login school-picker sections, account menu, demo login, dark/light toggle, sidebar collapse, mobile nav drawer, header search, notifications, grades term-grouping, and that every feature route renders real UI (no raw JSON dumps, no leftover `<pre>`).
-- Config: `apps/web/playwright.config.ts` starts both `wrangler dev` and `vite dev` as `webServer`s with `reuseExistingServer: true` — if a test run behaves like it's using stale code, check for orphaned processes on ports 5173/8787 first (`Get-NetTCPConnection -LocalPort 5173,8787 | Stop-Process -Force`) before assuming a real bug.
-- When adding a feature that changes visible DOM structure (icons, labels, aria-labels), update the smoke spec in the same change — several past regressions were only caught by real bounding-box/CSS assertions, not just "element exists" checks.
+### Internationalization
 
-## Internationalization (i18n)
+`apps/web/src/lib/i18n.tsx` is the source of truth:
 
-- `apps/web/src/lib/i18n.tsx` is the single source of truth: `type Locale = "en" | "vi"`, `LOCALES` array (`{id, label}`), `LocaleProvider` (persists to `localStorage` key `hyeboard.locale`, auto-detects from `navigator.language` on first visit, sets `document.documentElement.lang`), and `useLocale()` returning `{ locale, setLocale, t }`.
-- `t` is a typed nested object tree (`t.nav.dashboard`, `t.dashboard.welcomeBack(name)`), not a string-key lookup function — never write `t("nav.dashboard")`. Some leaf values are functions for interpolation; call them directly, don't wrap in another `t()`.
-- Every new user-facing string in `main.tsx` must go through `t.*`, added to both the `en` dict and the `vi()` dict in `i18n.tsx` (TS enforces `vi()` returns `typeof en`, so a missing key is a compile error). No hardcoded English string literals in JSX.
-- Data-driven enum values from the backend (assignment `status`, exam `examMethod`, etc.) are intentionally left untranslated — only app-authored copy goes through `t.*`.
-- Language switcher UI: `SettingsPage` has a `Select` row in the "Display" card; `LoginPage` has a bottom-right fixed toggle button (flag icon + label, flips directly between `en`/`vi` since only two locales exist — not a dropdown there).
-- Flag icons use inline SVG (`FlagIcon` component near the top of `main.tsx`), not emoji — Windows Chrome's font stack lacks flag emoji glyphs and falls back to literal "GB"/"VN" text, which also breaks baseline alignment with adjacent labels. Keep using `FlagIcon` for any future locale flag, don't reintroduce emoji.
-- `apps/web/src/lib/utils.ts`'s `formatDateTime` is still hardcoded to `Intl.DateTimeFormat("en", ...)` regardless of app locale — known gap, not yet wired to `useLocale()`. `formatCurrency` is intentionally hardcoded `vi-VN`/VND (it's the actual currency, not a UI-language choice) — don't "fix" that one.
+- Locales: `en`, `vi`
+- Translation access: typed object tree, e.g. `t.nav.dashboard`; never `t("nav.dashboard")`
+- Add every app-authored user-facing string to both dictionaries.
+- Backend enum/data values remain untranslated unless the product explicitly maps them.
+- Locale flags use the existing inline SVG `FlagIcon`, not emoji.
+- `formatCurrency` intentionally uses VND/`vi-VN`. Do not change currency formatting merely because UI locale changes.
 
-## UI/design conventions
+### UI and accessibility
 
-- Tailwind v4 with CSS custom properties for theming (`apps/web/src/styles.css`): `:root` = light default (Geist/mock palette), `:root[data-theme="uet"]` = UET palette, `:root[data-mode="dark"]` = dark overrides, combined selectors for UET-dark. UET's accent color is user-customizable via a hue picker (Settings page) that sets `--primary`/`--accent`/`--ring`/`--sidebar` as inline style overrides on `documentElement` — keep the `:root[data-theme="uet"]` CSS block as the pre-JS fallback (avoids flash of wrong color), don't remove it.
-- No gradient text, no side-stripe (`border-left`/`border-right` > 1px) accents on cards/alerts, no glassmorphism, no glow/box-shadow hover effects, no "cards inside cards." Prefer flat `.list-row`/`divide-y` lists inside a single bordered `Card` over grids of individually-boxed items. These rules came from an explicit user redesign pass — don't regress them.
-- Every feature route must render real bound data through `useFeatureQuery`/`FeatureFrame`, never a JSON dump. Every list/grid section needs an explicit empty-state (`<Empty />`), not silent nothing.
+- Use local primitives under `apps/web/src/components/ui`; do not run the shadcn CLI.
+- Preserve keyboard operation, visible focus, semantic controls, labels, and 44px touch targets where practical.
+- Keep explicit empty states for lists and grids.
+- Prefer flat list rows inside one bordered section. Avoid cards inside cards.
+- No gradient text, glassmorphism, glow hover effects, decorative sparklines, or colored side-stripe borders wider than 1px.
+- Theme tokens live in `apps/web/src/styles.css`. Preserve light, dark, UET/VNU palettes, and the pre-JS theme fallback.
+- User-customized hue writes `--primary`, `--accent`, `--ring`, and sidebar variables inline; do not remove the CSS fallback.
+- Route pages are lazy-loaded. Keep heavy optional features such as PDFMake outside the initial entry graph.
 
-## Communication style
+## Adapter conventions
 
-Repo owner prefers terse, technical responses — no filler, no hedging, direct fixes with file:line references when relevant.
+- Implement `UniversityAdapter` in `packages/university-adapters/src/types.ts`; register it in `registry.ts`.
+- Validate external responses before mapping them into shared schemas.
+- Keep upstream URLs, auth, retries, cancellation, and response parsing inside the adapter/client boundary. The API layer should not know university response shapes.
+- Preserve `AbortSignal` through network and browser operations.
+- Never log upstream response bodies, credentials, tokens, grants, cookies, CAPTCHA images, or student identifiers.
+- StudentHub `sessionStart`/`sessionEnd` are period ordinals, not clock hours. Render period numbers unless a verified timetable defines clocks.
+- `ClassSession.weekday` is ISO: Monday `1` through Sunday `7`.
+- VNU cross-lookup limits, budgets, permits, and no-store behavior are security/abuse boundaries. Do not raise, bypass, or cache them as a performance shortcut.
+
+## Runtime boundaries
+
+### Cloudflare
+
+- `apps/worker/src/index.ts` may use `cloudflare:workers`, Browser Rendering, and Durable Object bindings.
+- Keep Wrangler assets under `apps/web/dist`; `/api/*` runs Worker-first.
+- Load secrets from Worker secrets, never `wrangler.jsonc` vars.
+
+### Node/Bun memory mode
+
+- Non-secret defaults live in `apps/worker/config.json`.
+- `HYEB_SESSION_SECRET` is environment-only and at least 32 characters.
+- Memory mode is single-process and not replica-safe.
+
+### Distributed mode
+
+- PostgreSQL is durable authority for session revocation and VNU refresh/grant state.
+- Redis coordinates shared cache, CAPTCHA, VNU budgets/permits, and automation streams.
+- Dependency outages fail closed for affected operations; `/api/live` and `/api/ready` have distinct semantics.
+- Patchright is local/single-worker only. Distributed automation uses Browserless/Puppeteer.
+- `AUTOMATION_EXECUTOR_READY` is an explicit deployment gate. Do not enable it or claim parity without a successful real-provider validation.
+
+## Secrets, HAR, and generated artifacts
+
+Never commit or expose:
+
+- `.env`, `.env.*` except `.env.example`, `.dev.vars`
+- raw `.har` files
+- cookies, auth headers, JWTs, SAML payloads, reconnect grants, passwords, CAPTCHA images
+- student PII or PII-bearing response bodies
+- Playwright reports/results, Wrangler state, build output, coverage, local scratch
+
+Only manually redacted captures belong under `samples/har-redacted/`. For large HAR analysis, parse JSON programmatically and print field names/shapes only. Follow `docs/har-security.md`.
+
+## Documentation ownership
+
+- `README.md` — product overview, setup, common commands, deployment entry points
+- `AGENTS.md` — coding-agent operating rules
+- `CLAUDE.md` — reference to `AGENTS.md`; do not duplicate instructions
+- `docs/architecture.md` — durable system design and invariants
+- `docs/ha-runbook.md` — operator configuration and rollout procedures
+- `apps/automation-worker/README.md` — worker contract and limitations
+
+Update durable docs when architecture or operator behavior changes. Keep temporary plans, audit notes, and scratch artifacts outside tracked documentation.
+
+## Communication
+
+Use terse, technical updates. Report exact files, commands, failures, and residual risks. Do not claim tests, builds, deployments, or performance improvements without fresh evidence.
