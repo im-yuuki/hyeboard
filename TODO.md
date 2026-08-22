@@ -1,6 +1,6 @@
 # Hyeboard HA / Multi-Replica Implementation Plan
 
-Status: approved and in progress. Kubernetes manifests are intentionally deferred until the HA gates below pass.
+Status: approved and in progress. Kubernetes manifests now exist as a deployment template; production rollout still requires the runtime gates below.
 
 ## Decisions
 
@@ -97,7 +97,7 @@ Status: approved and in progress. Kubernetes manifests are intentionally deferre
 
 ## Kubernetes gate
 
-Do not write Kubernetes manifests until all of these are true:
+The manifests are written. Production rollout requires all of these gates:
 
 - [ ] Two API replicas work without sticky sessions.
 - [ ] Self-hosted VNU refresh and cross-lookup are authoritative and shared.
@@ -108,4 +108,4 @@ Do not write Kubernetes manifests until all of these are true:
 - [ ] Readiness and graceful shutdown are verified.
 - [ ] Old sessions follow the explicit cutover policy.
 - [ ] Patchright cannot be enabled in distributed mode.
-- [ ] `pnpm build`, `pnpm test`, Playwright, package checks, and Wrangler dry-run pass.
+- [ ] `pnpm build`, `pnpm test`, `pnpm test:k8s`, Playwright, package checks, and Wrangler dry-run pass.

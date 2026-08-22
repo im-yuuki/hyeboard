@@ -1,6 +1,7 @@
-import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { createServer } from "node:net";
+import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -13,12 +14,7 @@ export const probeScript = join(scriptDirectory, "node-probe.ts");
 export const sessionSecret = "ha-verification-secret-with-at-least-32-bytes";
 
 function resolveTsxLoader(): string {
-  const value = execFileSync(process.env.PNPM_BIN ?? "pnpm", ["--filter", "@hyeboard/worker", "exec", "node", "-p", "require.resolve('tsx/esm')"], {
-    cwd: repositoryRoot,
-    encoding: "utf8",
-  }).trim();
-  if (!value) throw new Error("Could not resolve the workspace tsx loader");
-  return value;
+  return createRequire(join(workerDirectory, "package.json"))("tsx/esm");
 }
 
 const tsxLoader = resolveTsxLoader();

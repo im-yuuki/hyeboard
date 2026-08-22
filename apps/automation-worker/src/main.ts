@@ -1,3 +1,5 @@
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { env, once, removeListener } from "node:process";
 import puppeteer from "puppeteer-core";
 import { createClient, createClientPool } from "redis";
 import {
@@ -32,6 +34,12 @@ export type AutomationHostLogger = AutomationWorkerLogger & {
   info?(message: string, fields?: Record<string, unknown>): void;
 };
 
+export type AutomationHealth = {
+  server: Server;
+  setReady(ready: boolean): void;
+  close(): Promise<void>;
+};
+
 export type AutomationHostOptions = {
   env?: Record<string, string | undefined>;
   redis?: { normal: AutomationRedisHostClient; blocking: AutomationRedisHostClient; close?: () => Promise<void> };
@@ -39,6 +47,7 @@ export type AutomationHostOptions = {
   browserProvider?: BrowserProvider;
   logger?: AutomationHostLogger;
   now?: () => number;
+  health?: AutomationHealth;
 };
 
 export type AutomationHost = {
@@ -48,6 +57,30 @@ export type AutomationHost = {
   start(): Promise<void>;
   stop(): Promise<void>;
 };
+
+export function automationHealthResponse(path: string | undefined, ready: boolean): { status: number; body: string } {
+  const status = path === "/readyz" && !ready ? 503 : 200;
+  return { status, body: JSON.stringify({ status: status === 200 ? "ok" : "starting", service: "hyeboard-automation-worker" }) };
+}
+
+export function createAutomationHealthServer(port: number, host: string): AutomationHealth {
+  let ready = false;
+  let closed = false;
+  const server = createServer((request: IncomingMessage, response: ServerResponse) => {
+    const result = automationHealthResponse(request.url, ready);
+    response.writeHead(result.status, { "content-type": "application/json" });
+    response.end(result.body);
+  }).listen(port, host);
+  return {
+    server,
+    setReady(value) { ready = value; },
+    close: () => {
+      if (closed) return Promise.resolve();
+      closed = true;
+      return new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
 
 async function closeRedisClient(client: AutomationRedisHostClient): Promise<void> {
   if (client.isOpen === false) return;
@@ -77,7 +110,7 @@ function createRedisHostClients(redisUrl: string): { normal: AutomationRedisHost
 }
 
 export function createAutomationHost(options: AutomationHostOptions = {}): AutomationHost {
-  const config = parseAutomationWorkerConfig(options.env ?? process.env);
+  const config = parseAutomationWorkerConfig(options.env ?? env);
   if (config.browserProvider !== "browserless") {
     throw new Error("The executable automation host supports Browserless only; configure BROWSERLESS_ENDPOINT and BROWSERLESS_TOKEN.");
   }
@@ -115,6 +148,7 @@ export function createAutomationHost(options: AutomationHostOptions = {}): Autom
 
   let started = false;
   let stopping: Promise<void> | undefined;
+  const health = options.health;
 
   return {
     config,
@@ -133,6 +167,7 @@ export function createAutomationHost(options: AutomationHostOptions = {}): Autom
         await probe.disconnect();
         await worker.start();
         await controls.start();
+        health?.setReady(true);
         started = true;
         options.logger?.info?.("Automation worker ready.", safeConfigSummary(config));
       } catch (error) {
@@ -140,6 +175,8 @@ export function createAutomationHost(options: AutomationHostOptions = {}): Autom
         await worker.stop("shutdown").catch(() => undefined);
         if (redis.close) await redis.close().catch(() => undefined);
         else await Promise.all([...clientsConnected].map((client) => closeRedisClient(client)));
+        health?.setReady(false);
+        await health?.close();
         throw error;
       }
     },
@@ -149,6 +186,8 @@ export function createAutomationHost(options: AutomationHostOptions = {}): Autom
         await worker.stop("shutdown");
         if (redis.close) await redis.close();
         else await Promise.all([closeRedisClient(redis.normal), closeRedisClient(redis.blocking)]);
+        health?.setReady(false);
+        await health?.close();
         started = false;
       })();
       await stopping;
@@ -162,19 +201,26 @@ function applyControl(control: AutomationControl, worker: AutomationWorker<UetAu
   return worker.requestFencedCancel(control);
 }
 
-export async function runAutomationWorker(env: Record<string, string | undefined> = process.env): Promise<void> {
+export async function runAutomationWorker(environment: Record<string, string | undefined> = env): Promise<void> {
   const logger: AutomationHostLogger = {
     info: (message, fields) => console.info(message, fields ?? {}),
     warn: (message, fields) => console.warn(message, fields ?? {}),
     error: (message, fields) => console.error(message, fields ?? {}),
   };
-  const host = createAutomationHost({ env, logger });
+  const health = createAutomationHealthServer(Number(environment.AUTOMATION_HEALTH_PORT ?? 8080), environment.AUTOMATION_HEALTH_HOST ?? "0.0.0.0");
+  let host: AutomationHost;
+  try {
+    host = createAutomationHost({ env: environment, logger, health });
+  } catch (error) {
+    await health.close();
+    throw error;
+  }
   let stopping: Promise<void> | undefined;
   const stop = () => {
     stopping ??= host.stop().catch((error) => logger.error?.("Automation worker shutdown failed.", { code: errorCode(error) }));
   };
-  process.once("SIGTERM", stop);
-  process.once("SIGINT", stop);
+  once("SIGTERM", stop);
+  once("SIGINT", stop);
   try {
     await host.start();
     await new Promise<void>((resolve) => {
@@ -188,8 +234,8 @@ export async function runAutomationWorker(env: Record<string, string | undefined
     logger.error?.("Automation worker failed to start.", { code: errorCode(error) });
     throw error;
   } finally {
-    process.removeListener("SIGTERM", stop);
-    process.removeListener("SIGINT", stop);
+    removeListener("SIGTERM", stop);
+    removeListener("SIGINT", stop);
     await host.stop().catch(() => undefined);
   }
 }

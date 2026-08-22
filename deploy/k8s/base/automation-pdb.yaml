@@ -1,0 +1,12 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hyeboard-automation-worker
+  labels:
+    app.kubernetes.io/name: hyeboard-automation-worker
+    app.kubernetes.io/component: automation-worker
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hyeboard-automation-worker

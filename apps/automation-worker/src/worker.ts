@@ -43,6 +43,7 @@ export class AutomationWorker<TCredential, TResult> {
   private running = false;
   private draining = false;
   private loopPromise?: Promise<void>;
+  private runOncePromise?: Promise<number>;
   private groupReady = false;
 
   constructor(private readonly options: AutomationWorkerOptions<TCredential, TResult>) {
@@ -63,11 +64,15 @@ export class AutomationWorker<TCredential, TResult> {
     this.draining = true;
     this.shutdown.abort(reason);
     for (const run of this.active.values()) run.token.cancel(reason);
-    if (this.loopPromise) {
+    const operations: Array<Promise<void | number>> = [
+      ...(this.loopPromise ? [this.loopPromise] : []),
+      ...(this.runOncePromise ? [this.runOncePromise] : []),
+    ];
+    if (operations.length) {
       let timeout: ReturnType<typeof setTimeout> | undefined;
       try {
         await Promise.race([
-          this.loopPromise,
+          Promise.allSettled(operations).then(() => undefined),
           new Promise<void>((resolve) => { timeout = setTimeout(resolve, this.options.config.shutdownTimeoutMs); }),
         ]);
       } finally {
@@ -78,6 +83,17 @@ export class AutomationWorker<TCredential, TResult> {
   }
 
   async runOnce(): Promise<number> {
+    if (this.runOncePromise) return this.runOncePromise;
+    const operation = this.runOnceImpl();
+    this.runOncePromise = operation;
+    try {
+      return await operation;
+    } finally {
+      if (this.runOncePromise === operation) this.runOncePromise = undefined;
+    }
+  }
+
+  private async runOnceImpl(): Promise<number> {
     if (this.draining) return 0;
     await this.ensureGroup();
     const reclaimed = await this.options.broker.reclaimPending({

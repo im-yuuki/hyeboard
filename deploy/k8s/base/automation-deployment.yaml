@@ -1,0 +1,117 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyeboard-automation-worker
+  labels:
+    app.kubernetes.io/name: hyeboard-automation-worker
+    app.kubernetes.io/component: automation-worker
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  minReadySeconds: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hyeboard-automation-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hyeboard-automation-worker
+        app.kubernetes.io/component: automation-worker
+    spec:
+      terminationGracePeriodSeconds: 45
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: hyeboard-automation-worker
+      containers:
+        - name: automation-worker
+          image: ghcr.io/teppyboy/hyeboard-automation-worker:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: health
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: hyeboard-runtime
+          env:
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hyeboard-runtime
+                  key: HYEB_REDIS_URL
+            - name: BROWSERLESS_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: hyeboard-runtime
+                  key: BROWSERLESS_ENDPOINT
+            - name: BROWSERLESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hyeboard-runtime
+                  key: BROWSERLESS_TOKEN
+            - name: AUTOMATION_KEY_CURRENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hyeboard-runtime
+                  key: AUTOMATION_KEY_CURRENT_ID
+            - name: AUTOMATION_KEY_CURRENT_B64
+              valueFrom:
+                secretKeyRef:
+                  name: hyeboard-runtime
+                  key: AUTOMATION_KEY_CURRENT_B64
+            - name: AUTOMATION_CONSUMER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: AUTOMATION_CONTROL_CONSUMER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true

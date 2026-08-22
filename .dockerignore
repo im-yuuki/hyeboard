@@ -1,0 +1,14 @@
+node_modules
+.git
+.pi
+.serena
+dist
+coverage
+.wrangler
+apps/web/test-results
+apps/web/playwright-report
+apps/web/blob-report
+*.har
+.env
+.env.*
+!.env.example

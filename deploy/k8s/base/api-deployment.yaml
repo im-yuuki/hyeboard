@@ -1,0 +1,122 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyeboard-api
+  labels:
+    app.kubernetes.io/name: hyeboard-api
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  minReadySeconds: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hyeboard-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hyeboard-api
+        app.kubernetes.io/component: api
+    spec:
+      terminationGracePeriodSeconds: 45
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: hyeboard-api
+      containers:
+        - name: api
+          image: ghcr.io/teppyboy/hyeboard-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8787
+          envFrom:
+            - configMapRef:
+                name: hyeboard-runtime
+          env:
+            - name: HYEB_SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: hyeboard-runtime
+                  key: HYEB_SESSION_SECRET
+            - name: HYEB_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hyeboard-runtime
+                  key: HYEB_POSTGRES_URL
+            - name: HYEB_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hyeboard-runtime
+                  key: HYEB_REDIS_URL
+            - name: AUTOMATION_KEY_CURRENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hyeboard-runtime
+                  key: AUTOMATION_KEY_CURRENT_ID
+            - name: AUTOMATION_KEY_CURRENT_B64
+              valueFrom:
+                secretKeyRef:
+                  name: hyeboard-runtime
+                  key: AUTOMATION_KEY_CURRENT_B64
+            - name: HYEB_HA_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          readinessProbe:
+            httpGet:
+              path: /api/ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /api/live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          startupProbe:
+            httpGet:
+              path: /api/live
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 10"]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

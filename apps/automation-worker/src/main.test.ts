@@ -11,6 +11,7 @@ import {
   AutomationControlConsumer,
   CaptchaControlBridge,
   createAutomationHost,
+  automationHealthResponse,
   type AutomationControl,
 } from "./index";
 import { InMemoryStreamsBroker, type NodeRedisStreamsClient } from "./index";
@@ -53,6 +54,14 @@ const config: AutomationWorkerConfig = {
 function control(): AutomationControl {
   return { type: "captcha-answer", jobId, accountId, fence: 1, challengeId, answer: "typed-answer" };
 }
+
+describe("automation worker health", () => {
+  it("reports liveness before readiness and readiness after startup", () => {
+    expect(automationHealthResponse("/healthz", false)).toMatchObject({ status: 200 });
+    expect(automationHealthResponse("/readyz", false)).toMatchObject({ status: 503 });
+    expect(automationHealthResponse("/readyz", true)).toMatchObject({ status: 200 });
+  });
+});
 
 describe("automation control host bridge", () => {
   it("decrypts controls in a separate group and fences stale CAPTCHA answers", async () => {

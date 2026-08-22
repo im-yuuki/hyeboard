@@ -1,6 +1,6 @@
 # HA Runbook
 
-This runbook covers the implemented self-hosted HA foundation and the work that is still deferred. It does not authorize a Kubernetes deployment. Kubernetes manifests wait for the multi-replica gates in the final section.
+This runbook covers the self-hosted HA foundation and the Kubernetes deployment template. The Kubernetes resources assume managed PostgreSQL, Redis, and Browserless services; they do not create database infrastructure.
 
 ## Modes
 
@@ -130,11 +130,32 @@ pnpm test:ha
 
 The PostgreSQL suite checks shared session revocation, refresh serialization, outage behavior, readiness, and SIGTERM drain across two worker processes. The Redis suite checks cross-process refresh coordination, CAPTCHA relay, Redis outage behavior, readiness/liveness separation, and SIGTERM drain. If Docker or an image is unavailable, the suites report a skip rather than a fake passing integration result.
 
-The latest `pnpm test:ha` run passed PostgreSQL 5/5 and Redis 4/4, and `/api/ready` reached ready during the distributed run. These results verify the shared-dependency and failure-handling foundation only; the real Browserless/UET login was attempted but failed with `GOOGLE_SIGNIN_FAILURE`, so Kubernetes remains deferred.
+The latest `pnpm test:ha` run passed PostgreSQL 5/5 and Redis 4/4, and `/api/ready` reached ready during the distributed run. These tests cover the shared-dependency and failure-handling foundation. Browserless/UET login remains deployment-specific and must be validated with the target provider before enabling automated sign-in.
 
-## Kubernetes Gate
+## Kubernetes deployment
 
-Do not add or deploy Kubernetes manifests until all of these pass against the implemented runtime:
+The manifests in [`deploy/k8s`](../deploy/k8s) run two API replicas and two automation workers by default. The API Deployment uses `/api/live` for liveness, `/api/ready` for dependency-backed readiness, rolling updates with no unavailable replicas, pod anti-affinity, resource requests, an HPA, and a PDB. Worker pods expose `/healthz` and `/readyz` after Redis and Browserless startup checks pass.
+
+Before applying the example overlay:
+
+1. Build and publish both images, then replace the image tags in `deploy/k8s/overlays/example/kustomization.yaml`.
+2. Provision PostgreSQL, Redis, and Browserless outside this repository. Put their URLs and credentials in a Secret named `hyeboard-runtime`; start from `deploy/k8s/base/secret.example.yaml` without applying it unchanged.
+3. Set the production hostname and TLS Secret in `deploy/k8s/overlays/example/ingress.yaml`.
+4. Set the session epoch and enforcement flag together during the planned session cutover.
+5. Render and inspect the overlay, then apply it:
+
+```bash
+pnpm test:k8s
+kubectl kustomize deploy/k8s/overlays/example
+kubectl apply -k deploy/k8s/overlays/example
+kubectl rollout status deployment/hyeboard-api -n hyeboard
+kubectl rollout status deployment/hyeboard-automation-worker -n hyeboard
+```
+
+The example NetworkPolicy restricts API and worker egress to DNS, HTTPS, and the configured PostgreSQL, Redis, and Browserless ports. It leaves ingress open so managed ingress controllers and kubelet probes work across CNI implementations; add an ingress allowlist matching the target cluster before production exposure.
+
+The Kubernetes resources do not remove the runtime gates below. Run them against the target cluster and dependencies before exposing the service to production:
+
 
 - Two API replicas work under round-robin traffic without sticky sessions.
 - VNU refresh, cross-lookup authority, and generic revocation are shared and survive replica restart.
@@ -146,4 +167,4 @@ Do not add or deploy Kubernetes manifests until all of these pass against the im
 - Patchright cannot be enabled in distributed mode.
 - `pnpm build`, `pnpm test`, Playwright, Node package checks, and the Wrangler dry-run pass.
 
-Until this gate passes, deployment guidance is limited to Cloudflare, single-worker memory mode, and explicitly tested distributed Node/Bun processes. Kubernetes is deferred, not partially supported.
+Until this gate passes, keep the Kubernetes overlay in staging. Production traffic requires the full multi-replica and failure-injection evidence above.
