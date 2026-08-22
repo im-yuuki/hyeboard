@@ -24,7 +24,9 @@ function readJson(args) {
     return JSON.parse(output);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    throw new Error(`kubectl ${args.join(" ")} returned invalid JSON: ${reason}`);
+    throw new Error(
+      `kubectl ${args.join(" ")} returned invalid JSON: ${reason}`,
+    );
   }
 }
 

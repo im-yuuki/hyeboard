@@ -125,7 +125,9 @@ assert.throws(
 );
 const oneNode = structuredClone(clusterSnapshot);
 oneNode.pods.items
-  .filter((pod) => pod.metadata.labels["app.kubernetes.io/name"] === "hyeboard-api")
+  .filter(
+    (pod) => pod.metadata.labels["app.kubernetes.io/name"] === "hyeboard-api",
+  )
   .forEach((pod) => {
     pod.spec.nodeName = "hyeboard-api-node-a";
   });
