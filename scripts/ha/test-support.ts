@@ -14,11 +14,12 @@ export const probeScript = join(scriptDirectory, "node-probe.ts");
 export const sessionSecret = "ha-verification-secret-with-at-least-32-bytes";
 
 function resolveTsxLoader(): string {
-  return createRequire(join(workerDirectory, "package.json"))("tsx/esm");
+  return createRequire(join(workerDirectory, "package.json")).resolve("tsx/esm");
 }
 
 const tsxLoader = resolveTsxLoader();
-const pnpmCommand = process.env.PNPM_BIN ?? (process.platform === "win32" ? "pnpm.cmd" : "pnpm");
+const pnpmCommand =
+  process.env.PNPM_BIN ?? (process.platform === "win32" ? "pnpm.cmd" : "pnpm");
 
 export async function dockerIsAvailable(): Promise<boolean> {
   try {
