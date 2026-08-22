@@ -6,7 +6,7 @@ metadata:
     app.kubernetes.io/name: hyeboard-api
     app.kubernetes.io/component: api
 spec:
-  minAvailable: 1
+  maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: hyeboard-api
