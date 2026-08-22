@@ -234,6 +234,180 @@ automationWorker:
   extraEnv: []
   tmpVolume: {}
 
+# Redis is a shared authority for distributed mode. The application chart does
+# not install the cluster-scoped operator; enable this resource only after the
+# OT-CONTAINER-KIT Redis Operator and its CRD are installed in the cluster.
+# The operator's <name>-master Service is the stable write endpoint used by
+# the Node redis client after Sentinel-managed failover.
+redis:
+  operator:
+    enabled: false
+    apiVersion: redis.redis.opstreelabs.in/v1beta2
+    name: hyeboard-redis
+    clusterSize: 3
+    image:
+      repository: quay.io/opstree/redis
+      tag: "7.0.15"
+      pullPolicy: IfNotPresent
+    sentinel:
+      enabled: true
+      size: 3
+      image:
+        repository: quay.io/opstree/redis-sentinel
+        tag: "7.0.15"
+        pullPolicy: IfNotPresent
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+      nodeSelector: {}
+      tolerations: []
+      topologySpreadConstraints: []
+    auth:
+      existingSecret: hyeboard-redis-auth
+      key: password
+    storage:
+      storageClassName: ""
+      size: 50Gi
+    resources:
+      requests:
+        cpu: 250m
+        memory: 1Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+    podSecurityContext:
+      runAsUser: 1000
+      runAsGroup: 1000
+      fsGroup: 1000
+      seccompProfile:
+        type: RuntimeDefault
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+          - ALL
+      readOnlyRootFilesystem: false
+      runAsNonRoot: true
+    terminationGracePeriodSeconds: 60
+    nodeSelector: {}
+    tolerations: []
+    topologySpreadConstraints: []
+
+# Browserless is application-owned and can safely run in-cluster. It remains
+# disabled by default so external managed Browserless deployments are still a
+# supported choice for environments that need a separate browser fleet.
+browserless:
+  enabled: false
+  replicaCount: 2
+  revisionHistoryLimit: 3
+  minReadySeconds: 10
+  terminationGracePeriodSeconds: 60
+  image:
+    repository: ghcr.io/browserless/chromium
+    tag: v2.55.4
+    digest: ""
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 3000
+    annotations: {}
+  resources:
+    requests:
+      cpu: "1"
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    readOnlyRootFilesystem: false
+    runAsNonRoot: true
+  probes:
+    readiness:
+      tcpSocket:
+        port: http
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 3
+    liveness:
+      tcpSocket:
+        port: http
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 6
+    startup:
+      tcpSocket:
+        port: http
+      periodSeconds: 2
+      timeoutSeconds: 3
+      failureThreshold: 60
+  podAnnotations: {}
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/component: browserless
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/component: browserless
+  nodeSelector: {}
+  tolerations: []
+  extraEnv: []
+  shmSizeLimit: 2Gi
+  tmpVolume: {}
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    behavior:
+      scaleUp:
+        stabilizationWindowSeconds: 30
+        policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 60
+      scaleDown:
+        stabilizationWindowSeconds: 300
+        policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+    metrics:
+      - type: Resource
+        resource:
+          name: cpu
+          target:
+            type: Utilization
+            averageUtilization: 70
+      - type: Resource
+        resource:
+          name: memory
+          target:
+            type: Utilization
+            averageUtilization: 75
+  pdb:
+    enabled: true
+    maxUnavailable: 1
+
 hpa:
   api:
     enabled: true

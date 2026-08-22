@@ -25,6 +25,8 @@ const workerHpa = read("deploy/k8s/base/automation-hpa.yaml");
 const apiPdb = read("deploy/k8s/base/api-pdb.yaml");
 const workerPdb = read("deploy/k8s/base/automation-pdb.yaml");
 const ingress = read("deploy/k8s/overlays/example/ingress.yaml");
+const productionBrowserless = read("deploy/k8s/overlays/production/browserless-deployment.yaml");
+const productionRedis = read("deploy/k8s/overlays/production/redis-replication.yaml");
 const dockerfile = read("Dockerfile");
 const workerDockerfile = read("apps/automation-worker/Dockerfile");
 const count = (text, value) => text.split(value).length - 1;
@@ -63,7 +65,7 @@ function imageReferences(text) {
   );
 }
 
-function validateImageTags(text, { strict = false, expectedTag, requireReferences = true } = {}) {
+function validateImageTags(text, { strict = false, expectedTag, requireReferences = true, allowedPinnedImages = [] } = {}) {
   const references = imageReferences(text);
   if (requireReferences) assert(references.length > 0, "No container image references found");
   for (const reference of references) {
@@ -79,11 +81,14 @@ function validateImageTags(text, { strict = false, expectedTag, requireReference
       continue;
     }
     assert(!mutableTags.has(reference.tag), `Image ${reference.image} uses mutable tag ${reference.tag}`);
-    assert(
-      /^sha-[a-f0-9]{40}$/.test(reference.tag),
-      `Image ${reference.image} must use a full SHA tag or digest, got ${reference.tag}`,
-    );
-    if (expectedTag) assert.equal(reference.tag, expectedTag);
+    const pinnedDependency = allowedPinnedImages.some((pattern) => pattern.test(reference.image));
+    if (!pinnedDependency) {
+      assert(
+        /^sha-[a-f0-9]{40}$/.test(reference.tag),
+        `Image ${reference.image} must use a full SHA tag or digest, got ${reference.tag}`,
+      );
+      if (expectedTag) assert.equal(reference.tag, expectedTag);
+    }
   }
 
   for (const match of text.matchAll(/^\s*digest:\s*sha256:([a-f0-9]{64})\s*$/gm)) {
@@ -150,13 +155,40 @@ function validateDeploymentSecurity(text, name) {
   assert(!/name:\s*(?:HYEB_SESSION_SECRET|HYEB_POSTGRES_URL|HYEB_REDIS_URL|REDIS_URL|BROWSERLESS_TOKEN)\s*\n\s+value:/m.test(text), `${name} contains a literal secret value`);
 }
 
+function validateBrowserlessSecurity(text) {
+  has(text, /automountServiceAccountToken:\s*false/);
+  has(text, /runAsNonRoot:\s*true/);
+  has(text, /seccompProfile:\s*\n\s+type:\s*RuntimeDefault/);
+  has(text, /allowPrivilegeEscalation:\s*false/);
+  has(text, /capabilities:\s*\n\s+drop:\s*(?:\[ALL\]|\n\s+-\s+ALL)/);
+  has(text, /mountPath:\s*\/dev\/shm/);
+  has(text, /sizeLimit:\s*2Gi/);
+  has(text, /readinessProbe:/);
+  has(text, /livenessProbe:/);
+  has(text, /startupProbe:/);
+  assert(!/^\s*(?:privileged|hostNetwork|hostPID|hostIPC):\s*true\s*$/m.test(text), "Browserless enables a host or privileged setting");
+  assert(!/^\s*hostPath:/m.test(text), "Browserless mounts a hostPath volume");
+}
+
 function validateRenderedManifest(text, expectedTag) {
-  validateImageTags(text, { strict: true, expectedTag });
+  validateImageTags(text, {
+    strict: true,
+    expectedTag,
+    allowedPinnedImages: [/^ghcr\.io\/browserless\/chromium$/, /^quay\.io\/opstree\/redis(?:-sentinel)?$/],
+  });
   validateDeploymentSecurity(resourceSection(text, "Deployment", "hyeboard-api"), "hyeboard-api");
   validateDeploymentSecurity(resourceSection(text, "Deployment", "hyeboard-automation-worker"), "hyeboard-automation-worker");
   has(text, /kind:\s*NetworkPolicy/);
   has(text, /name:\s*hyeboard-api/);
   has(text, /name:\s*hyeboard-automation-worker/);
+  if (/kind:\s*RedisReplication/.test(text)) {
+    validateBrowserlessSecurity(resourceSection(text, "Deployment", "hyeboard-browserless"));
+    resourceSection(text, "Service", "hyeboard-browserless");
+    has(text, /kind:\s*RedisReplication/);
+    has(text, /redisSecret:/);
+    has(text, /sentinel:/);
+    has(text, /clusterSize:\s*3/);
+  }
 }
 
 validateImageTags(`${api}\n${worker}\n${kustomization}`);
@@ -216,6 +248,17 @@ assert(kustomization.includes("api-deployment.yaml"));
 assert(kustomization.includes("automation-deployment.yaml"));
 assert(!kustomization.includes("newTag: latest"));
 assert(config.includes("HYEB_AUTOMATION_EXECUTOR_READY=false"));
+assert(overlayKustomizations.find(({ name }) => name === "production").text.includes("browserless-deployment.yaml"));
+assert(overlayKustomizations.find(({ name }) => name === "production").text.includes("redis-replication.yaml"));
+validateBrowserlessSecurity(productionBrowserless);
+has(productionBrowserless, /image: ghcr\.io\/browserless\/chromium:v2\.55\.4/);
+assert(!productionBrowserless.includes(":latest"));
+has(productionRedis, /apiVersion: redis\.redis\.opstreelabs\.in\/v1beta2/);
+has(productionRedis, /clusterSize: 3/);
+has(productionRedis, /redisSecret:/);
+has(productionRedis, /name: hyeboard-redis-auth/);
+has(productionRedis, /sentinel:/);
+assert(!productionRedis.includes(":latest"));
 has(ingress, /nginx.ingress.kubernetes.io\/proxy-buffering: "off"/);
 has(ingress, /nginx.ingress.kubernetes.io\/proxy-request-buffering: "off"/);
 has(networkPolicy, /name: hyeboard-automation-worker/);

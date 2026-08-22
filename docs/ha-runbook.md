@@ -1,6 +1,6 @@
 # HA Runbook
 
-This runbook covers self-hosted memory/distributed containers and the Kubernetes deployment templates. Kubernetes assumes external PostgreSQL, Redis, and Browserless services; it does not create database or browser infrastructure.
+This runbook covers self-hosted memory/distributed containers and the Kubernetes deployment templates. Kubernetes keeps PostgreSQL external, can run Browserless in-cluster, and uses the OT-CONTAINER-KIT Redis Operator for production Redis replication and Sentinel failover.
 
 ## Prerequisites
 
@@ -14,7 +14,7 @@ docker buildx version
 
 For Kubernetes, install `kubectl` with a Kustomize-capable version, select the intended context, and confirm access with `kubectl cluster-info`. Applying an overlay additionally requires an ingress controller with class `nginx`, a metrics API for HPA, TLS Secrets, permissions to create/update resources in the target namespace, and enough capacity for the selected replica count. Staging and production validation require two nodes because the validator checks node spread.
 
-PostgreSQL, Redis, and Browserless must be reachable from the API/worker in distributed mode. Compose starts local instances for its `distributed` profile; Kubernetes expects managed/external instances and their connection values in the runtime Secret. Browserless is represented by the pinned Compose image `ghcr.io/browserless/chromium:v2.55.4`; this pin is not a claim of Browserless/UET parity.
+PostgreSQL, Redis, and Browserless must be reachable from the API/worker in distributed mode. Compose starts local instances for its `distributed` profile. Kubernetes staging may use managed/external Redis and Browserless; the production overlay runs RedisReplication and Browserless in-cluster. Browserless is represented by the pinned image `ghcr.io/browserless/chromium:v2.55.4`; this pin is not a claim of Browserless/UET parity.
 
 ## Modes
 
@@ -191,7 +191,7 @@ The overlays are intentionally different:
 | --- | --- | --- | --- | --- |
 | `example` | `hyeboard` | `hyeboard.example.com` | 1 API, 1 worker | `ghcr.io/im-yuuki` |
 | `staging` | `hyeboard-staging` | `staging.hyeboard.example.com` | 2 API, 2 workers | `ghcr.io/im-yuuki` |
-| `production` | `hyeboard-production` | `hyeboard.example.com` | 3 API, 3 workers | `registry.internal.example` placeholder |
+| `production` | `hyeboard-production` | `hyeboard.example.com` | 3 API, 3 workers, 3 Browserless | `registry.internal.example` placeholder |
 
 The base starts `HYEB_AUTOMATION_EXECUTOR_READY=false` and uses distributed mode with Browserless as the configured provider. The setting is not changed by any overlay. Keep it false: a running worker, Browserless endpoint, or healthy rollout does not establish Browserless/UET parity.
 
@@ -226,9 +226,67 @@ BROWSERLESS_ENDPOINT
 BROWSERLESS_TOKEN
 ```
 
+For the in-cluster production topology, set `HYEB_REDIS_URL` to the operator-managed primary Service, for example `redis://:<url-encoded-password>@hyeboard-redis-master:6379/0`, and set `BROWSERLESS_ENDPOINT=ws://hyeboard-browserless:3000/chromium`. The separate `hyeboard-redis-auth` Secret contains the same Redis password under the `password` key; do not commit either Secret.
+
+### Install the OpsTree Redis Operator
+
+Install the OT-CONTAINER-KIT Redis Operator once per cluster. It is cluster-scoped infrastructure and is intentionally not installed by either the Hyeboard Helm chart or the application Kustomize overlay. Pin the operator chart version after reviewing the available versions; do not install an unpinned release in production:
+
+```bash
+export OPERATOR_NAMESPACE=ot-operators
+helm repo add ot-helm https://ot-container-kit.github.io/helm-charts
+helm repo update
+helm search repo ot-helm/redis-operator --versions
+export REDIS_OPERATOR_VERSION=<reviewed-operator-chart-version>
+
+helm upgrade --install redis-operator ot-helm/redis-operator \
+  --namespace "$OPERATOR_NAMESPACE" \
+  --create-namespace \
+  --version "$REDIS_OPERATOR_VERSION" \
+  --set featureGates.GenerateConfigInInitContainer=true \
+  --wait --timeout 10m
+
+kubectl -n "$OPERATOR_NAMESPACE" \
+  rollout status deployment/redis-operator --timeout=180s
+kubectl get crd redisreplications.redis.redis.opstreelabs.in
+```
+
+The operator's upstream YAML installer is intended for development; use its Helm chart for a production cluster. Verify the operator version, image provenance, RBAC, CRD version (`redis.redis.opstreelabs.in/v1beta2`), and upgrade policy before installing. The production Hyeboard resource creates three Redis members and three Sentinel pods through this CRD.
+
+Create the Redis auth Secret and Hyeboard runtime Secret in the application namespace before applying either deployment method. Generate a hex password so it is safe to place in a Redis URI without additional URL encoding:
+
+```bash
+export HYEB_K8S_NAMESPACE=hyeboard-production
+kubectl create namespace "$HYEB_K8S_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+export REDIS_PASSWORD="$(openssl rand -hex 32)"
+kubectl -n "$HYEB_K8S_NAMESPACE" create secret generic hyeboard-redis-auth \
+  --from-literal=password="$REDIS_PASSWORD" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+export HYEB_SESSION_SECRET=<32-byte-or-longer-random-secret>
+export HYEB_POSTGRES_URL=<managed-postgresql-url>
+export AUTOMATION_KEY_CURRENT_ID=<unique-key-id>
+export AUTOMATION_KEY_CURRENT_B64=<base64-encoded-32-byte-key>
+export BROWSERLESS_TOKEN=<browserless-token>
+export HYEB_REDIS_URL="redis://:${REDIS_PASSWORD}@hyeboard-redis-master:6379/0"
+export BROWSERLESS_ENDPOINT=ws://hyeboard-browserless:3000/chromium
+
+kubectl -n "$HYEB_K8S_NAMESPACE" create secret generic hyeboard-runtime \
+  --from-literal=HYEB_SESSION_SECRET="$HYEB_SESSION_SECRET" \
+  --from-literal=HYEB_POSTGRES_URL="$HYEB_POSTGRES_URL" \
+  --from-literal=HYEB_REDIS_URL="$HYEB_REDIS_URL" \
+  --from-literal=AUTOMATION_KEY_CURRENT_ID="$AUTOMATION_KEY_CURRENT_ID" \
+  --from-literal=AUTOMATION_KEY_CURRENT_B64="$AUTOMATION_KEY_CURRENT_B64" \
+  --from-literal=BROWSERLESS_ENDPOINT="$BROWSERLESS_ENDPOINT" \
+  --from-literal=BROWSERLESS_TOKEN="$BROWSERLESS_TOKEN" \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+For real operations, replace shell variables with an external secret manager or External Secrets integration. Do not save these exports in a tracked file or paste generated Secret YAML into a ticket.
+
 Generate the session secret and automation key with a cryptographically secure generator, and use a unique key ID. Generate a PostgreSQL password separately when the managed database is provisioned. Keep values out of manifests, shell history where practical, logs, and source control. If no secret manager is available, create the Secret out of band with `kubectl` from environment variables; never apply `secret.example.yaml` unchanged.
 
-The external services must expose PostgreSQL on `5432`, Redis on `6379`, and Browserless on its configured endpoint (the NetworkPolicies allow the corresponding TCP ports). Add destination restrictions appropriate to the cluster CNI and provider. The Ingress resources require an NGINX ingress controller, the named TLS Secret (`hyeboard-tls`, `hyeboard-staging-tls`, or `hyeboard-production-tls`), and DNS for the selected hostname.
+Staging requires reachable PostgreSQL, Redis, and Browserless endpoints. Production requires PostgreSQL, the OT-CONTAINER-KIT Redis Operator and its `redis.redis.opstreelabs.in/v1beta2` CRD, a `hyeboard-redis-auth` Secret with key `password`, a StorageClass that can provision three Redis PVCs, and enough nodes for Redis/Sentinel anti-affinity. Production Browserless is exposed only through the in-cluster `hyeboard-browserless` ClusterIP and uses `BROWSERLESS_ENDPOINT=ws://hyeboard-browserless:3000/chromium`. Production `HYEB_REDIS_URL` must use the operator-managed `hyeboard-redis-master` Service and include the Redis password in the URL. Add destination restrictions appropriate to the cluster CNI. The Ingress resources require an NGINX ingress controller, the named TLS Secret (`hyeboard-tls`, `hyeboard-staging-tls`, or `hyeboard-production-tls`), and DNS for the selected hostname.
 
 ### Render and apply
 
@@ -238,7 +296,7 @@ Run static validation first. It does not require a live cluster:
 pnpm test:k8s
 ```
 
-Replace image tags/digests, provision the external Secret, and render the selected overlay to a file for review:
+Replace image tags/digests, provision the runtime/auth Secrets, install the pinned Redis Operator for production, and render the selected overlay to a file for review:
 
 ```bash
 kubectl kustomize deploy/k8s/overlays/staging > /tmp/hyeboard-staging.yaml
@@ -248,14 +306,46 @@ kubectl rollout status deployment/hyeboard-api -n hyeboard-staging --timeout=180
 kubectl rollout status deployment/hyeboard-automation-worker -n hyeboard-staging --timeout=180s
 ```
 
-Use the corresponding overlay and namespace for `example` or `production`. The example overlay has one replica and is not suitable for the multi-replica cluster validator. For staging or production, after the dependencies and metrics API are ready:
+Use the corresponding overlay and namespace for `example` or `production`. The example overlay has one replica and is not suitable for the multi-replica cluster validator. For production, verify the Redis Operator reports the CRD and reconcile permissions before applying the overlay. For staging or production, after the dependencies and metrics API are ready:
 
 ```bash
 HYEB_K8S_NAMESPACE=hyeboard-staging \
   node scripts/validate-k8s-cluster.mjs --failover
 ```
 
-The cluster validator needs a working `kubectl` context, at least two nodes, two ready replicas of both Deployments, two ready API Service endpoints, active HPA metrics, and permission to create a temporary `node:22-alpine` probe pod. It checks rollouts, readiness, endpoint spread, a mock session against each API pod, repeated readiness requests, and API pod replacement during `--failover`. It validates infrastructure behavior, not Browserless/UET parity.
+The cluster validator needs a working `kubectl` context, at least two nodes, two ready replicas of both application Deployments, two ready API Service endpoints, active HPA metrics, and permission to create a temporary `node:22-alpine` probe pod. It checks rollouts, readiness, endpoint spread, a mock session against each API pod, repeated readiness requests, and API pod replacement during `--failover`. Separately verify Redis Sentinel failover and Browserless session recovery; the validator does not establish Browserless/UET parity.
+
+### Apply the production Kustomize overlay
+
+The production overlay is the `kubectl` deployment path. It includes Browserless and the `RedisReplication` custom resource. It still expects the Redis Operator, both Secrets, PostgreSQL, DNS/TLS, and real immutable application images to exist. Do not edit tracked placeholders; render a temporary release copy:
+
+```bash
+export IMAGE_TAG=sha-<40-character-commit-sha>
+export IMAGE_REGISTRY=registry.example.internal
+export RELEASE_DIR="$(mktemp -d)"
+trap 'rm -rf "$RELEASE_DIR"' EXIT
+cp -R deploy/k8s "$RELEASE_DIR/k8s"
+
+perl -pi -e "s#registry.internal.example#${IMAGE_REGISTRY}#g; s/replace-with-release-tag/${IMAGE_TAG}/g" \
+  "$RELEASE_DIR/k8s/base/"*.yaml \
+  "$RELEASE_DIR/k8s/overlays/"*/*.yaml
+
+kubectl kustomize "$RELEASE_DIR/k8s/overlays/production" > "$RELEASE_DIR/production.yaml"
+node scripts/validate-k8s.mjs \
+  --rendered="$RELEASE_DIR/production.yaml" \
+  --expected-tag="$IMAGE_TAG"
+kubectl diff -f "$RELEASE_DIR/production.yaml"
+kubectl apply -f "$RELEASE_DIR/production.yaml"
+
+kubectl -n "$HYEB_K8S_NAMESPACE" get redisreplication hyeboard-redis
+kubectl -n "$HYEB_K8S_NAMESPACE" get pods -l app=hyeboard-redis
+kubectl -n "$HYEB_K8S_NAMESPACE" get svc hyeboard-redis-master
+kubectl -n "$HYEB_K8S_NAMESPACE" rollout status deployment/hyeboard-api --timeout=10m
+kubectl -n "$HYEB_K8S_NAMESPACE" rollout status deployment/hyeboard-automation-worker --timeout=10m
+kubectl -n "$HYEB_K8S_NAMESPACE" rollout status deployment/hyeboard-browserless --timeout=10m
+```
+
+The operator's master Service is the endpoint used by the current Node Redis client. After the RedisReplication resource is Ready, verify that `hyeboard-redis-master` selects the current master. Test Sentinel failover in a maintenance window and confirm the Service moves to the promoted member before enabling any production automation gate.
 
 ### CI
 
@@ -265,11 +355,11 @@ The cluster validator needs a working `kubectl` context, at least two nodes, two
 
 ## Helm alternative
 
-The Helm chart is available at [`deploy/helm/hyeboard`](../deploy/helm/hyeboard). It is an alternative to the Kustomize templates above; do not let Helm and Kustomize manage the same workloads in one namespace. The chart does not create a Namespace or Secret: the Helm release namespace and external `hyeboard-runtime` Secret remain operator-managed.
+The Helm chart is available at [`deploy/helm/hyeboard`](../deploy/helm/hyeboard). It is an alternative to the Kustomize templates above; do not let Helm and Kustomize manage the same workloads in one namespace. The chart can deploy Browserless and render a RedisReplication custom resource when enabled, but it does not install the cluster-scoped Redis Operator, Namespace, or Secrets.
 
-The Helm operator prerequisites are Helm 3, `kubectl` access to the selected cluster context, an ingress controller matching the chart's configured Ingress class, DNS, and a pre-created TLS Secret in the target namespace. PostgreSQL, Redis, and Browserless remain external services. Helm does not provision those dependencies, and their endpoints and credentials must be reachable by the distributed API and automation worker.
+The Helm production prerequisites are Helm 3, `kubectl` access to the selected cluster context, a pinned OT-CONTAINER-KIT Redis Operator/CRD, a StorageClass for Redis PVCs, an ingress controller matching the chart's configured Ingress class, DNS, and a pre-created TLS Secret. PostgreSQL remains external. `values-production.yaml` enables Browserless and the RedisReplication resource; the chart does not install the Redis Operator itself.
 
-Create the external Secret `hyeboard-runtime` in each target namespace before installing the release. Use an external secret manager or External Secrets integration where available. The Secret must contain:
+Create `hyeboard-runtime` and `hyeboard-redis-auth` in each target namespace before installing the production release. Use an external secret manager or External Secrets integration where available. The runtime Secret must contain:
 
 ```text
 HYEB_SESSION_SECRET
@@ -283,7 +373,39 @@ BROWSERLESS_ENDPOINT
 BROWSERLESS_TOKEN
 ```
 
-Set `images.api.repository`, `images.api.tag`/`digest`, and the corresponding `images.automationWorker.*` values and use an immutable commit SHA tag such as `sha-<40-character-commit-sha>` or a verified registry digest. Never use `latest` or another mutable tag. Put environment-specific values in a local uncommitted file.
+Set `images.api.repository`, `images.api.tag`/`digest`, and the corresponding `images.automationWorker.*` values and use an immutable commit SHA tag such as `sha-<40-character-commit-sha>` or a verified registry digest. Never use `latest` or another mutable tag. Put environment-specific values in a local uncommitted file. For the production values, `HYEB_REDIS_URL` uses `<release>-redis-master` and `BROWSERLESS_ENDPOINT` uses `<release>-browserless`.
+
+For a production Helm release, layer `values-production.yaml` with an uncommitted site values file containing the real image registry/tag or digests, ingress hostname/TLS, allowed origins, and any environment-specific scheduling values. The Redis Operator must already be installed and the two Secrets must exist in the release namespace:
+
+```bash
+export HYEB_K8S_NAMESPACE=hyeboard-production
+export RELEASE_NAME=hyeboard
+
+helm lint deploy/helm/hyeboard --strict \
+  --values deploy/helm/hyeboard/values-production.yaml \
+  --values /path/to/values-production-site.yaml
+helm template "$RELEASE_NAME" deploy/helm/hyeboard \
+  --namespace "$HYEB_K8S_NAMESPACE" \
+  --values deploy/helm/hyeboard/values-production.yaml \
+  --values /path/to/values-production-site.yaml \
+  > /tmp/hyeboard-production-helm.yaml
+kubectl diff -f /tmp/hyeboard-production-helm.yaml
+
+helm upgrade --install "$RELEASE_NAME" deploy/helm/hyeboard \
+  --namespace "$HYEB_K8S_NAMESPACE" \
+  --create-namespace \
+  --values deploy/helm/hyeboard/values-production.yaml \
+  --values /path/to/values-production-site.yaml \
+  --wait --atomic --timeout 15m
+
+helm status "$RELEASE_NAME" --namespace "$HYEB_K8S_NAMESPACE"
+kubectl -n "$HYEB_K8S_NAMESPACE" get redisreplication,svc,pods
+kubectl -n "$HYEB_K8S_NAMESPACE" rollout status deployment/${RELEASE_NAME}-api --timeout=10m
+kubectl -n "$HYEB_K8S_NAMESPACE" rollout status deployment/${RELEASE_NAME}-automation-worker --timeout=10m
+kubectl -n "$HYEB_K8S_NAMESPACE" rollout status deployment/${RELEASE_NAME}-browserless --timeout=10m
+```
+
+Do not install the Helm release and apply the Kustomize production overlay in the same namespace. Both paths create the same application resources. Helm `--wait` does not prove the Redis custom resource has reconciled; inspect the RedisReplication status and the `<release>-redis-master` Service separately.
 
 Reference workflow for a staging namespace:
 

@@ -89,6 +89,15 @@
     },
     "api": { "$ref": "#/definitions/api" },
     "automationWorker": { "$ref": "#/definitions/automationWorker" },
+    "redis": {
+      "type": "object",
+      "required": ["operator"],
+      "additionalProperties": false,
+      "properties": {
+        "operator": { "$ref": "#/definitions/redisOperator" }
+      }
+    },
+    "browserless": { "$ref": "#/definitions/browserless" },
     "hpa": {
       "type": "object",
       "required": ["api", "automationWorker"],
@@ -272,6 +281,151 @@
       ]
     },
     "automationWorker": { "$ref": "#/definitions/componentCommon" },
+    "redisImage": {
+      "type": "object",
+      "required": ["repository", "tag", "pullPolicy"],
+      "additionalProperties": false,
+      "properties": {
+        "repository": { "type": "string", "minLength": 1, "pattern": "^\\S+$" },
+        "tag": { "type": "string", "minLength": 1, "pattern": "^\\S+$" },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "redisOperator": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "apiVersion",
+        "name",
+        "clusterSize",
+        "image",
+        "sentinel",
+        "auth",
+        "storage",
+        "resources",
+        "podSecurityContext",
+        "securityContext",
+        "terminationGracePeriodSeconds",
+        "nodeSelector",
+        "tolerations",
+        "topologySpreadConstraints"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "apiVersion": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 63 },
+        "clusterSize": { "type": "integer", "minimum": 3 },
+        "image": { "$ref": "#/definitions/redisImage" },
+        "sentinel": {
+          "type": "object",
+          "required": ["enabled", "size", "image", "resources", "nodeSelector", "tolerations", "topologySpreadConstraints"],
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "size": { "type": "integer", "minimum": 3 },
+            "image": { "$ref": "#/definitions/redisImage" },
+            "resources": { "$ref": "#/definitions/resources" },
+            "nodeSelector": { "type": "object", "additionalProperties": { "type": "string" } },
+            "tolerations": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+            "topologySpreadConstraints": { "$ref": "#/definitions/topologySpreadConstraints" }
+          }
+        },
+        "auth": {
+          "type": "object",
+          "required": ["existingSecret", "key"],
+          "additionalProperties": false,
+          "properties": {
+            "existingSecret": { "type": "string", "minLength": 1 },
+            "key": { "$ref": "#/definitions/envKey" }
+          }
+        },
+        "storage": {
+          "type": "object",
+          "required": ["storageClassName", "size"],
+          "additionalProperties": false,
+          "properties": {
+            "storageClassName": { "type": "string" },
+            "size": { "type": "string", "minLength": 1 }
+          }
+        },
+        "resources": { "$ref": "#/definitions/resources" },
+        "podSecurityContext": { "$ref": "#/definitions/securityContext" },
+        "securityContext": { "$ref": "#/definitions/securityContext" },
+        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 1 },
+        "nodeSelector": { "type": "object", "additionalProperties": { "type": "string" } },
+        "tolerations": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+        "topologySpreadConstraints": { "$ref": "#/definitions/topologySpreadConstraints" }
+      }
+    },
+    "browserless": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "replicaCount",
+        "revisionHistoryLimit",
+        "minReadySeconds",
+        "terminationGracePeriodSeconds",
+        "image",
+        "service",
+        "resources",
+        "podSecurityContext",
+        "securityContext",
+        "probes",
+        "podAnnotations",
+        "topologySpreadConstraints",
+        "affinity",
+        "nodeSelector",
+        "tolerations",
+        "extraEnv",
+        "shmSizeLimit",
+        "tmpVolume",
+        "hpa",
+        "pdb"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "replicaCount": { "type": "integer", "minimum": 1 },
+        "revisionHistoryLimit": { "type": "integer", "minimum": 0 },
+        "minReadySeconds": { "type": "integer", "minimum": 0 },
+        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 1 },
+        "image": { "$ref": "#/definitions/image" },
+        "service": {
+          "type": "object",
+          "required": ["type", "port", "annotations"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "annotations": { "type": "object", "additionalProperties": { "type": "string" } }
+          }
+        },
+        "resources": { "$ref": "#/definitions/resources" },
+        "podSecurityContext": { "$ref": "#/definitions/securityContext" },
+        "securityContext": { "$ref": "#/definitions/securityContext" },
+        "probes": {
+          "type": "object",
+          "required": ["readiness", "liveness", "startup"],
+          "additionalProperties": false,
+          "properties": {
+            "readiness": { "$ref": "#/definitions/probe" },
+            "liveness": { "$ref": "#/definitions/probe" },
+            "startup": { "$ref": "#/definitions/probe" }
+          }
+        },
+        "podAnnotations": { "type": "object", "additionalProperties": { "type": "string" } },
+        "topologySpreadConstraints": { "$ref": "#/definitions/topologySpreadConstraints" },
+        "affinity": { "$ref": "#/definitions/securityContext" },
+        "nodeSelector": { "type": "object", "additionalProperties": { "type": "string" } },
+        "tolerations": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+        "extraEnv": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+        "shmSizeLimit": { "type": "string", "minLength": 1 },
+        "tmpVolume": { "type": "object", "additionalProperties": true },
+        "hpa": { "$ref": "#/definitions/hpaConfig" },
+        "pdb": { "$ref": "#/definitions/pdbConfig" }
+      }
+    },
     "hpaConfig": {
       "type": "object",
       "required": ["enabled", "minReplicas", "maxReplicas", "behavior", "metrics"],

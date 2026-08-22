@@ -100,7 +100,13 @@ function imageTagPaths(paths) {
       const indent = match[1].length;
       while (stack.length && stack.at(-1).indent >= indent) stack.pop();
       const pathParts = [...stack.map((entry) => entry.key), match[2]];
-      if (/(?:tag|imageTag)$/i.test(match[2])) paths.add(pathParts.join("."));
+      if (
+        pathParts[0] === "images" &&
+        ["api", "automationWorker"].includes(pathParts[1]) &&
+        /(?:tag|imageTag)$/i.test(match[2])
+      ) {
+        paths.add(pathParts.join("."));
+      }
       if (!match[3] || match[3] === "|" || match[3] === ">") {
         stack.push({ indent, key: match[2] });
       }
@@ -151,6 +157,10 @@ function assertField(document, pattern, description) {
 function validateImages(rendered, { strictRelease }) {
   const images = [...rendered.matchAll(/^\s*image:\s*(?:>-\s*)?([^\s#]+)\s*$/gm)].map((match) => match[1]);
   assert(images.length >= 2, "Rendered chart must contain API and worker image references");
+  const applicationImages = documentSections(rendered)
+    .filter((document) => resourceKind(document) === "Deployment")
+    .filter((document) => /api|automation-worker/.test(resourceName(document) || ""))
+    .flatMap((document) => [...document.matchAll(/^\s*image:\s*(?:>-\s*)?([^\s#]+)\s*$/gm)].map((match) => match[1]));
   for (const image of images) {
     const digest = image.match(/@sha256:([a-f0-9]{64})$/i)?.[1];
     const tag = digest ? undefined : image.match(/:([^:/]+)$/)?.[1];
@@ -160,7 +170,7 @@ function validateImages(rendered, { strictRelease }) {
       continue;
     }
     assert(!mutableTags.has(tag), `Image ${image} uses mutable tag ${tag}`);
-    if (strictRelease) {
+    if (strictRelease && applicationImages.includes(image)) {
       assert(tag !== placeholderTag, `Image ${image} still uses the release placeholder tag`);
       if (requestedImageTag) assert.equal(tag, requestedImageTag, `Image ${image} does not use the requested release tag`);
     }
@@ -183,6 +193,22 @@ function validateDeployment(document, role) {
   assert(!/^\s*hostPath:/m.test(document), `${role} mounts a hostPath volume`);
 }
 
+function validateBrowserlessDeployment(document) {
+  assertField(document, /^\s*automountServiceAccountToken:\s*false\s*$/m, "Browserless service-account token restriction");
+  assertField(document, /^\s*runAsNonRoot:\s*true\s*$/m, "Browserless non-root security context");
+  assertField(document, /seccompProfile:\s*\n[\s\S]*?type:\s*RuntimeDefault/m, "Browserless RuntimeDefault seccomp profile");
+  assertField(document, /^\s*allowPrivilegeEscalation:\s*false\s*$/m, "Browserless privilege-escalation restriction");
+  assertField(document, /capabilities:\s*\n[\s\S]*?drop:\s*(?:\[?ALL\]?|\n\s+-\s+ALL)/m, "Browserless dropped capabilities");
+  assertField(document, /mountPath:\s*\/dev\/shm/m, "Browserless shared-memory volume");
+  assertField(document, /sizeLimit:\s*\S+/m, "Browserless shared-memory size limit");
+  assertField(document, /^\s*resources:\s*$/m, "Browserless resource limits");
+  assertField(document, /^\s*readinessProbe:\s*$/m, "Browserless readiness probe");
+  assertField(document, /^\s*livenessProbe:\s*$/m, "Browserless liveness probe");
+  assertField(document, /^\s*startupProbe:\s*$/m, "Browserless startup probe");
+  assert(!/^\s*(?:privileged|hostNetwork|hostPID|hostIPC):\s*true\s*$/m.test(document), "Browserless enables a host or privileged setting");
+  assert(!/^\s*hostPath:/m.test(document), "Browserless mounts a hostPath volume");
+}
+
 function validateRenderedManifest(rendered, label, { strictRelease }) {
   const documents = documentSections(rendered);
   assert(documents.length > 0, `${label} rendered no Kubernetes resources`);
@@ -194,6 +220,18 @@ function validateRenderedManifest(rendered, label, { strictRelease }) {
   validateDeployment(worker, "worker deployment");
   findResource(documents, "Service", /(^|-)api($|-)/);
   assert(documents.some((document) => resourceKind(document) === "Ingress"), `${label} is missing an Ingress`);
+
+  const browserless = documents.find(
+    (document) => resourceKind(document) === "Deployment" && /browserless/.test(resourceName(document) || ""),
+  );
+  if (browserless) {
+    validateBrowserlessDeployment(browserless);
+    findResource(documents, "Service", /browserless/);
+  }
+
+  if (strictRelease && label === "production") {
+    findResource(documents, "RedisReplication", /redis/);
+  }
 
   if (strictRelease) validateRenderedSecrets(rendered, label);
 }

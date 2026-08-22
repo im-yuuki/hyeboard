@@ -33,6 +33,14 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- printf "%s-automation-worker" (include "hyeboard.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
+{{- define "hyeboard.browserlessName" -}}
+{{- printf "%s-browserless" (include "hyeboard.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "hyeboard.redisName" -}}
+{{- .Values.redis.operator.name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
 {{- define "hyeboard.apiSelectorLabels" -}}
 app.kubernetes.io/name: {{ include "hyeboard.apiName" . }}
 app.kubernetes.io/component: api

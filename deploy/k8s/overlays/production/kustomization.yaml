@@ -5,8 +5,33 @@ resources:
   - ../../base
   - namespace.yaml
   - ingress.yaml
+  - browserless-deployment.yaml
+  - browserless-service.yaml
+  - browserless-hpa.yaml
+  - browserless-pdb.yaml
+  - browserless-network-policy.yaml
+  - redis-replication.yaml
+  - redis-network-policy.yaml
 patches:
   - path: scaling.yaml
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: hyeboard-api
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/topologySpreadConstraints/0/whenUnsatisfiable
+        value: DoNotSchedule
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: hyeboard-automation-worker
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/topologySpreadConstraints/0/whenUnsatisfiable
+        value: DoNotSchedule
 configMapGenerator:
   - name: hyeboard-runtime
     behavior: merge
