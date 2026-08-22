@@ -31,7 +31,12 @@ jobs:
       - run: pnpm test:browser
       - run: pnpm --filter @hyeboard/worker check:node-package
       - run: pnpm --filter @hyeboard/worker exec wrangler deploy --dry-run
+      - run: >-
+          docker pull postgres:16-alpine &&
+          docker pull redis:7-alpine
       - run: pnpm test:ha
+        env:
+          HYEB_REQUIRE_HA_INFRASTRUCTURE: "true"
       - run: docker build --tag hyeboard-api:ci .
       - run: >-
           docker build --tag hyeboard-automation-worker:ci

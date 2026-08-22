@@ -9,7 +9,13 @@ const dockerAvailable = await dockerIsAvailable();
 const imagesAvailable = dockerAvailable && await dockerImagesAreAvailable(["postgres:16-alpine", "redis:7-alpine"]);
 const infrastructureAvailable = dockerAvailable && imagesAvailable;
 if (!infrastructureAvailable) {
-  console.warn(`[ha:postgres] SKIPPED: ${dockerAvailable ? "required Docker images are not present (pull postgres:16-alpine and redis:7-alpine first)" : "Docker is unavailable"}; no fake integration result will be reported.`);
+  const reason = dockerAvailable
+    ? "required Docker images are not present (pull postgres:16-alpine and redis:7-alpine first)"
+    : "Docker is unavailable";
+  if (process.env.HYEB_REQUIRE_HA_INFRASTRUCTURE === "true") {
+    throw new Error(`[ha:postgres] ${reason}`);
+  }
+  console.warn(`[ha:postgres] SKIPPED: ${reason}; no fake integration result will be reported.`);
 }
 
 describe.skipIf(!infrastructureAvailable)("HA PostgreSQL integration", () => {
