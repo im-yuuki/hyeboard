@@ -1,7 +1,20 @@
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { RedisContainer, type StartedRedisContainer } from "@testcontainers/redis";
 import { beforeAll, afterAll, describe, expect, it } from "vitest";
-import { dockerImagesAreAvailable, dockerIsAvailable, runProbe, WorkerProcess } from "./test-support.js";
+import { RedisStreamsBroker } from "../../apps/automation-worker/src/broker.js";
+import { RedisJobLeaseStore } from "../../apps/automation-worker/src/lease.js";
+import {
+  closeRedis,
+  connectRedis,
+  createRedisClients,
+} from "../../apps/worker/src/node/redis/index.js";
+import {
+  delay,
+  dockerImagesAreAvailable,
+  dockerIsAvailable,
+  runProbe,
+  WorkerProcess,
+} from "./test-support.js";
 
 const dockerAvailable = await dockerIsAvailable();
 const imagesAvailable = dockerAvailable && await dockerImagesAreAvailable(["postgres:16-alpine", "redis:7-alpine"]);
@@ -60,6 +73,63 @@ describe.skipIf(!infrastructureAvailable)("HA Redis integration", () => {
       runProbe("redis", "begin", { principalKey, pair }, { redisUrl: redis.getConnectionUrl() }),
     ]);
     expect(results.map((result) => result.kind).sort()).toEqual(["accepted", "in-progress"]);
+  });
+
+  it("reclaims a crashed automation consumer with a new fencing lease", async () => {
+    const first = createRedisClients({ url: redis.getConnectionUrl() });
+    const second = createRedisClients({ url: redis.getConnectionUrl() });
+    await Promise.all([connectRedis(first), connectRedis(second)]);
+    try {
+      const firstBroker = new RedisStreamsBroker(first.client as never);
+      const secondBroker = new RedisStreamsBroker(second.client as never);
+      const stream = `ha:automation:jobs:${Date.now()}`;
+      const group = "ha-automation-workers";
+      await firstBroker.ensureGroup(stream, group);
+      const messageId = await firstBroker.add(stream, { jobEnvelope: "opaque" });
+      await expect(
+        firstBroker.readGroup({
+          stream,
+          group,
+          consumer: "crashed-worker",
+          count: 1,
+          blockMs: 1,
+        }),
+      ).resolves.toHaveLength(1);
+
+      const firstLease = await new RedisJobLeaseStore(
+        first.client as never,
+        "ha:automation:lease:",
+      ).acquire("reclaimed-job", 1, 1_000);
+      expect(firstLease).toBeDefined();
+      await expect(
+        new RedisJobLeaseStore(
+          second.client as never,
+          "ha:automation:lease:",
+        ).acquire("reclaimed-job", 2, 1_000),
+      ).resolves.toBeUndefined();
+
+      await delay(1_100);
+      const reclaimed = await secondBroker.reclaimPending({
+        stream,
+        group,
+        consumer: "replacement-worker",
+        count: 1,
+        minIdleMs: 1_000,
+      });
+      expect(reclaimed).toMatchObject([{ id: messageId, deliveryCount: 2 }]);
+
+      const replacementLease = await new RedisJobLeaseStore(
+        second.client as never,
+        "ha:automation:lease:",
+      ).acquire("reclaimed-job", 2, 1_000);
+      expect(replacementLease).toBeDefined();
+      await expect(firstLease!.assertHeld()).rejects.toThrow();
+      await expect(replacementLease!.assertHeld()).resolves.toBeUndefined();
+      await secondBroker.ack(stream, group, messageId);
+      await replacementLease!.release();
+    } finally {
+      await Promise.all([closeRedis(first), closeRedis(second)]);
+    }
   });
 
   it("relays a CAPTCHA answer between independent Redis processes", async () => {
