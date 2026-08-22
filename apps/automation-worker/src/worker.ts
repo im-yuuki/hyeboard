@@ -104,9 +104,9 @@ export class AutomationWorker<TCredential, TResult> {
     this.running = false;
   }
 
-  async runOnce(): Promise<number> {
+  async runOnce(signal?: AbortSignal): Promise<number> {
     if (this.runOncePromise) return this.runOncePromise;
-    const operation = this.runOnceImpl();
+    const operation = this.runOnceImpl(signal);
     this.runOncePromise = operation;
     try {
       return await operation;
@@ -115,7 +115,7 @@ export class AutomationWorker<TCredential, TResult> {
     }
   }
 
-  private async runOnceImpl(): Promise<number> {
+  private async runOnceImpl(signal?: AbortSignal): Promise<number> {
     if (this.draining) return 0;
     await this.ensureGroup();
     const reclaimed = await this.options.broker.reclaimPending({
@@ -124,7 +124,7 @@ export class AutomationWorker<TCredential, TResult> {
       consumer: this.options.config.consumerName,
       count: 10,
       minIdleMs: this.options.config.reclaimIdleMs,
-      signal: this.shutdown.signal,
+      signal,
     });
     const messages =
       reclaimed.length > 0
@@ -135,7 +135,7 @@ export class AutomationWorker<TCredential, TResult> {
             consumer: this.options.config.consumerName,
             count: 10,
             blockMs: this.options.config.readBlockMs,
-            signal: this.shutdown.signal,
+            signal,
           });
     let processed = 0;
     for (const message of messages) {
@@ -187,7 +187,7 @@ export class AutomationWorker<TCredential, TResult> {
 
   private async consume(): Promise<void> {
     while (!this.draining) {
-      const processed = await this.runOnce();
+      const processed = await this.runOnce(this.shutdown.signal);
       if (processed === 0)
         await new Promise((resolve) => setTimeout(resolve, 25));
     }

@@ -186,6 +186,8 @@ describe("in-memory automation worker", () => {
     const credentials = await encryptEnvelope({ bearer: "private-upstream-token" }, { keyring, aad: `credential:${value.jobId}`, issuedAt: "2036-01-02T03:00:00.000Z", expiresAt: "2036-01-02T04:00:00.000Z", randomBytes: () => new Uint8Array(12).fill(8) });
     await broker.add("jobs", { jobEnvelope: await codec.close({ ...value, credentialEnvelope: credentials }, "job-aad", "2036-01-02T04:00:00.000Z") });
     let release: (() => void) | undefined;
+    let startExecutor: (() => void) | undefined;
+    const executorStarted = new Promise<void>((resolve) => { startExecutor = resolve; });
     const blocked = new Promise<void>((resolve) => { release = resolve; });
     const worker = new AutomationWorker({
       config: { ...config, shutdownTimeoutMs: 20 },
@@ -193,12 +195,16 @@ describe("in-memory automation worker", () => {
       leaseStore: new InMemoryJobLeaseStore(() => now),
       envelopeCodec: codec,
        browserProvider: createBrowserlessPuppeteerProvider({ endpoint: config.browserlessEndpoint, token: config.browserlessToken, connect: async () => fakeBrowser, now: () => now }),
-      executor: { execute: async ({ cancellation }) => { await Promise.race([blocked, cancellation.sleep(10_000)]); cancellation.throwIfCancelled(); return { imported: true }; } },
+      executor: { execute: async ({ cancellation }) => { startExecutor?.(); await Promise.race([blocked, cancellation.sleep(10_000)]); cancellation.throwIfCancelled(); return { imported: true }; } },
       events,
       now: () => now,
     });
     const processing = worker.runOnce();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    for (let attempt = 0; attempt < 20 && broker.pending("jobs", "workers").length === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    expect(broker.pending("jobs", "workers")).toHaveLength(1);
+    await executorStarted;
     await worker.stop();
     release?.();
     await processing;
