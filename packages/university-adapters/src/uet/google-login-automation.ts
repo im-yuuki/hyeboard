@@ -1,7 +1,16 @@
 import puppeteer from "@cloudflare/puppeteer";
 import puppeteerCore from "puppeteer-core";
-import { getLogger, HyeboardError, type GoogleSessionCookie } from "@hyeboard/core";
-import type { BrowserConnection, UetBrowserDriver, UetBrowserTarget, UetPageDriver } from "../types";
+import {
+  getLogger,
+  HyeboardError,
+  type GoogleSessionCookie,
+} from "@hyeboard/core";
+import type {
+  BrowserConnection,
+  UetBrowserDriver,
+  UetBrowserTarget,
+  UetPageDriver,
+} from "../types";
 
 // Structural type covering whichever of @cloudflare/puppeteer's or
 // puppeteer-core's Browser we got — both packages implement the same
@@ -16,7 +25,8 @@ export const CANVAS_SSO_URL = "https://portal.uet.vnu.edu.vn/login/saml";
 // login attempt during that window ends up here regardless of credentials,
 // so it must be checked before treating a failed login as a credential or
 // automation problem.
-export const STUDENTHUB_MAINTENANCE_URL = "https://studenthub.uet.edu.vn/maintance/system-update";
+export const STUDENTHUB_MAINTENANCE_URL =
+  "https://studenthub.uet.edu.vn/maintance/system-update";
 
 export function isStudenthubMaintenance(url: string): boolean {
   return /\/maintance\/system-update(?:[/?#]|$)/.test(url);
@@ -34,11 +44,23 @@ export type AutomationDeadline = {
   dispose: () => void;
 };
 
-export function createAutomationDeadline(signal?: AbortSignal): AutomationDeadline {
+export function createAutomationDeadline(
+  signal?: AbortSignal,
+): AutomationDeadline {
   const controller = new AbortController();
-  const onAbort = () => controller.abort(signal?.reason ?? new DOMException("This operation was aborted", "AbortError"));
+  const onAbort = () =>
+    controller.abort(
+      signal?.reason ??
+        new DOMException("This operation was aborted", "AbortError"),
+    );
   const timeoutId = setTimeout(() => {
-    controller.abort(new HyeboardError("GOOGLE_AUTOMATION_TIMEOUT", "The automated sign-in took too long and was cancelled.", 504));
+    controller.abort(
+      new HyeboardError(
+        "GOOGLE_AUTOMATION_TIMEOUT",
+        "The automated sign-in took too long and was cancelled.",
+        504,
+      ),
+    );
   }, HARD_TIMEOUT_MS);
   if (signal?.aborted) onAbort();
   else signal?.addEventListener("abort", onAbort, { once: true });
@@ -52,10 +74,17 @@ export function createAutomationDeadline(signal?: AbortSignal): AutomationDeadli
   };
 }
 
-export async function awaitAutomationOperation<T>(operation: Promise<T>, signal: AbortSignal, onCancel: () => Promise<void>): Promise<T> {
+export async function awaitAutomationOperation<T>(
+  operation: Promise<T>,
+  signal: AbortSignal,
+  onCancel: () => Promise<void>,
+): Promise<T> {
   if (signal.aborted) {
     await onCancel().catch(() => undefined);
-    throw signal.reason ?? new DOMException("This operation was aborted", "AbortError");
+    throw (
+      signal.reason ??
+      new DOMException("This operation was aborted", "AbortError")
+    );
   }
   return new Promise<T>((resolve, reject) => {
     let settled = false;
@@ -68,7 +97,14 @@ export async function awaitAutomationOperation<T>(operation: Promise<T>, signal:
     const onAbort = () => {
       void onCancel()
         .catch(() => undefined)
-        .then(() => finish(() => reject(signal.reason ?? new DOMException("This operation was aborted", "AbortError"))));
+        .then(() =>
+          finish(() =>
+            reject(
+              signal.reason ??
+                new DOMException("This operation was aborted", "AbortError"),
+            ),
+          ),
+        );
     };
     signal.addEventListener("abort", onAbort, { once: true });
     operation.then(
@@ -79,11 +115,53 @@ export async function awaitAutomationOperation<T>(operation: Promise<T>, signal:
 }
 
 export function throwIfAutomationAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) throw signal.reason ?? new DOMException("This operation was aborted", "AbortError");
+  if (signal?.aborted)
+    throw (
+      signal.reason ??
+      new DOMException("This operation was aborted", "AbortError")
+    );
 }
 
 function isTransientNavigationError(error: unknown): boolean {
-  return error instanceof Error && /detached Frame|execution context was destroyed|navigating frame/i.test(error.message);
+  return (
+    error instanceof Error &&
+    /detached Frame|execution context was destroyed|navigating frame/i.test(
+      error.message,
+    )
+  );
+}
+
+export async function waitForGoogleIdentityServices(
+  page: UetPageDriver,
+  timeoutMs = 15_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      const ready = await page.evaluate(() => {
+        const googleWindow = window as Window & {
+          google?: { accounts?: { id?: unknown } };
+        };
+        return Boolean(
+          googleWindow.google?.accounts?.id &&
+            document.querySelector("#googleLoginButton1 div[role='button']"),
+        );
+      });
+      if (ready) return;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new HyeboardError(
+    "GOOGLE_IDENTITY_UNAVAILABLE",
+    "Google sign-in did not load. Please try again or use the manual token option below.",
+    502,
+    lastError instanceof Error
+      ? { originalMessage: lastError.message }
+      : undefined,
+  );
 }
 
 export async function waitForStableSelector(
@@ -121,7 +199,10 @@ export type GoogleLoginResult = {
   googleCookies?: GoogleSessionCookie[];
 };
 
-export type GoogleChallengeCode = "GOOGLE_2FA_REQUIRED" | "GOOGLE_AUTOMATION_BLOCKED" | "GOOGLE_CHALLENGE_REQUIRED";
+export type GoogleChallengeCode =
+  | "GOOGLE_2FA_REQUIRED"
+  | "GOOGLE_AUTOMATION_BLOCKED"
+  | "GOOGLE_CHALLENGE_REQUIRED";
 
 // Optional Patchright-based launcher for the "local" BrowserConnection kind
 // (github.com/Kaliiiiiiiiii-Vinyzu/patchright-nodejs — a patched Playwright
@@ -147,7 +228,9 @@ export type PatchrightLauncher = (
   signal?: AbortSignal,
 ) => Promise<GoogleLoginResult>;
 let patchrightLauncher: PatchrightLauncher | undefined;
-export function setPatchrightLauncher(launcher: PatchrightLauncher | undefined): void {
+export function setPatchrightLauncher(
+  launcher: PatchrightLauncher | undefined,
+): void {
   patchrightLauncher = launcher;
 }
 
@@ -159,21 +242,35 @@ export function setPatchrightLauncher(launcher: PatchrightLauncher | undefined):
 // Patchright's cached contexts too without this file ever importing the
 // patchright-dependent module directly.
 let patchrightCloseHandler: (() => Promise<void>) | undefined;
-export function setPatchrightCloseHandler(handler: (() => Promise<void>) | undefined): void {
+export function setPatchrightCloseHandler(
+  handler: (() => Promise<void>) | undefined,
+): void {
   patchrightCloseHandler = handler;
 }
 
 // Checked in this exact priority order: 2FA first, then automation-blocked
 // (Google's "this browser or app may not be secure" / suspicious-activity
 // messaging), then a generic challenge/rejected fallback.
-export function detectChallenge(currentUrl: string, bodyText: string): GoogleChallengeCode | undefined {
-  if (/\/signin\/v2\/challenge\/(totp|ipp|iap)/.test(currentUrl)) return "GOOGLE_2FA_REQUIRED";
-  if (/may not be secure|verify it.?s you|unusual activity|suspicious/i.test(bodyText)) return "GOOGLE_AUTOMATION_BLOCKED";
-  if (/\/signin\/(challenge|rejected)/.test(currentUrl)) return "GOOGLE_CHALLENGE_REQUIRED";
+export function detectChallenge(
+  currentUrl: string,
+  bodyText: string,
+): GoogleChallengeCode | undefined {
+  if (/\/signin\/v2\/challenge\/(totp|ipp|iap)/.test(currentUrl))
+    return "GOOGLE_2FA_REQUIRED";
+  if (
+    /may not be secure|verify it.?s you|unusual activity|suspicious/i.test(
+      bodyText,
+    )
+  )
+    return "GOOGLE_AUTOMATION_BLOCKED";
+  if (/\/signin\/(challenge|rejected)/.test(currentUrl))
+    return "GOOGLE_CHALLENGE_REQUIRED";
   return undefined;
 }
 
-export function serializeCookies(cookies: Array<{ name: string; value: string }>): string {
+export function serializeCookies(
+  cookies: Array<{ name: string; value: string }>,
+): string {
   return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
 }
 
@@ -188,7 +285,13 @@ export function serializeCookies(cookies: Array<{ name: string; value: string }>
 // stays URL-list-based rather than a true wildcard capture — the list is
 // just wider than before instead of unbounded.
 export function cookieCaptureUrls(): string[] {
-  return [new URL(STUDENTHUB_LOGIN_URL).origin, new URL(CANVAS_SSO_URL).origin, "https://accounts.google.com", "https://www.google.com", "https://idp.vnu.edu.vn"];
+  return [
+    new URL(STUDENTHUB_LOGIN_URL).origin,
+    new URL(CANVAS_SSO_URL).origin,
+    "https://accounts.google.com",
+    "https://www.google.com",
+    "https://idp.vnu.edu.vn",
+  ];
 }
 
 // Now that capture is broader (StudentHub/Canvas cookies included, see
@@ -202,7 +305,9 @@ export function cookieCaptureUrls(): string[] {
 // allow-list (not a studenthub/canvas deny-list) so it stays correct even
 // if Google/VNU IDP start setting cookies on a domain not anticipated here.
 export function isRehydratableGoogleCookie(domain: string): boolean {
-  return /(^|\.)google\.com$|(^|\.)gstatic\.com$|(^|\.)googleusercontent\.com$|(^|\.)idp\.vnu\.edu\.vn$/.test(domain);
+  return /(^|\.)google\.com$|(^|\.)gstatic\.com$|(^|\.)googleusercontent\.com$|(^|\.)idp\.vnu\.edu\.vn$/.test(
+    domain,
+  );
 }
 
 // Auto-detect Chrome/Chromium on the system when HYEB_CHROME_PATH is unset.
@@ -211,32 +316,61 @@ export function isRehydratableGoogleCookie(domain: string): boolean {
 // only — never on Cloudflare Workers).
 async function findChromeExecutable(): Promise<string | undefined> {
   // Common binary names in priority order.
-  const names = ["google-chrome", "google-chrome-stable", "chromium-browser", "chromium", "chrome", "google-chrome-unstable"];
+  const names = [
+    "google-chrome",
+    "google-chrome-stable",
+    "chromium-browser",
+    "chromium",
+    "chrome",
+    "google-chrome-unstable",
+  ];
   try {
     const { execSync } = await import("node:child_process");
     const isWin = process.platform === "win32";
     for (const name of names) {
       try {
-        const out = execSync(isWin ? `where ${name}` : `which ${name} 2>/dev/null`, { encoding: "utf-8", timeout: 2000 });
+        const out = execSync(
+          isWin ? `where ${name}` : `which ${name} 2>/dev/null`,
+          { encoding: "utf-8", timeout: 2000 },
+        );
         const p = out.trim().split(/\r?\n/)[0];
         if (p) return p;
-      } catch { /* not in PATH */ }
+      } catch {
+        /* not in PATH */
+      }
     }
-  } catch { /* child_process not available */ }
+  } catch {
+    /* child_process not available */
+  }
   // Static fallback paths per platform.
   const { accessSync, constants } = await import("node:fs");
-  const candidates = process.platform === "win32"
-    ? ["C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-       "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-       `${process.env.LOCALAPPDATA}\\Google\\Chrome\\Application\\chrome.exe`]
-    : process.platform === "darwin"
-    ? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-       "/Applications/Chromium.app/Contents/MacOS/Chromium"]
-    : ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable",
-       "/usr/bin/chromium-browser", "/usr/bin/chromium",
-       "/snap/bin/chromium", "/snap/bin/google-chrome"];
+  const candidates =
+    process.platform === "win32"
+      ? [
+          "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+          "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+          `${process.env.LOCALAPPDATA}\\Google\\Chrome\\Application\\chrome.exe`,
+        ]
+      : process.platform === "darwin"
+        ? [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+          ]
+        : [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            "/snap/bin/chromium",
+            "/snap/bin/google-chrome",
+          ];
   for (const p of candidates) {
-    try { accessSync(p, constants.X_OK); return p; } catch { /* not found */ }
+    try {
+      accessSync(p, constants.X_OK);
+      return p;
+    } catch {
+      /* not found */
+    }
   }
   return undefined;
 }
@@ -286,9 +420,15 @@ const browserSessionCache = new Map<string, CachedBrowserSession>();
 // failure). Configurable via HYEB_BROWSER_IDLE_EVICTION_MS (milliseconds)
 // for operators who've measured a different real-world TTL.
 const DEFAULT_IDLE_EVICTION_MS = 14 * 24 * 60 * 60_000;
-const IDLE_EVICTION_MS = Number(process.env.HYEB_BROWSER_IDLE_EVICTION_MS) > 0 ? Number(process.env.HYEB_BROWSER_IDLE_EVICTION_MS) : DEFAULT_IDLE_EVICTION_MS;
+const IDLE_EVICTION_MS =
+  Number(process.env.HYEB_BROWSER_IDLE_EVICTION_MS) > 0
+    ? Number(process.env.HYEB_BROWSER_IDLE_EVICTION_MS)
+    : DEFAULT_IDLE_EVICTION_MS;
 
-function cacheKeyFor(connection: BrowserConnection, email: string): string | undefined {
+function cacheKeyFor(
+  connection: BrowserConnection,
+  email: string,
+): string | undefined {
   // Cloudflare's Browser Rendering binding launches a fresh instance every
   // call with no addressable identity to reconnect to later — never cache.
   if (connection.kind === "cloudflare") return undefined;
@@ -322,23 +462,35 @@ export async function closeCachedBrowserSessions(): Promise<void> {
   browserSessionCache.clear();
   await Promise.all([
     ...sessions.map((s) => s.browser.close().catch(() => undefined)),
-    patchrightCloseHandler ? patchrightCloseHandler().catch(() => undefined) : Promise.resolve(),
+    patchrightCloseHandler
+      ? patchrightCloseHandler().catch(() => undefined)
+      : Promise.resolve(),
   ]);
 }
 
-async function acquireBrowser(connection: BrowserConnection): Promise<AnyBrowser> {
+async function acquireBrowser(
+  connection: BrowserConnection,
+): Promise<AnyBrowser> {
   if (connection.kind === "cloudflare") {
-    return (await puppeteer.launch(connection.binding as never)) as unknown as AnyBrowser;
+    return (await puppeteer.launch(
+      connection.binding as never,
+    )) as unknown as AnyBrowser;
   } else if (connection.kind === "self-hosted") {
-    return (await puppeteerCore.connect({ browserWSEndpoint: connection.browserWSEndpoint })) as unknown as AnyBrowser;
+    return (await puppeteerCore.connect({
+      browserWSEndpoint: connection.browserWSEndpoint,
+    })) as unknown as AnyBrowser;
   } else if (connection.kind === "owned") {
     return connection.driver;
   } else {
-    const chromePath = process.env.HYEB_CHROME_PATH ?? await findChromeExecutable();
+    const chromePath =
+      process.env.HYEB_CHROME_PATH ?? (await findChromeExecutable());
     if (!chromePath) {
-      throw new HyeboardError("CHROME_NOT_FOUND",
-        "No Chrome/Chromium executable found. Install Chrome, set HYEB_CHROME_PATH, "
-        + "or use a remote browser via HYEB_BROWSER_WS_ENDPOINT.", 500);
+      throw new HyeboardError(
+        "CHROME_NOT_FOUND",
+        "No Chrome/Chromium executable found. Install Chrome, set HYEB_CHROME_PATH, " +
+          "or use a remote browser via HYEB_BROWSER_WS_ENDPOINT.",
+        500,
+      );
     }
     return (await puppeteerCore.launch({
       headless: connection.headless ?? true,
@@ -371,8 +523,19 @@ export async function automateVnuGoogleLogin(
   // "local" + a registered Patchright launcher (see setPatchrightLauncher
   // above) + explicit opt-in via env var — dispatches to a completely
   // separate Playwright-based implementation instead of Puppeteer below.
-  if (connection.kind === "local" && process.env.HYEB_BROWSER_PATCHRIGHT === "true" && patchrightLauncher) {
-    return patchrightLauncher(connection.headless ?? true, email, password, existingCookies, onProgress, signal);
+  if (
+    connection.kind === "local" &&
+    process.env.HYEB_BROWSER_PATCHRIGHT === "true" &&
+    patchrightLauncher
+  ) {
+    return patchrightLauncher(
+      connection.headless ?? true,
+      email,
+      password,
+      existingCookies,
+      onProgress,
+      signal,
+    );
   }
 
   const key = cacheKeyFor(connection, email);
@@ -382,7 +545,10 @@ export async function automateVnuGoogleLogin(
   const log = getLogger();
   // Set HYEB_LOG_LEVEL=debug to see every step of this flow (browser
   // acquisition, navigation, token capture, Canvas SSO hop).
-  log.debug({ connectionKind: connection.kind, email }, "automateVnuGoogleLogin: starting");
+  log.debug(
+    { connectionKind: connection.kind, email },
+    "automateVnuGoogleLogin: starting",
+  );
 
   // Up to two attempts: first, try a cached live browser if one exists
   // (self-hosted only); if the flow fails while reusing it, evict that
@@ -398,18 +564,36 @@ export async function automateVnuGoogleLogin(
     let flow: Promise<void> | undefined;
     const deadline = createAutomationDeadline(signal);
     try {
-      const acquisition = reusingCache ? Promise.resolve(cached!.browser) : acquireBrowser(connection);
-      acquisition.then((candidate) => {
-        if (deadline.signal.aborted) void candidate.close().catch(() => undefined);
-      }, () => undefined);
+      const acquisition = reusingCache
+        ? Promise.resolve(cached!.browser)
+        : acquireBrowser(connection);
+      acquisition.then(
+        (candidate) => {
+          if (deadline.signal.aborted)
+            void candidate.close().catch(() => undefined);
+        },
+        () => undefined,
+      );
       browser = reusingCache
         ? cached!.browser
-        : await awaitAutomationOperation(acquisition, deadline.signal, async () => {
-            await interruptBrowser(browser, connection);
-          });
+        : await awaitAutomationOperation(
+            acquisition,
+            deadline.signal,
+            async () => {
+              await interruptBrowser(browser, connection);
+            },
+          );
       log.debug({ reusingCache }, "automateVnuGoogleLogin: browser acquired");
       await assertConnectionOwned(connection);
-      flow = runFlow(browser, email, password, result, existingCookies, onProgress, deadline.signal);
+      flow = runFlow(
+        browser,
+        email,
+        password,
+        result,
+        existingCookies,
+        onProgress,
+        deadline.signal,
+      );
       await awaitAutomationOperation(flow, deadline.signal, async () => {
         await interruptBrowser(browser, connection);
       });
@@ -419,7 +603,8 @@ export async function automateVnuGoogleLogin(
       // Success: keep the browser alive for the next refresh instead of
       // closing it (self-hosted only — cacheKeyFor() already excludes
       // Cloudflare).
-      if (key) browserSessionCache.set(key, { browser, lastUsedAt: Date.now() });
+      if (key)
+        browserSessionCache.set(key, { browser, lastUsedAt: Date.now() });
       else await browser.close().catch(() => undefined);
       deadline.dispose();
       break;
@@ -433,11 +618,15 @@ export async function automateVnuGoogleLogin(
         await evictCachedSession(key);
         if (!callerAborted) {
           deadline.dispose();
-          log.debug({ err: error }, "automateVnuGoogleLogin: cached browser session failed, retrying with a fresh browser");
+          log.debug(
+            { err: error },
+            "automateVnuGoogleLogin: cached browser session failed, retrying with a fresh browser",
+          );
           continue;
         }
       }
-      if (!reusingCache && connection.kind !== "owned") await browser?.close().catch(() => undefined);
+      if (!reusingCache && connection.kind !== "owned")
+        await browser?.close().catch(() => undefined);
       deadline.dispose();
       if (callerAborted) throw signal?.reason ?? error;
       if (deadline.signal.aborted) throw deadline.signal.reason ?? error;
@@ -456,22 +645,45 @@ export async function automateVnuGoogleLogin(
       // crashed CDP connection, a network blip) — not Google blocking
       // anything. Using the same code for both hid the real cause and
       // wrongly implied Google itself was at fault every time.
-      throw new HyeboardError("GOOGLE_SIGNIN_FAILURE", `Google sign-in automation failed: ${reason}`, 502, { originalMessage: reason, originalName: error instanceof Error ? error.name : undefined });
+      throw new HyeboardError(
+        "GOOGLE_SIGNIN_FAILURE",
+        `Google sign-in automation failed: ${reason}`,
+        502,
+        {
+          originalMessage: reason,
+          originalName: error instanceof Error ? error.name : undefined,
+        },
+      );
     }
   }
 
-  log.debug({ hasStudenthub: Boolean(result.studenthub), hasCanvas: Boolean(result.canvas) }, "automateVnuGoogleLogin: finished");
+  log.debug(
+    {
+      hasStudenthub: Boolean(result.studenthub),
+      hasCanvas: Boolean(result.canvas),
+    },
+    "automateVnuGoogleLogin: finished",
+  );
   if (!result.studenthub && !result.canvas) {
-    throw new HyeboardError("GOOGLE_SIGNIN_FAILURE", "Google did not complete the sign-in. Check your email and password, or use the manual token option below.", 502);
+    throw new HyeboardError(
+      "GOOGLE_SIGNIN_FAILURE",
+      "Google did not complete the sign-in. Check your email and password, or use the manual token option below.",
+      502,
+    );
   }
   return result;
 }
 
-async function assertConnectionOwned(connection: BrowserConnection): Promise<void> {
+async function assertConnectionOwned(
+  connection: BrowserConnection,
+): Promise<void> {
   if (connection.kind === "owned") await connection.assertOwned?.();
 }
 
-async function interruptBrowser(browser: AnyBrowser | undefined, connection: BrowserConnection): Promise<void> {
+async function interruptBrowser(
+  browser: AnyBrowser | undefined,
+  connection: BrowserConnection,
+): Promise<void> {
   if (!browser) return;
   if (connection.kind === "owned") {
     await browser.disconnect();
@@ -517,13 +729,17 @@ async function clickGoogleButtonAndWaitForPopup(
       reject(new Error("Google sign-in popup did not open in time."));
     }, 10_000);
   });
-  await page.waitForSelector("aria/Đăng nhập với VNU mail", { timeout: 10_000 });
+  await page.waitForSelector("aria/Đăng nhập với VNU mail", {
+    timeout: 10_000,
+  });
   await page.click("aria/Đăng nhập với VNU mail");
   const popup = await popupPromise;
   // The popup target resolves as soon as it's created, often while it's
   // still on about:blank mid-redirect through Google's OAuth handshake —
   // wait for it to actually settle on a Google page before inspecting it.
-  await popup.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15_000 }).catch(() => undefined);
+  await popup
+    .waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15_000 })
+    .catch(() => undefined);
   await popup.bringToFront().catch(() => undefined);
   return popup;
 }
@@ -541,7 +757,16 @@ async function runFlow(
   const report = (message: string) => onProgress?.(message);
   const page = await browser.newPage();
   try {
-    await runFlowBody(page, browser, email, password, result, existingCookies, report, signal);
+    await runFlowBody(
+      page,
+      browser,
+      email,
+      password,
+      result,
+      existingCookies,
+      report,
+      signal,
+    );
   } finally {
     // Always close this call's page/tab, even on success or a thrown
     // error — the browser itself may be kept alive afterward (see the
@@ -574,23 +799,57 @@ async function runFlowBody(
   // interactive email/password/Keycloak steps. Filtered to Google/IDP
   // cookies only — existingCookies may also contain StudentHub/Canvas
   // cookies now that capture is broad (see isRehydratableGoogleCookie).
-  const rehydratableCookies = existingCookies?.filter((c) => isRehydratableGoogleCookie(c.domain)) ?? [];
+  const rehydratableCookies =
+    existingCookies?.filter((c) => isRehydratableGoogleCookie(c.domain)) ?? [];
   if (rehydratableCookies.length) {
-    await page.setCookie(...(rehydratableCookies as never[])).catch(() => undefined);
+    await page
+      .setCookie(...(rehydratableCookies as never[]))
+      .catch(() => undefined);
   }
 
   // 1. StudentHub → Google sign-in popup.
   report("Opening StudentHub...");
-  await page.goto(STUDENTHUB_LOGIN_URL, { waitUntil: "networkidle0" });
+  await page.goto(STUDENTHUB_LOGIN_URL, {
+    waitUntil: "domcontentloaded",
+    timeout: 30_000,
+  });
   if (isStudenthubMaintenance(page.url())) {
-    throw new HyeboardError("STUDENTHUB_MAINTENANCE", "StudentHub is currently under maintenance. Please try again later.", 503);
+    throw new HyeboardError(
+      "STUDENTHUB_MAINTENANCE",
+      "StudentHub is currently under maintenance. Please try again later.",
+      503,
+    );
+  }
+  const signInButton = await page
+    .waitForSelector("aria/Đăng nhập với VNU mail", { timeout: 3_000 })
+    .catch(() => null);
+  if (!signInButton) {
+    const hasStaleToken = await page
+      .evaluate(() => Boolean(window.localStorage.getItem("accessToken")))
+      .catch(() => false);
+    if (hasStaleToken) {
+      await page.evaluate(() => window.localStorage.removeItem("accessToken"));
+      await page.goto(STUDENTHUB_LOGIN_URL, {
+        waitUntil: "domcontentloaded",
+        timeout: 30_000,
+      });
+    }
   }
   report("Signing in with Google...");
+  await waitForGoogleIdentityServices(page);
   let popup = await clickGoogleButtonAndWaitForPopup(page, browser);
 
   const checkPopupChallenge = async (p: UetPageDriver) => {
-    const challenge = detectChallenge(p.url(), await p.evaluate(() => document.body.innerText).catch(() => ""));
-    if (challenge) throw new HyeboardError(challenge, "Google requires additional verification that cannot be completed automatically.", 401);
+    const challenge = detectChallenge(
+      p.url(),
+      await p.evaluate(() => document.body.innerText).catch(() => ""),
+    );
+    if (challenge)
+      throw new HyeboardError(
+        challenge,
+        "Google requires additional verification that cannot be completed automatically.",
+        401,
+      );
   };
 
   // 1b. If we restored a Google session cookie, give the popup a brief
@@ -609,7 +868,10 @@ async function runFlowBody(
       popup.once("close", () => resolve(true));
       setTimeout(() => resolve(false), 1_500);
     });
-    getLogger().debug({ silentCookieLogin }, "runFlow: silent cookie-based login attempt finished");
+    getLogger().debug(
+      { silentCookieLogin },
+      "runFlow: silent cookie-based login attempt finished",
+    );
   }
 
   if (!silentCookieLogin) {
@@ -620,10 +882,14 @@ async function runFlowBody(
     // expected to skip straight to the email input below without ever
     // showing this chooser, but that specific case has not been exercised
     // live — this branch is a defensive best-effort, not a confirmed path.
-    const useAnotherAccount = await popup.waitForSelector("aria/Sử dụng tài khoản khác", { timeout: 3_000 }).catch(() => null);
+    const useAnotherAccount = await popup
+      .waitForSelector("aria/Sử dụng tài khoản khác", { timeout: 3_000 })
+      .catch(() => null);
     if (useAnotherAccount) {
       await useAnotherAccount.click().catch(() => undefined);
-      await popup.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15_000 }).catch(() => undefined);
+      await popup
+        .waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15_000 })
+        .catch(() => undefined);
     }
 
     // 2b. When cookie rehydration (step 0) placed the popup on Google's
@@ -634,11 +900,17 @@ async function runFlowBody(
     // present or the popup isn't on the account chooser), this is a no-op
     // and the interactive flow below proceeds normally.
     const loggedInTile =
-      (await popup.waitForSelector(`div[data-identifier="${email}"]`, { timeout: 3_000 }).catch(() => null)) ??
-      (await popup.waitForSelector(`::-p-text(${email})`, { timeout: 3_000 }).catch(() => null));
+      (await popup
+        .waitForSelector(`div[data-identifier="${email}"]`, { timeout: 3_000 })
+        .catch(() => null)) ??
+      (await popup
+        .waitForSelector(`::-p-text(${email})`, { timeout: 3_000 })
+        .catch(() => null));
     if (loggedInTile) {
       await loggedInTile.click().catch(() => undefined);
-      await popup.waitForNavigation({ waitUntil: "networkidle0", timeout: 15_000 }).catch(() => undefined);
+      await popup
+        .waitForNavigation({ waitUntil: "networkidle0", timeout: 15_000 })
+        .catch(() => undefined);
       if (popup.isClosed()) {
         silentCookieLogin = true;
       } else {
@@ -650,7 +922,9 @@ async function runFlowBody(
         // wrongly falls through to the email step. Non-fatal timeout: if no
         // second navigation happens, the check below simply proceeds with
         // the normal email/password flow.
-        await popup.waitForNavigation({ waitUntil: "networkidle0", timeout: 8_000 }).catch(() => undefined);
+        await popup
+          .waitForNavigation({ waitUntil: "networkidle0", timeout: 8_000 })
+          .catch(() => undefined);
         if (popup.isClosed()) silentCookieLogin = true;
       }
     }
@@ -669,7 +943,9 @@ async function runFlowBody(
       await popup.type(emailSelector, email, { delay: 20 });
       await popup.waitForSelector("#identifierNext", { timeout: 10_000 });
       await popup.click("#identifierNext");
-      await popup.waitForNavigation({ waitUntil: "networkidle0" }).catch(() => undefined);
+      await popup
+        .waitForNavigation({ waitUntil: "networkidle0" })
+        .catch(() => undefined);
       await checkPopupChallenge(popup);
     }
 
@@ -695,7 +971,9 @@ async function runFlowBody(
       report("Completing VNU sign-in...");
       // Confirmed by live testing: Keycloak's #username field expects the
       // bare local-part (before "@"), not the full email address.
-      const keycloakUsername = email.includes("@") ? email.slice(0, email.indexOf("@")) : email;
+      const keycloakUsername = email.includes("@")
+        ? email.slice(0, email.indexOf("@"))
+        : email;
       await waitForStableSelector(popup, "#username", 5_000);
       await popup.type("#username", keycloakUsername, { delay: 20 });
       await popup.type("#password", password, { delay: 20 });
@@ -704,13 +982,23 @@ async function runFlowBody(
       // close), making the saved VNU IDP cookie useless for re-auth on the
       // next login. Confirmed present at #rememberMe in the live-captured
       // VNU IDP page.
-      const rememberMe = await popup.waitForSelector("#rememberMe", { timeout: 2_000 }).catch(() => null);
+      const rememberMe = await popup
+        .waitForSelector("#rememberMe", { timeout: 2_000 })
+        .catch(() => null);
       if (rememberMe) {
-        const isChecked = await popup.evaluate(() => (document.querySelector("#rememberMe") as HTMLInputElement | null)?.checked ?? false).catch(() => false);
+        const isChecked = await popup
+          .evaluate(
+            () =>
+              (document.querySelector("#rememberMe") as HTMLInputElement | null)
+                ?.checked ?? false,
+          )
+          .catch(() => false);
         if (!isChecked) await rememberMe.click();
       }
       await popup.click("#kc-login");
-      await popup.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15_000 }).catch(() => undefined);
+      await popup
+        .waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15_000 })
+        .catch(() => undefined);
 
       // Google can show an interstitial "We'd like to verify if this
       // account is yours" screen with a "Continue" button before the VNU
@@ -719,18 +1007,28 @@ async function runFlowBody(
       // (the more common case, confirmed live), the selector simply times
       // out and this is a no-op.
       const verifyContinue =
-        (await popup.waitForSelector("aria/Continue", { timeout: 5_000 }).catch(() => null)) ??
-        (await popup.waitForSelector("aria/Tiếp tục", { timeout: 3_000 }).catch(() => null));
+        (await popup
+          .waitForSelector("aria/Continue", { timeout: 5_000 })
+          .catch(() => null)) ??
+        (await popup
+          .waitForSelector("aria/Tiếp tục", { timeout: 3_000 })
+          .catch(() => null));
       if (verifyContinue) {
-        getLogger().debug("runFlow: clicking 'verify it's you' Continue interstitial");
+        getLogger().debug(
+          "runFlow: clicking 'verify it's you' Continue interstitial",
+        );
         await verifyContinue.click().catch(() => undefined);
-        await popup.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 10_000 }).catch(() => undefined);
+        await popup
+          .waitForNavigation({ waitUntil: "domcontentloaded", timeout: 10_000 })
+          .catch(() => undefined);
       }
 
       if (popup.isClosed()) {
         // OAuth completed directly (popup closed itself during/near the
         // interstitial step) — no close+reopen dance needed.
-        getLogger().debug("runFlow: popup closed itself after Keycloak login (OAuth completed directly)");
+        getLogger().debug(
+          "runFlow: popup closed itself after Keycloak login (OAuth completed directly)",
+        );
       } else {
         // Popup is on mail.google.com (the VNU JS redirect dead end) or
         // some other intermediate URL. Close and reopen via the opener's
@@ -751,20 +1049,30 @@ async function runFlowBody(
         // account tile; the text-content fallback keeps this tolerant if
         // Google changes attributes.
         const accountTile =
-          (await popup.waitForSelector(`div[data-identifier="${email}"]`, { timeout: 8_000 }).catch(() => null)) ??
-          (await popup.waitForSelector(`::-p-text(${email})`, { timeout: 5_000 }).catch(() => null));
+          (await popup
+            .waitForSelector(`div[data-identifier="${email}"]`, {
+              timeout: 8_000,
+            })
+            .catch(() => null)) ??
+          (await popup
+            .waitForSelector(`::-p-text(${email})`, { timeout: 5_000 })
+            .catch(() => null));
         if (accountTile) {
           await accountTile.click().catch(() => undefined);
           // MUST wait for the popup navigation (Google OAuth consent page)
           // before polling the opener — the postMessage that delivers the
           // credential to StudentHub only fires after this navigation.
-          await popup.waitForNavigation({ waitUntil: "networkidle0", timeout: 15_000 }).catch(() => undefined);
+          await popup
+            .waitForNavigation({ waitUntil: "networkidle0", timeout: 15_000 })
+            .catch(() => undefined);
           // Poll the opener for the StudentHub accessToken deposited by
           // Google's postMessage handshake.
           for (let attempt = 0; attempt < 20; attempt++) {
             await new Promise((r) => setTimeout(r, 500));
             if (studenthubToken || popup.isClosed()) break;
-            studenthubToken = await page.evaluate(() => window.localStorage.getItem("accessToken")).catch(() => null);
+            studenthubToken = await page
+              .evaluate(() => window.localStorage.getItem("accessToken"))
+              .catch(() => null);
           }
         }
       }
@@ -781,8 +1089,15 @@ async function runFlowBody(
       // surfaces as its own real code; otherwise report the missing
       // redirect explicitly, with the popup's URL logged for diagnosis.
       await checkPopupChallenge(popup);
-      getLogger().error({ url: popup.url() }, "runFlow: expected a Keycloak (idp.vnu.edu.vn) redirect after the email step but never got one");
-      throw new HyeboardError("GOOGLE_KEYCLOAK_REDIRECT_MISSING", "Google did not redirect to the VNU sign-in page as expected. Try again, or use the manual token option below.", 502);
+      getLogger().error(
+        { url: popup.url() },
+        "runFlow: expected a Keycloak (idp.vnu.edu.vn) redirect after the email step but never got one",
+      );
+      throw new HyeboardError(
+        "GOOGLE_KEYCLOAK_REDIRECT_MISSING",
+        "Google did not redirect to the VNU sign-in page as expected. Try again, or use the manual token option below.",
+        502,
+      );
     }
     if (!popup.isClosed()) await checkPopupChallenge(popup);
   }
@@ -797,19 +1112,32 @@ async function runFlowBody(
   // manual-paste instructions already in apps/web/src/main.tsx.
   report("Finalizing StudentHub session...");
   await new Promise<void>((resolve) => {
-    if (popup.isClosed()) { resolve(); return; }
+    if (popup.isClosed()) {
+      resolve();
+      return;
+    }
     popup.once("close", () => resolve());
     setTimeout(resolve, 6_000);
   });
 
   for (let attempt = 0; attempt < 8 && !studenthubToken; attempt++) {
-    studenthubToken = await page.evaluate(() => window.localStorage.getItem("accessToken")).catch(() => null);
-    if (!studenthubToken) await new Promise((resolve) => setTimeout(resolve, 300));
+    studenthubToken = await page
+      .evaluate(() => window.localStorage.getItem("accessToken"))
+      .catch(() => null);
+    if (!studenthubToken)
+      await new Promise((resolve) => setTimeout(resolve, 300));
   }
   if (studenthubToken) result.studenthub = { accessToken: studenthubToken };
-  getLogger().debug({ gotStudenthubToken: Boolean(studenthubToken) }, "runFlow: StudentHub token capture attempt finished");
+  getLogger().debug(
+    { gotStudenthubToken: Boolean(studenthubToken) },
+    "runFlow: StudentHub token capture attempt finished",
+  );
   if (!studenthubToken && isStudenthubMaintenance(page.url())) {
-    throw new HyeboardError("STUDENTHUB_MAINTENANCE", "StudentHub is currently under maintenance. Please try again later.", 503);
+    throw new HyeboardError(
+      "STUDENTHUB_MAINTENANCE",
+      "StudentHub is currently under maintenance. Please try again later.",
+      503,
+    );
   }
 
   // Capture cookies from every origin touched during the flow — see
@@ -822,7 +1150,9 @@ async function runFlowBody(
   // EncryptedSessionPayload.uetGoogleCredential.googleCookies) so the next
   // automateVnuGoogleLogin() call can attempt the silent cookie-based path
   // above instead of a full interactive login.
-  const googleCookies = await page.cookies(...cookieCaptureUrls()).catch(() => []);
+  const googleCookies = await page
+    .cookies(...cookieCaptureUrls())
+    .catch(() => []);
   if (googleCookies.length) {
     result.googleCookies = googleCookies.map((c) => ({
       name: c.name,
@@ -835,7 +1165,10 @@ async function runFlowBody(
       sameSite: c.sameSite as GoogleSessionCookie["sameSite"],
     }));
   }
-  getLogger().debug({ gotGoogleCookies: googleCookies.length > 0 }, "runFlow: Google session cookie capture finished");
+  getLogger().debug(
+    { gotGoogleCookies: googleCookies.length > 0 },
+    "runFlow: Google session cookie capture finished",
+  );
 
   // 5b. Let StudentHub's SPA finish transitioning into its authenticated
   // main page before navigating away to Canvas. The token landing in
@@ -846,7 +1179,9 @@ async function runFlowBody(
   // StudentHub's authenticated dashboard state, so this is a best-effort
   // network-idle wait rather than a specific assertion — non-fatal if it
   // times out, since we still proceed to Canvas either way.
-  await page.waitForNetworkIdle({ idleTime: 500, timeout: 8_000 }).catch(() => undefined);
+  await page
+    .waitForNetworkIdle({ idleTime: 500, timeout: 8_000 })
+    .catch(() => undefined);
 
   // 6. Same browser context/cookies → Canvas SSO (Keycloak brokers to the
   // already-authenticated Google session silently, no second password).
@@ -856,19 +1191,36 @@ async function runFlowBody(
   // Canvas SAML login convention and has not been confirmed against a real
   // account.
   report("Connecting to Canvas...");
-  getLogger().debug({ url: CANVAS_SSO_URL }, "runFlow: navigating to Canvas SSO");
-  await page.goto(CANVAS_SSO_URL, { waitUntil: "networkidle0" }).catch(() => undefined);
-  const canvasChallenge = detectChallenge(page.url(), await page.evaluate(() => document.body.innerText).catch(() => ""));
-  if (canvasChallenge) getLogger().debug({ challenge: canvasChallenge, url: page.url() }, "runFlow: Canvas SSO hit a challenge");
+  getLogger().debug(
+    { url: CANVAS_SSO_URL },
+    "runFlow: navigating to Canvas SSO",
+  );
+  await page
+    .goto(CANVAS_SSO_URL, { waitUntil: "networkidle0" })
+    .catch(() => undefined);
+  const canvasChallenge = detectChallenge(
+    page.url(),
+    await page.evaluate(() => document.body.innerText).catch(() => ""),
+  );
+  if (canvasChallenge)
+    getLogger().debug(
+      { challenge: canvasChallenge, url: page.url() },
+      "runFlow: Canvas SSO hit a challenge",
+    );
   if (!canvasChallenge) {
     const cookies = await page.cookies();
     const csrfCookie = cookies.find((c) => /csrf/i.test(c.name));
     if (cookies.length) {
       result.canvas = {
         cookie: serializeCookies(cookies),
-        csrfToken: csrfCookie ? decodeURIComponent(csrfCookie.value) : undefined,
+        csrfToken: csrfCookie
+          ? decodeURIComponent(csrfCookie.value)
+          : undefined,
       };
     }
-    getLogger().debug({ gotCanvasCookies: cookies.length > 0 }, "runFlow: Canvas SSO finished");
+    getLogger().debug(
+      { gotCanvasCookies: cookies.length > 0 },
+      "runFlow: Canvas SSO finished",
+    );
   }
 }

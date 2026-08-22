@@ -277,7 +277,7 @@ export async function automateVnuGoogleLoginPatchright(
 async function clickGoogleButtonAndWaitForPopup(page: Page): Promise<Page> {
   const [popup] = await Promise.all([
     page.waitForEvent("popup", { timeout: 10_000 }),
-    page.getByRole("link", { name: "Đăng nhập với VNU mail" }).click({ timeout: 10_000 }).catch(() =>
+    page.getByRole("button", { name: "Đăng nhập với VNU mail" }).click({ timeout: 10_000 }).catch(() =>
       page.getByText("Đăng nhập với VNU mail").click({ timeout: 10_000 }),
     ),
   ]);
@@ -386,7 +386,7 @@ async function runFlowBody(
   // time" style failures on the reuse path). Detect that and force a
   // clean, logged-out reload before proceeding.
   const googleSignInButtonVisible = await page
-    .getByRole("link", { name: "Đăng nhập với VNU mail" })
+    .getByRole("button", { name: "Đăng nhập với VNU mail" })
     .isVisible({ timeout: 3_000 })
     .catch(() => false);
   if (!googleSignInButtonVisible) {
@@ -400,6 +400,10 @@ async function runFlowBody(
 
   log.debug("runFlow(patchright): StudentHub login page loaded, clicking Google sign-in button");
   report("Signing in with Google...");
+  await page.locator("#googleLoginButton1 iframe").waitFor({
+    state: "attached",
+    timeout: 15_000,
+  });
   let popup = await clickGoogleButtonAndWaitForPopup(page);
   log.debug({ popupUrl: popup.url() }, "runFlow(patchright): Google sign-in popup opened");
 

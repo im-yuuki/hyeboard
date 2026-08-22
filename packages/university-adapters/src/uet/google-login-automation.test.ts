@@ -4,44 +4,89 @@ import {
   awaitAutomationOperation,
   detectChallenge,
   serializeCookies,
+  waitForGoogleIdentityServices,
   waitForStableSelector,
 } from "./google-login-automation";
 
 const browserMocks = vi.hoisted(() => ({ launch: vi.fn(), connect: vi.fn() }));
-vi.mock("@cloudflare/puppeteer", () => ({ default: { launch: browserMocks.launch } }));
-vi.mock("puppeteer-core", () => ({ default: { connect: browserMocks.connect, launch: vi.fn() } }));
+vi.mock("@cloudflare/puppeteer", () => ({
+  default: { launch: browserMocks.launch },
+}));
+vi.mock("puppeteer-core", () => ({
+  default: { connect: browserMocks.connect, launch: vi.fn() },
+}));
 
 describe("detectChallenge", () => {
   it("returns GOOGLE_2FA_REQUIRED for a totp challenge URL", () => {
-    expect(detectChallenge("https://accounts.google.com/signin/v2/challenge/totp?x=1", "")).toBe("GOOGLE_2FA_REQUIRED");
+    expect(
+      detectChallenge(
+        "https://accounts.google.com/signin/v2/challenge/totp?x=1",
+        "",
+      ),
+    ).toBe("GOOGLE_2FA_REQUIRED");
   });
 
   it("returns GOOGLE_2FA_REQUIRED for an ipp challenge URL", () => {
-    expect(detectChallenge("https://accounts.google.com/signin/v2/challenge/ipp", "")).toBe("GOOGLE_2FA_REQUIRED");
+    expect(
+      detectChallenge(
+        "https://accounts.google.com/signin/v2/challenge/ipp",
+        "",
+      ),
+    ).toBe("GOOGLE_2FA_REQUIRED");
   });
 
   it("returns GOOGLE_2FA_REQUIRED for an iap challenge URL", () => {
-    expect(detectChallenge("https://accounts.google.com/signin/v2/challenge/iap", "")).toBe("GOOGLE_2FA_REQUIRED");
+    expect(
+      detectChallenge(
+        "https://accounts.google.com/signin/v2/challenge/iap",
+        "",
+      ),
+    ).toBe("GOOGLE_2FA_REQUIRED");
   });
 
   it("returns GOOGLE_AUTOMATION_BLOCKED when body text warns the sign-in is unsafe", () => {
-    expect(detectChallenge("https://accounts.google.com/signin/rejected", "This browser or app may not be secure")).toBe("GOOGLE_AUTOMATION_BLOCKED");
+    expect(
+      detectChallenge(
+        "https://accounts.google.com/signin/rejected",
+        "This browser or app may not be secure",
+      ),
+    ).toBe("GOOGLE_AUTOMATION_BLOCKED");
   });
 
   it("returns GOOGLE_CHALLENGE_REQUIRED for a generic challenge URL with no blocked phrasing", () => {
-    expect(detectChallenge("https://accounts.google.com/signin/challenge", "please verify your identity")).toBe("GOOGLE_CHALLENGE_REQUIRED");
+    expect(
+      detectChallenge(
+        "https://accounts.google.com/signin/challenge",
+        "please verify your identity",
+      ),
+    ).toBe("GOOGLE_CHALLENGE_REQUIRED");
   });
 
   it("returns GOOGLE_CHALLENGE_REQUIRED for a rejected URL with no blocked phrasing", () => {
-    expect(detectChallenge("https://accounts.google.com/signin/rejected", "sign-in was not successful")).toBe("GOOGLE_CHALLENGE_REQUIRED");
+    expect(
+      detectChallenge(
+        "https://accounts.google.com/signin/rejected",
+        "sign-in was not successful",
+      ),
+    ).toBe("GOOGLE_CHALLENGE_REQUIRED");
   });
 
   it("returns undefined for a normal successful URL and body", () => {
-    expect(detectChallenge("https://studenthub.uet.edu.vn/dashboard", "Welcome back")).toBeUndefined();
+    expect(
+      detectChallenge(
+        "https://studenthub.uet.edu.vn/dashboard",
+        "Welcome back",
+      ),
+    ).toBeUndefined();
   });
 
   it("prioritizes GOOGLE_2FA_REQUIRED over the blocked-phrase check when both could match", () => {
-    expect(detectChallenge("https://accounts.google.com/signin/v2/challenge/totp", "unusual activity detected")).toBe("GOOGLE_2FA_REQUIRED");
+    expect(
+      detectChallenge(
+        "https://accounts.google.com/signin/v2/challenge/totp",
+        "unusual activity detected",
+      ),
+    ).toBe("GOOGLE_2FA_REQUIRED");
   });
 });
 
@@ -60,6 +105,34 @@ describe("serializeCookies", () => {
   });
 });
 
+describe("waitForGoogleIdentityServices", () => {
+  it("waits until the GSI button is rendered", async () => {
+    const page = {
+      evaluate: vi
+        .fn()
+        .mockResolvedValueOnce(false)
+        .mockResolvedValueOnce(true),
+    } as unknown as UetPageDriver;
+
+    await expect(
+      waitForGoogleIdentityServices(page, 1_000),
+    ).resolves.toBeUndefined();
+    expect(page.evaluate).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails with a specific error when GSI never renders", async () => {
+    const page = {
+      evaluate: vi.fn().mockResolvedValue(false),
+    } as unknown as UetPageDriver;
+
+    await expect(waitForGoogleIdentityServices(page, 10)).rejects.toMatchObject(
+      {
+        code: "GOOGLE_IDENTITY_UNAVAILABLE",
+      },
+    );
+  });
+});
+
 describe("waitForStableSelector", () => {
   it("retries when Browserless replaces the popup frame during navigation", async () => {
     const element = { click: vi.fn(async () => undefined) };
@@ -67,7 +140,9 @@ describe("waitForStableSelector", () => {
       isClosed: () => false,
       waitForSelector: vi
         .fn()
-        .mockRejectedValueOnce(new Error("Attempted to use detached Frame 'ABC'."))
+        .mockRejectedValueOnce(
+          new Error("Attempted to use detached Frame 'ABC'."),
+        )
         .mockResolvedValueOnce(element),
     } as unknown as UetPageDriver;
 
@@ -97,7 +172,11 @@ describe("awaitAutomationOperation", () => {
     const reason = new DOMException("login cancelled", "AbortError");
     const cleanup = vi.fn(async () => undefined);
     const operation = new Promise<void>(() => undefined);
-    const pending = awaitAutomationOperation(operation, controller.signal, cleanup);
+    const pending = awaitAutomationOperation(
+      operation,
+      controller.signal,
+      cleanup,
+    );
 
     controller.abort(reason);
 
@@ -108,7 +187,9 @@ describe("awaitAutomationOperation", () => {
 
 describe("automateVnuGoogleLogin cancellation", () => {
   it("closes the page and browser when cancelled during navigation", async () => {
-    const { automateVnuGoogleLogin } = await import("./google-login-automation");
+    const { automateVnuGoogleLogin } = await import(
+      "./google-login-automation"
+    );
     const controller = new AbortController();
     const reason = new DOMException("login cancelled", "AbortError");
     let rejectNavigation: ((error: Error) => void) | undefined;
@@ -151,23 +232,31 @@ describe("automateVnuGoogleLogin cancellation", () => {
   });
 
   it("uses and disconnects an owned driver without opening a second Puppeteer connection", async () => {
-    const { automateVnuGoogleLogin } = await import("./google-login-automation");
+    const { automateVnuGoogleLogin } = await import(
+      "./google-login-automation"
+    );
     const controller = new AbortController();
     const reason = new DOMException("login cancelled", "AbortError");
     let rejectNavigation: ((error: Error) => void) | undefined;
     let navigationStarted: () => void = () => undefined;
-    const started = new Promise<void>((resolve) => { navigationStarted = resolve; });
+    const started = new Promise<void>((resolve) => {
+      navigationStarted = resolve;
+    });
     const page = {
       close: vi.fn(async () => undefined),
       goto: vi.fn(() => {
         navigationStarted();
-        return new Promise<never>((_, reject) => { rejectNavigation = reject; });
+        return new Promise<never>((_, reject) => {
+          rejectNavigation = reject;
+        });
       }),
     } as unknown as UetPageDriver;
     const driver = {
       connected: true,
       close: vi.fn(async () => undefined),
-      disconnect: vi.fn(async () => { rejectNavigation?.(new Error("driver disconnected")); }),
+      disconnect: vi.fn(async () => {
+        rejectNavigation?.(new Error("driver disconnected"));
+      }),
       newPage: vi.fn(async () => page),
       on: vi.fn(),
       off: vi.fn(),
