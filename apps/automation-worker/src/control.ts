@@ -159,6 +159,7 @@ export class AutomationControlConsumer {
       envelopeCodec: AutomationEnvelopeCodec;
       onControl: AutomationControlHandler;
       logger?: AutomationControlLogger;
+      onFatalError?: (error: unknown) => void;
       now?: () => number;
     },
   ) {}
@@ -168,7 +169,12 @@ export class AutomationControlConsumer {
     await this.ensureGroup();
     this.running = true;
     this.loopPromise = this.consume().catch((error) => {
-      if (!this.shutdown.signal.aborted) this.options.logger?.error?.("Automation control consumer stopped unexpectedly.", { code: errorCode(error) });
+      if (this.shutdown.signal.aborted) return;
+      this.options.logger?.error?.(
+        "Automation control consumer stopped unexpectedly.",
+        { code: errorCode(error) },
+      );
+      this.options.onFatalError?.(error);
     });
   }
 

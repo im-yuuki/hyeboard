@@ -30,6 +30,7 @@ export type AutomationWorkerOptions<TCredential, TResult> = {
   executor: AutomationExecutor<TCredential, TResult>;
   events: AutomationEventSink;
   logger?: AutomationWorkerLogger;
+  onFatalError?: (error: unknown) => void;
   onCaptchaNeeded?: (request: {
     job: UetImportJob;
     challengeId: string;
@@ -69,11 +70,12 @@ export class AutomationWorker<TCredential, TResult> {
     this.draining = false;
     await this.ensureGroup();
     this.loopPromise = this.consume().catch((error) => {
-      if (!this.draining)
-        this.options.logger?.error?.(
-          "Automation job consumer stopped unexpectedly.",
-          { code: errorCode(error) },
-        );
+      if (this.draining) return;
+      this.options.logger?.error?.(
+        "Automation job consumer stopped unexpectedly.",
+        { code: errorCode(error) },
+      );
+      this.options.onFatalError?.(error);
     });
   }
 

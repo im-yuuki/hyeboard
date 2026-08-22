@@ -80,6 +80,7 @@ export type AutomationHost = {
   readonly controls: AutomationControlConsumer;
   start(): Promise<void>;
   stop(): Promise<void>;
+  waitForFailure(): Promise<never>;
 };
 
 export function automationHealthResponse(
@@ -182,6 +183,18 @@ export function createAutomationHost(
       now: options.now,
     });
   const captcha = new CaptchaControlBridge();
+  let failureSignaled = false;
+  let signalFailure!: (error: unknown) => void;
+  const failure = new Promise<never>((_, reject) => {
+    signalFailure = reject;
+  });
+  const health = options.health;
+  const onFatalError = (error: unknown) => {
+    if (failureSignaled) return;
+    failureSignaled = true;
+    health?.setReady(false);
+    signalFailure(error);
+  };
   const worker = new AutomationWorker<UetAutomationCredential, ImportedSession>(
     {
       config,
@@ -198,6 +211,7 @@ export function createAutomationHost(
       ),
       logger: options.logger,
       now: options.now,
+      onFatalError,
       onCaptchaNeeded: (request) => captcha.waitForAnswer(request),
     },
   );
@@ -207,12 +221,12 @@ export function createAutomationHost(
     envelopeCodec: codec,
     logger: options.logger,
     now: options.now,
+    onFatalError,
     onControl: async (control) => applyControl(control, worker, captcha),
   });
 
   let started = false;
   let stopping: Promise<void> | undefined;
-  const health = options.health;
 
   return {
     config,
@@ -250,6 +264,7 @@ export function createAutomationHost(
         throw error;
       }
     },
+    waitForFailure: () => failure,
     async stop() {
       stopping ??= (async () => {
         await controls.stop(config.shutdownTimeoutMs);
@@ -299,6 +314,10 @@ export async function runAutomationWorker(
     throw error;
   }
   let stopping: Promise<void> | undefined;
+  let resolveStopRequested!: () => void;
+  const stopRequested = new Promise<void>((resolve) => {
+    resolveStopRequested = resolve;
+  });
   const stop = () => {
     stopping ??= host
       .stop()
@@ -306,19 +325,14 @@ export async function runAutomationWorker(
         logger.error?.("Automation worker shutdown failed.", {
           code: errorCode(error),
         }),
-      );
+      )
+      .finally(resolveStopRequested);
   };
   once("SIGTERM", stop);
   once("SIGINT", stop);
   try {
     await host.start();
-    await new Promise<void>((resolve) => {
-      const waitForStop = () => {
-        if (stopping) void stopping.finally(resolve);
-        else setTimeout(waitForStop, 25);
-      };
-      waitForStop();
-    });
+    await Promise.race([host.waitForFailure(), stopRequested]);
   } catch (error) {
     logger.error?.("Automation worker failed to start.", {
       code: errorCode(error),
